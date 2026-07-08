@@ -1,0 +1,368 @@
+/* ============================================================================
+   Swerve Build — design system
+   Swerve Create identity (dark-first) + Claude-style organization.
+
+   Theming is attribute-driven: dark tokens are the base :root, light lives
+   under :root[data-theme="light"]. A boot script in app.html resolves the
+   "system" preference to a concrete light/dark attribute before first paint,
+   so the CSS only ever carries two concrete states.
+   ============================================================================ */
+
+:root {
+  color-scheme: dark;
+
+  /* Fonts — progressive system stacks, no bundled files. If Inter / JetBrains
+     Mono are installed they win; otherwise we fall back gracefully. */
+  --font-sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, "Consolas", monospace;
+
+  /* Layout */
+  --sidebar-width: 264px;
+  --reading-width: 740px;
+  --titlebar-height: 34px;
+
+  /* Radii */
+  --radius-sm: 8px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  /* Backgrounds / surfaces (Swerve deep navy) */
+  --bg-app: #04060d;
+  --bg-sidebar: #080b14;
+  --bg-surface: #0d1220;
+  --bg-surface-2: #111a2b;
+  --bg-muted: #0b0f1a;
+  --bg-hover: rgba(255, 255, 255, 0.055);
+  --bg-active: color-mix(in srgb, var(--sc-accent) 14%, transparent);
+
+  /* Borders */
+  --border: #1c2436;
+  --border-strong: #2a3346;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+
+  /* Text tiers */
+  --text-primary: #e8edf4;
+  --text-secondary: #b7c0d0;
+  --text-muted: #8b93a7;
+  --text-faint: #64748b;
+
+  /* Global interactive accent (links, focus rings) */
+  --accent: #6cb5ff;
+  --accent-strong: #4aa0ff;
+  --accent-tint: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-ring: color-mix(in srgb, var(--accent) 55%, transparent);
+
+  /* Per-provider accent — set on <html> at runtime (default = Grok blue). */
+  --sc-accent: #6cb5ff;
+  --sc-accent-tint: color-mix(in srgb, var(--sc-accent) 14%, transparent);
+  --sc-accent-ring: color-mix(in srgb, var(--sc-accent) 55%, transparent);
+
+  /* The signature SwerveCreate gradient (cyan -> orange -> violet). */
+  --sc-gradient: linear-gradient(100deg, #4cc9f0 0%, #e8452c 50%, #8b5cf6 100%);
+
+  /* Semantic */
+  --success: #4dd2c0;
+  --success-tint: color-mix(in srgb, var(--success) 16%, transparent);
+  --warning: #f5b656;
+  --warning-tint: color-mix(in srgb, var(--warning) 16%, transparent);
+  --danger: #ff6b6b;
+  --danger-tint: color-mix(in srgb, var(--danger) 16%, transparent);
+
+  /* Depth */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 20px 50px rgba(0, 0, 0, 0.55);
+  --glow: 0 0 10px -2px;
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur-fast: 140ms;
+  --dur: 180ms;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-app: #f7f8fa;
+  --bg-sidebar: #eef1f5;
+  --bg-surface: #ffffff;
+  --bg-surface-2: #f3f5f8;
+  --bg-muted: #f0f2f5;
+  --bg-hover: rgba(10, 15, 30, 0.05);
+
+  --border: #dce1e9;
+  --border-strong: #c4ccd8;
+  --border-subtle: rgba(10, 15, 30, 0.08);
+
+  --text-primary: #0f1626;
+  --text-secondary: #46536b;
+  --text-muted: #6b7688;
+  --text-faint: #94a0b3;
+
+  --accent: #2f7ff0;
+  --accent-strong: #1f6fe0;
+
+  --shadow-sm: 0 1px 2px rgba(20, 30, 60, 0.08);
+  --shadow-md: 0 8px 24px rgba(20, 30, 60, 0.1);
+  --shadow-lg: 0 20px 50px rgba(20, 30, 60, 0.16);
+  /* --sc-accent, gradient, semantics, radii, motion, fonts inherit from :root */
+}
+
+/* ---------------------------------------------------------------- reset --- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-app);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+::selection {
+  background: var(--sc-accent-tint);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Themed scrollbars (zero-dep polish). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: var(--radius-pill);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* ----------------------------------------------------------- typography --- */
+
+.page-title {
+  font-size: 1.375rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.page-subtitle {
+  margin-top: 0.25rem;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.mono-label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.reading-col {
+  width: 100%;
+  max-width: var(--reading-width);
+  margin-inline: auto;
+}
+
+/* ------------------------------------------------------------- gradient --- */
+
+.sc-gradient-text {
+  background: var(--sc-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: #a78bfa; /* fallback if clip unsupported */
+}
+
+/* --------------------------------------------------------------- card ----- */
+
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.card + .card {
+  margin-top: 1rem;
+}
+
+/* --------------------------------------------------------------- button --- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-2);
+  color: var(--text-primary);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+
+.btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.btn:active {
+  transform: translateY(0.5px);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #04060d;
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+/* Provider-tinted call to action (e.g. chat "send"). */
+.btn-accent {
+  background: var(--sc-accent);
+  border-color: var(--sc-accent);
+  color: #04060d;
+  font-weight: 600;
+}
+
+.btn-accent:hover {
+  box-shadow: var(--glow) var(--sc-accent);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+
+.btn-ghost:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.btn-icon {
+  padding: 0.5rem;
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.btn-sm {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.8125rem;
+}
+
+/* --------------------------------------------------------------- badge ---- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: var(--radius-pill);
+  font-size: 0.75rem;
+  font-weight: 500;
+  border: 1px solid transparent;
+}
+
+.badge-muted {
+  background: var(--bg-muted);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+
+.badge-accent {
+  background: var(--sc-accent-tint);
+  color: var(--sc-accent);
+}
+
+.badge-success {
+  background: var(--success-tint);
+  color: var(--success);
+}
+
+.badge-warning {
+  background: var(--warning-tint);
+  color: var(--warning);
+}
+
+.badge-danger {
+  background: var(--danger-tint);
+  color: var(--danger);
+}
