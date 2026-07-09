@@ -6,7 +6,7 @@ A clean, minimal Windows desktop app for [Grok Build CLI](https://github.com/xai
 
 ## Install (users)
 
-1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`).
+1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`). Prefer the newest version (v0.1.1+ includes chat reliability fixes).
 2. Run the installer and open **Swerve Build**.
 3. On the home screen, click **Install Grok Build** (installs the official Grok CLI to `~/.grok/`).
 4. Click **Sign In** and complete OAuth in your browser.

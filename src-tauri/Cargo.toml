@@ -1,6 +1,6 @@
 [package]
 name = "swerve-build"
-version = "0.1.0"
+version = "0.1.1"
 description = "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents"
 authors = ["Swerve Build Contributors"]
 license = "MIT"

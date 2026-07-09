@@ -5,7 +5,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
   import type { Chat, ChatMessage, PermissionRequest, Project } from "$lib/types";
-  import { loadWorkspace, projectById } from "$lib/workspace";
+  import { loadWorkspace } from "$lib/workspace";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { imageSrc } from "$lib/attachments";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
@@ -93,14 +93,19 @@
     }
   }
 
-  async function finalizeAssistantMessage() {
-    const text = streaming
+  async function finalizeAssistantMessage(note?: string) {
+    let text = streaming
       .filter((item) => item.role === "assistant" && item.kind === "message")
       .map((item) => item.content)
       .join("")
       .trim();
 
-    if (!text || !chat) return;
+    if (!text) return false;
+    if (!chat) return false;
+
+    if (note) {
+      text = `${text}\n\n_${note}_`;
+    }
 
     const saved = await invoke<ChatMessage>("append_chat_message", {
       chatId: chat.id,
@@ -115,6 +120,7 @@
       updated_at: saved.created_at,
     };
     resetStream();
+    return true;
   }
 
   async function refreshActiveSessions() {
@@ -127,8 +133,17 @@
     sessionReady = false;
     resetStream();
 
-    const workspace = await loadWorkspace();
-    const loaded = workspace.chats.find((item) => item.id === id);
+    await workspaceStore.refresh();
+
+    let loaded = workspaceStore.chats.find((item) => item.id === id);
+    if (!loaded) {
+      try {
+        loaded = await invoke<Chat>("get_chat", { chatId: id });
+      } catch {
+        loaded = undefined;
+      }
+    }
+
     if (!loaded) {
       await goto("/projects");
       return;
@@ -137,21 +152,24 @@
     if (gen !== bootstrapGen) return;
 
     chat = loaded;
-    project = projectById(workspace, loaded.project_id) ?? null;
+    project = workspaceStore.projectById(loaded.project_id) ?? null;
 
-    const result = await invoke<{ success: boolean; message: string }>("start_chat_session", {
-      chatId: id,
-    });
-
-    if (gen !== bootstrapGen) return;
-
-    if (!result.success) {
-      error = result.message;
-      return;
+    try {
+      await invoke<{ success: boolean; message: string }>("start_chat_session", {
+        chatId: id,
+      });
+      if (gen !== bootstrapGen) return;
+      sessionReady = true;
+      await refreshActiveSessions();
+    } catch (err) {
+      if (gen !== bootstrapGen) return;
+      sessionReady = false;
+      error =
+        "Live Grok session disconnected. Your saved messages are below — send a message to reconnect.";
+      if (String(err).trim()) {
+        error = `${error} (${String(err)})`;
+      }
     }
-
-    sessionReady = true;
-    await refreshActiveSessions();
   }
 
   async function enqueuePermission(request: PermissionRequest) {
@@ -200,6 +218,11 @@
     resetStream();
 
     try {
+      if (!sessionReady) {
+        await invoke("start_chat_session", { chatId: chat.id });
+        sessionReady = true;
+        await refreshActiveSessions();
+      }
       const userMessage = await invoke<ChatMessage>("append_chat_message", {
         chatId: chat.id,
         role: "user",
@@ -223,6 +246,10 @@
       await finalizeAssistantMessage();
       workspaceStore.refresh();
     } catch (err) {
+      const saved = await finalizeAssistantMessage("Partial reply saved after interruption");
+      if (saved) {
+        await workspaceStore.refresh();
+      }
       error = String(err);
     } finally {
       sending = false;
@@ -284,7 +311,7 @@
   {/if}
 
   <div class="reading-col composer-wrap">
-    <Composer disabled={!sessionReady} {sending} onsend={sendMessage} />
+    <Composer disabled={!chat || sending} {sending} onsend={sendMessage} />
   </div>
 </div>
 

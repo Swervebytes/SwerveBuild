@@ -8,7 +8,7 @@
   import Wordmark from "./Wordmark.svelte";
   import Icon from "./ui/Icon.svelte";
 
-  const appVersion = "0.1.0";
+  const appVersion = "0.1.1";
   let creating = $state(false);
 
   const recent = $derived(workspaceStore.recent(7));

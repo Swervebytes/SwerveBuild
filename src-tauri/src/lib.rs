@@ -490,17 +490,23 @@ async fn start_chat_session(
     acp: State<'_, Arc<AcpManager>>,
     chat_id: String,
 ) -> Result<CommandResult, String> {
-    let store = Store::load();
+    let mut store = Store::load();
     let chat = store
         .chats
         .iter()
         .find(|c| c.id == chat_id)
-        .ok_or_else(|| "Chat not found".to_string())?;
+        .ok_or_else(|| "Chat not found".to_string())?
+        .clone();
     let project = store
         .projects
         .iter()
         .find(|p| p.id == chat.project_id)
         .ok_or_else(|| "Project not found".to_string())?;
+
+    if let Some(entry) = store.chats.iter_mut().find(|c| c.id == chat_id) {
+        entry.updated_at = Store::now();
+        Store::save(&store)?;
+    }
 
     let provider = chat
         .provider_id

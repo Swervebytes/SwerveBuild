@@ -107,7 +107,7 @@
 
   <section class="card about">
     <h2 class="group-title">About</h2>
-    <p class="about-line">Swerve Build v0.1.0</p>
+    <p class="about-line">Swerve Build v0.1.1</p>
     <p class="about-line muted">MIT License · Open source</p>
   </section>
 </div>
