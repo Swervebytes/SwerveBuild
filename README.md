@@ -2,6 +2,14 @@
 
 A clean, minimal Windows desktop app for [Grok Build CLI](https://github.com/xai-org/grok-cli) and other ACP agents. Project-scoped chats, tool approval, memories, skills, and multi-provider support — in one native shell.
 
+<p align="center">
+  <img src="docs/screenshot-home.png" alt="Swerve Build home screen — Grok install, sign-in, and quick links" width="820" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshot-settings.png" alt="Swerve Build settings — theme and multi-provider agent picker" width="820" />
+</p>
+
 **License:** MIT
 
 ## Install (users)
@@ -72,7 +80,7 @@ npm run tauri dev    # Full desktop app with hot reload
 npm run release
 ```
 
-Output: `src-tauri/target/release/bundle/nsis/Swerve Build_0.1.0_x64-setup.exe`
+Output: `src-tauri/target/release/bundle/nsis/Swerve Build_0.1.1_x64-setup.exe`
 
 Upload the `*-setup.exe` to GitHub Releases. The script builds the frontend and Rust binaries, stages the MCP sidecar, bundles with Tauri, then restores dev-friendly config.
 
