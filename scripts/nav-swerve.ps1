@@ -17,7 +17,11 @@ $ctrlCond = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
     [System.Windows.Automation.ControlType]::Hyperlink)
 $and = New-Object System.Windows.Automation.AndCondition($nameCond, $ctrlCond)
-$link = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $and)
+$link = $null
+for ($i = 0; $i -lt 20 -and -not $link; $i++) {
+    $link = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $and)
+    if (-not $link) { Start-Sleep -Milliseconds 500 }
+}
 if (-not $link) { throw "Link '$Page' not found" }
 
 $pattern = $link.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
