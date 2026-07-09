@@ -26,13 +26,19 @@ pub struct AcpManager {
     sessions: Mutex<HashMap<String, ActiveSession>>,
 }
 
+/// Shared ACP transport — must be usable without holding `AcpManager::sessions` lock
+/// so permission responses can be sent while `session/prompt` is in flight.
+struct SessionTransport {
+    stdin: Arc<Mutex<ChildStdin>>,
+    request_id: AtomicU64,
+    responses: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>>,
+}
+
 struct ActiveSession {
     chat_id: String,
     session_id: String,
     child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
-    request_id: AtomicU64,
-    responses: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>>,
+    transport: Arc<SessionTransport>,
     last_accessed: AtomicU64,
 }
 
@@ -186,11 +192,13 @@ impl AcpManager {
             });
         }
 
-        let stdin = Arc::new(Mutex::new(stdin));
-        let responses: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let responses_for_reader = Arc::clone(&responses);
-        let stdin_for_reader = Arc::clone(&stdin);
+        let transport = Arc::new(SessionTransport {
+            stdin: Arc::new(Mutex::new(stdin)),
+            request_id: AtomicU64::new(1),
+            responses: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let responses_for_reader = Arc::clone(&transport.responses);
+        let stdin_for_reader = Arc::clone(&transport.stdin);
         let app_for_reader = app.clone();
         let chat_for_reader = chat_id.to_string();
 
@@ -218,7 +226,7 @@ impl AcpManager {
                     }
 
                     if method == "session/request_permission" {
-                        if let Some(id) = value.get("id").and_then(|id| id.as_u64()) {
+                        if let Some(id) = jsonrpc_id(&value) {
                             let _ = app_for_reader.emit(
                                 "chat-permission-request",
                                 json!({
@@ -249,7 +257,7 @@ impl AcpManager {
                     }
                 }
 
-                if let Some(id) = value.get("id").and_then(|id| id.as_u64()) {
+                if let Some(id) = jsonrpc_id(&value) {
                     if let Ok(mut pending) = responses_for_reader.lock() {
                         if let Some(sender) = pending.remove(&id) {
                             let _ = sender.send(value);
@@ -263,13 +271,11 @@ impl AcpManager {
             chat_id: chat_id.to_string(),
             session_id: String::new(),
             child,
-            stdin,
-            request_id: AtomicU64::new(1),
-            responses,
+            transport: Arc::clone(&transport),
             last_accessed: AtomicU64::new(now_secs()),
         };
 
-        let agent_caps = active.rpc(
+        let agent_caps = active.transport.rpc(
             "initialize",
             json!({
                 "protocolVersion": 1,
@@ -293,7 +299,7 @@ impl AcpManager {
             .is_some();
 
         let session_id = if let Some(stored) = stored_session_id.filter(|_| can_resume) {
-            match active.rpc(
+            match active.transport.rpc(
                 "session/resume",
                 json!({
                     "sessionId": stored,
@@ -329,7 +335,7 @@ impl AcpManager {
         cwd: &str,
         mcp_servers: &Value,
     ) -> Result<String, String> {
-        let result = active.rpc(
+        let result = active.transport.rpc(
             "session/new",
             json!({
                 "cwd": cwd,
@@ -351,13 +357,16 @@ impl AcpManager {
         request_id: u64,
         option_id: &str,
     ) -> Result<(), String> {
-        let guard = self
-            .sessions
-            .lock()
-            .map_err(|_| "ACP session lock poisoned".to_string())?;
-        let active = guard
-            .get(chat_id)
-            .ok_or_else(|| "Chat session not active".to_string())?;
+        let transport = {
+            let guard = self
+                .sessions
+                .lock()
+                .map_err(|_| "ACP session lock poisoned".to_string())?;
+            let active = guard
+                .get(chat_id)
+                .ok_or_else(|| "Chat session not active".to_string())?;
+            Arc::clone(&active.transport)
+        };
 
         let reply = json!({
             "jsonrpc": "2.0",
@@ -370,29 +379,24 @@ impl AcpManager {
             }
         });
 
-        let mut writer = active
-            .stdin
-            .lock()
-            .map_err(|_| "ACP stdin lock poisoned".to_string())?;
-        writeln!(writer, "{}", reply.to_string())
-            .map_err(|e| format!("Failed to send permission response: {e}"))?;
-        writer
-            .flush()
-            .map_err(|e| format!("Failed to flush permission response: {e}"))?;
-        Ok(())
+        transport.write_json_line(&reply)
     }
 
     pub fn send_prompt(&self, chat_id: &str, text: &str, images: &[String]) -> Result<(), String> {
-        let mut guard = self
-            .sessions
-            .lock()
-            .map_err(|_| "ACP session lock poisoned".to_string())?;
-
-        let active = guard
-            .get_mut(chat_id)
-            .ok_or_else(|| "No active session for this chat. Open the chat to connect.".to_string())?;
-
-        active.bump_access();
+        let (transport, session_id) = {
+            let mut guard = self
+                .sessions
+                .lock()
+                .map_err(|_| "ACP session lock poisoned".to_string())?;
+            let active = guard
+                .get_mut(chat_id)
+                .ok_or_else(|| "No active session for this chat. Open the chat to connect.".to_string())?;
+            active.bump_access();
+            (
+                Arc::clone(&active.transport),
+                active.session_id.clone(),
+            )
+        };
 
         let mut prompt_text = text.trim().to_string();
         for (index, image) in images.iter().enumerate() {
@@ -406,8 +410,7 @@ impl AcpManager {
             return Err("Message cannot be empty".to_string());
         }
 
-        let session_id = active.session_id.clone();
-        active.rpc(
+        transport.rpc(
             "session/prompt",
             json!({
                 "sessionId": session_id,
@@ -425,12 +428,28 @@ impl ActiveSession {
         self.last_accessed
             .store(now_secs(), Ordering::SeqCst);
     }
+}
 
+impl SessionTransport {
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn rpc(&mut self, method: &str, params: Value, timeout_secs: u64) -> Result<Value, String> {
+    fn write_json_line(&self, value: &Value) -> Result<(), String> {
+        let mut writer = self
+            .stdin
+            .lock()
+            .map_err(|_| "ACP stdin lock poisoned".to_string())?;
+        let line = serde_json::to_string(value).map_err(|e| e.to_string())?;
+        writeln!(writer, "{line}")
+            .map_err(|e| format!("Failed to write ACP message: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("Failed to flush ACP stdin: {e}"))?;
+        Ok(())
+    }
+
+    fn rpc(&self, method: &str, params: Value, timeout_secs: u64) -> Result<Value, String> {
         let id = self.next_id();
         let (tx, rx) = mpsc::channel();
 
@@ -449,24 +468,13 @@ impl ActiveSession {
             "params": params
         });
 
-        {
-            let mut writer = self
-                .stdin
-                .lock()
-                .map_err(|_| "ACP stdin lock poisoned".to_string())?;
-            let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-            writeln!(writer, "{line}")
-                .map_err(|e| format!("Failed to write ACP request: {e}"))?;
-            writer
-                .flush()
-                .map_err(|e| format!("Failed to flush ACP stdin: {e}"))?;
-        }
+        self.write_json_line(&request)?;
 
         let response = rx
             .recv_timeout(std::time::Duration::from_secs(timeout_secs))
             .map_err(|_| {
                 format!(
-                    "Timed out after {timeout_secs}s waiting for Grok ({method}). Check sign-in and try again."
+                    "Timed out after {timeout_secs}s waiting for Grok ({method}). Approve any pending tool prompts, check sign-in, and try again."
                 )
             })?;
 
@@ -476,6 +484,13 @@ impl ActiveSession {
 
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
+}
+
+fn jsonrpc_id(value: &Value) -> Option<u64> {
+    let id = value.get("id")?;
+    id.as_u64()
+        .or_else(|| id.as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| id.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
 }
 
 fn now_secs() -> u64 {
