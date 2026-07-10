@@ -151,7 +151,8 @@ Send-Acp @{
 }
 $initResp = Read-AcpResponse 1
 Assert-True ($null -ne $initResp.result) "ACP initialize"
-$canResume = $null -ne $initResp.result.agentCapabilities.sessionCapabilities.resume
+$canLoad = ($initResp.result.agentCapabilities.loadSession -eq $true) -or
+    ($null -ne $initResp.result.agentCapabilities.sessionCapabilities.resume)
 
 Send-Acp @{
     jsonrpc = "2.0"; id = 2; method = "session/new"
@@ -178,8 +179,8 @@ Assert-True $gotUpdate "ACP session/update streaming"
 
 try { $acp.Kill() } catch {}
 
-# 4. Session resume (only when the agent advertises resume support)
-if ($sessionId -and $canResume) {
+# 4. Session load (gated the same way as acp.rs: loadSession, or sessionCapabilities.resume)
+if ($sessionId -and $canLoad) {
     $acp2 = [System.Diagnostics.Process]::Start($psi)
     function Send-Acp2($obj) {
         $script:acp2.StandardInput.WriteLine(($obj | ConvertTo-Json -Compress -Depth 12))
@@ -208,19 +209,19 @@ if ($sessionId -and $canResume) {
     $null = Read-Acp2 1
 
     Send-Acp2 @{
-        jsonrpc = "2.0"; id = 2; method = "session/resume"
+        jsonrpc = "2.0"; id = 2; method = "session/load"
         params = @{
             sessionId = $sessionId
             cwd = $testCwd
             mcpServers = @(@{ name = "swervebuild"; command = $mcpPath; args = @(); env = @() })
         }
     }
-    $resumeResp = Read-Acp2 2
-    $resumed = ($null -ne $resumeResp.result)
-    Assert-True $resumed "ACP session/resume" "$(if ($resumeResp.error) { $resumeResp.error } else { 'ok' })"
+    $loadResp = Read-Acp2 2
+    $loaded = ($null -ne $loadResp) -and ($null -eq $loadResp.error)
+    Assert-True $loaded "ACP session/load reuses session id" "$(if ($loadResp.error) { $loadResp.error } else { 'ok' })"
     try { $acp2.Kill() } catch {}
 } elseif ($sessionId) {
-    Write-Host "[SKIP] ACP session/resume - agent does not advertise resume capability" -ForegroundColor DarkYellow
+    Write-Host "[SKIP] ACP session/load - agent advertises neither loadSession nor sessionCapabilities.resume" -ForegroundColor DarkYellow
 }
 
 # 5. Data store has test project

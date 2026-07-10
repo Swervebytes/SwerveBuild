@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +32,11 @@ struct SessionTransport {
     stdin: Arc<Mutex<ChildStdin>>,
     request_id: AtomicU64,
     responses: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>>,
+    /// While true, `session/update` notifications are dropped instead of emitted.
+    /// `session/load` replays the whole history as updates before it responds;
+    /// the app already persists messages itself, so forwarding the replay would
+    /// duplicate every saved message in the UI.
+    suppress_updates: AtomicBool,
 }
 
 struct ActiveSession {
@@ -196,9 +201,9 @@ impl AcpManager {
             stdin: Arc::new(Mutex::new(stdin)),
             request_id: AtomicU64::new(1),
             responses: Arc::new(Mutex::new(HashMap::new())),
+            suppress_updates: AtomicBool::new(false),
         });
-        let responses_for_reader = Arc::clone(&transport.responses);
-        let stdin_for_reader = Arc::clone(&transport.stdin);
+        let transport_for_reader = Arc::clone(&transport);
         let app_for_reader = app.clone();
         let chat_for_reader = chat_id.to_string();
 
@@ -215,13 +220,15 @@ impl AcpManager {
 
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                     if method == "session/update" {
-                        let _ = app_for_reader.emit(
-                            "chat-update",
-                            json!({
-                                "chatId": chat_for_reader,
-                                "params": value.get("params").cloned().unwrap_or(Value::Null),
-                            }),
-                        );
+                        if !transport_for_reader.suppress_updates.load(Ordering::SeqCst) {
+                            let _ = app_for_reader.emit(
+                                "chat-update",
+                                json!({
+                                    "chatId": chat_for_reader,
+                                    "params": value.get("params").cloned().unwrap_or(Value::Null),
+                                }),
+                            );
+                        }
                         continue;
                     }
 
@@ -248,7 +255,7 @@ impl AcpManager {
                                 "id": id,
                                 "result": response,
                             });
-                            if let Ok(mut writer) = stdin_for_reader.lock() {
+                            if let Ok(mut writer) = transport_for_reader.stdin.lock() {
                                 let _ = writeln!(writer, "{}", reply.to_string());
                                 let _ = writer.flush();
                             }
@@ -258,7 +265,7 @@ impl AcpManager {
                 }
 
                 if let Some(id) = jsonrpc_id(&value) {
-                    if let Ok(mut pending) = responses_for_reader.lock() {
+                    if let Ok(mut pending) = transport_for_reader.responses.lock() {
                         if let Some(sender) = pending.remove(&id) {
                             let _ = sender.send(value);
                         }
@@ -292,22 +299,38 @@ impl AcpManager {
         )?;
 
         let mcp_servers = mcp_servers_config()?;
-        let can_resume = agent_caps
-            .get("agentCapabilities")
-            .and_then(|c| c.get("sessionCapabilities"))
-            .and_then(|c| c.get("resume"))
-            .is_some();
+        // Grok (v0.2.x) advertises `agentCapabilities.loadSession: true`;
+        // `sessionCapabilities.resume` is kept as a forward-compat check for
+        // agents on the newer capability shape.
+        let caps = agent_caps.get("agentCapabilities");
+        let can_load = caps
+            .and_then(|c| c.get("loadSession"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || caps
+                .and_then(|c| c.get("sessionCapabilities"))
+                .and_then(|c| c.get("resume"))
+                .is_some();
 
-        let session_id = if let Some(stored) = stored_session_id.filter(|_| can_resume) {
-            match active.transport.rpc(
-                "session/resume",
+        let session_id = if let Some(stored) = stored_session_id.filter(|_| can_load) {
+            active
+                .transport
+                .suppress_updates
+                .store(true, Ordering::SeqCst);
+            let loaded = active.transport.rpc(
+                "session/load",
                 json!({
                     "sessionId": stored,
                     "cwd": cwd,
                     "mcpServers": mcp_servers,
                 }),
                 CONNECT_TIMEOUT_SECS,
-            ) {
+            );
+            active
+                .transport
+                .suppress_updates
+                .store(false, Ordering::SeqCst);
+            match loaded {
                 Ok(_) => stored.to_string(),
                 Err(_) => Self::create_new_session(&mut active, cwd, &mcp_servers)?,
             }
