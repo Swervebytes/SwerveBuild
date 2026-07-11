@@ -10,7 +10,7 @@
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
 
-  const FEEDBACK_URL = "https://feedback.roaringbytes.com/";
+  const FEEDBACK_URL = "https://feedback.roaringbytes.com/?project=swervebuild";
 
   let { children } = $props();
 
