@@ -1,9 +1,12 @@
 mod acp;
+mod jobs;
 pub mod paths;
 mod providers;
 mod store;
+mod util;
 
 use acp::AcpManager;
+use jobs::JobManager;
 use providers::{ProviderStatus, ProviderView};
 use serde::Serialize;
 use std::fs;
@@ -12,12 +15,6 @@ use std::process::{Command, Stdio};
 use store::{AppStore, Chat, ChatMessage, Project, Store};
 use std::sync::Arc;
 use tauri::State;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Serialize)]
 pub struct GrokStatus {
@@ -65,7 +62,7 @@ pub fn resolve_grok_executable() -> Option<PathBuf> {
 }
 
 pub(crate) fn which_on_path(command: &str) -> Option<PathBuf> {
-    let output = Command::new("where").arg(command).output().ok()?;
+    let output = util::hidden_command("where").arg(command).output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -80,7 +77,7 @@ pub(crate) fn which_on_path(command: &str) -> Option<PathBuf> {
 }
 
 fn grok_version_at(path: &Path) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
+    let output = util::hidden_command(path).arg("--version").output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -148,18 +145,14 @@ fn install_grok() -> CommandResult {
 }
 
 fn spawn_hidden_grok_login(grok: &Path) -> std::io::Result<()> {
-    let mut command = Command::new(grok);
-    command
+    util::hidden_command(grok)
         .arg("login")
         .arg("--oauth")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-
-    command.spawn().map(|_| ())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -188,41 +181,56 @@ fn open_grok_login() -> CommandResult {
 
 #[tauri::command]
 fn check_grok_updates() -> CommandResult {
-    let grok = match resolve_grok_executable() {
-        Some(path) => path,
-        None => {
+    // Read grok's own version state from ~/.grok/version.json, which its
+    // background auto-updater keeps fresh. Spawning `grok update --check` returns
+    // "program not found" when launched from this app's process context (it works
+    // from a shell — an environment quirk we couldn't reproduce or pin down), so
+    // we read the authoritative file instead: instant, and no fragile subprocess.
+    if resolve_grok_executable().is_none() {
+        return CommandResult {
+            success: false,
+            message: "Grok Build is not installed.".into(),
+        };
+    }
+
+    let path = grok_home().join("version.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => {
+            // No cached file yet — report the installed version directly.
+            let installed = resolve_grok_executable()
+                .as_deref()
+                .and_then(grok_version_at)
+                .unwrap_or_else(|| "unknown version".to_string());
             return CommandResult {
-                success: false,
-                message: "Grok Build is not installed.".into(),
+                success: true,
+                message: format!("Installed: {installed}. Grok manages its own updates."),
             };
         }
     };
 
-    let output = Command::new(grok).arg("update").arg("--check").output();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return CommandResult {
+            success: true,
+            message: "Grok Build manages its own updates.".into(),
+        };
+    };
 
-    match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            let message = if stdout.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                stdout.trim().to_string()
-            };
+    let current = v.get("version").and_then(|x| x.as_str()).unwrap_or("?");
+    let latest = v
+        .get("stable_version")
+        .and_then(|x| x.as_str())
+        .unwrap_or(current);
 
-            CommandResult {
-                success: result.status.success(),
-                message: if message.is_empty() {
-                    "Update check completed.".into()
-                } else {
-                    message
-                },
-            }
-        }
-        Err(error) => CommandResult {
-            success: false,
-            message: format!("Failed to check updates: {error}"),
-        },
+    let message = if !latest.is_empty() && latest != "?" && latest != current {
+        format!("Update available: v{current} → v{latest}. Grok auto-updates; run `grok update` to apply it now.")
+    } else {
+        format!("Grok Build is up to date — v{current}.")
+    };
+
+    CommandResult {
+        success: true,
+        message,
     }
 }
 
@@ -643,15 +651,103 @@ fn test_provider(id: String) -> CommandResult {
     CommandResult { success, message }
 }
 
+// -------------------------------------------------------------- automations
+
+#[tauri::command]
+fn list_automations() -> Vec<jobs::Automation> {
+    jobs::list_automations()
+}
+
+#[tauri::command]
+fn save_automation(
+    job_mgr: State<'_, Arc<JobManager>>,
+    automation: jobs::Automation,
+) -> Result<jobs::Automation, String> {
+    let saved = jobs::save_automation(automation)?;
+    job_mgr.wake();
+    Ok(saved)
+}
+
+#[tauri::command]
+fn delete_automation(job_mgr: State<'_, Arc<JobManager>>, id: String) -> Result<(), String> {
+    jobs::delete_automation(&id)?;
+    job_mgr.wake();
+    Ok(())
+}
+
+#[tauri::command]
+async fn run_automation_now(
+    app: tauri::AppHandle,
+    job_mgr: State<'_, Arc<JobManager>>,
+    automation_id: String,
+) -> Result<String, String> {
+    let automation =
+        jobs::get_automation(&automation_id).ok_or_else(|| "Automation not found".to_string())?;
+    let jm = job_mgr.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        jm.start_run(app, automation, "manual".to_string(), 0)
+    })
+    .await
+    .map_err(|e| format!("Failed to start run: {e}"))?
+}
+
+#[tauri::command]
+fn cancel_run(job_mgr: State<'_, Arc<JobManager>>, run_id: String) -> Result<(), String> {
+    job_mgr.cancel_run(&run_id)
+}
+
+#[tauri::command]
+fn set_automations_paused(
+    job_mgr: State<'_, Arc<JobManager>>,
+    paused: bool,
+) -> Result<(), String> {
+    job_mgr.set_paused(paused);
+    job_mgr.wake();
+    Ok(())
+}
+
+#[tauri::command]
+fn get_automations_paused() -> bool {
+    jobs::is_paused()
+}
+
+#[tauri::command]
+fn list_automation_runs(automation_id: String) -> Vec<jobs::RunRecord> {
+    jobs::list_runs(&automation_id)
+}
+
+#[tauri::command]
+fn read_run_log(automation_id: String, run_id: String) -> Result<String, String> {
+    jobs::read_run_log(&automation_id, &run_id)
+}
+
+#[tauri::command]
+fn mark_runs_seen(automation_id: String, run_ids: Vec<String>) -> Result<(), String> {
+    jobs::mark_runs_seen(&automation_id, run_ids)
+}
+
+#[tauri::command]
+fn automation_failure_count() -> usize {
+    jobs::unseen_failure_count()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let acp = Arc::new(AcpManager::default());
     let acp_exit = acp.clone();
+    let job_mgr = Arc::new(JobManager::default());
+    let jobs_exit = job_mgr.clone();
+    let jobs_sched = job_mgr.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(acp)
+        .manage(job_mgr)
+        .setup(move |app| {
+            jobs::spawn_scheduler(app.handle().clone(), jobs_sched);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_grok_status,
             install_grok,
@@ -678,13 +774,25 @@ pub fn run() {
             get_active_provider,
             set_active_provider,
             get_provider_status,
-            test_provider
+            test_provider,
+            list_automations,
+            save_automation,
+            delete_automation,
+            run_automation_now,
+            cancel_run,
+            set_automations_paused,
+            get_automations_paused,
+            list_automation_runs,
+            read_run_log,
+            mark_runs_seen,
+            automation_failure_count
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(move |_app, event| {
             if let tauri::RunEvent::Exit = event {
                 acp_exit.close_all();
+                jobs_exit.cancel_all();
             }
         });
 }

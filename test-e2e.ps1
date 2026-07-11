@@ -68,6 +68,13 @@ Assert-True ($null -ne $status.result.content[0].text) "MCP app status returns t
 $projects = Invoke-McpRpc "tools/call" 4 @{ name = "swervebuild_list_projects"; arguments = @{} }
 Assert-True ($projects.result.content[0].text -match "projects") "MCP swervebuild_list_projects"
 
+# Automation tools are exposed to agents
+$toolNames = $tools.result.tools | ForEach-Object { $_.name }
+Assert-True ($toolNames -contains "swervebuild_list_automations") "MCP exposes swervebuild_list_automations"
+Assert-True ($toolNames -contains "swervebuild_list_automation_runs") "MCP exposes swervebuild_list_automation_runs"
+$autos = Invoke-McpRpc "tools/call" 6 @{ name = "swervebuild_list_automations"; arguments = @{} }
+Assert-True (-not $autos.result.isError -and $autos.result.content[0].text -match "automations") "MCP swervebuild_list_automations"
+
 # Legacy tool aliases still work
 $legacyStatus = Invoke-McpRpc "tools/call" 5 @{ name = "swervegrok_get_app_status"; arguments = @{} }
 Assert-True (-not $legacyStatus.result.isError) "MCP legacy swervegrok_get_app_status alias"

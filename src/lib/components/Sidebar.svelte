@@ -1,17 +1,23 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { navItems } from "$lib/nav";
   import { createChat } from "$lib/workspace";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
+  import { automationsStore } from "$lib/stores/automations.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
   import Wordmark from "./Wordmark.svelte";
   import Icon from "./ui/Icon.svelte";
 
-  const appVersion = "0.1.1";
+  const appVersion = "0.2.0";
   let creating = $state(false);
 
   const recent = $derived(workspaceStore.recent(7));
+
+  onMount(() => {
+    automationsStore.refreshFailures();
+  });
 
   function isActive(href: string): boolean {
     const path = $page.url.pathname;
@@ -60,6 +66,11 @@
       >
         <span class="nav-icon"><Icon name={item.icon} size={17} /></span>
         <span class="nav-label">{item.label}</span>
+        {#if item.id === "automations" && automationsStore.failureCount > 0}
+          <span class="nav-badge" title="{automationsStore.failureCount} failed run(s)">
+            {automationsStore.failureCount}
+          </span>
+        {/if}
       </a>
     {/each}
   </nav>
@@ -183,6 +194,21 @@
   }
   .nav-label {
     font-size: 0.875rem;
+  }
+  .nav-badge {
+    margin-left: auto;
+    min-width: 1.15rem;
+    height: 1.15rem;
+    padding: 0 0.35rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-pill);
+    background: var(--danger);
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1;
   }
 
   .recent {

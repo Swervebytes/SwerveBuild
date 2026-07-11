@@ -98,6 +98,20 @@
   </section>
 
   <section class="card">
+    <div class="group-head">
+      <h2 class="group-title">Automations &amp; safety</h2>
+      <StatusPill tone="accent" label="Shadow mode default" />
+    </div>
+    <p class="group-note">
+      Automations run Grok headless on a trigger. By default they use read-only tools — enforced in
+      the app itself, not just the UI — so they can read and reason about your project but cannot
+      change files. Grok's own approval prompts and the OS sandbox don't apply to background runs on
+      Windows, so anything that could write is deliberately gated and confined to the automation's
+      project folder. Up to 2 automations run at once, and they run while Swerve Build is open.
+    </p>
+  </section>
+
+  <section class="card">
     <h2 class="group-title">Application</h2>
     <p class="group-note">
       Up to 3 chats stay connected in the background. Switching between them reconnects instantly;
@@ -107,7 +121,7 @@
 
   <section class="card about">
     <h2 class="group-title">About</h2>
-    <p class="about-line">Swerve Build v0.1.1</p>
+    <p class="about-line">Swerve Build v0.2.0</p>
     <p class="about-line muted">MIT License · Open source</p>
   </section>
 </div>

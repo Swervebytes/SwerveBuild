@@ -10,8 +10,8 @@ export type NavItem = {
 export const navItems: NavItem[] = [
   { id: "home", label: "Home", href: "/", icon: "home" },
   { id: "projects", label: "Projects", href: "/projects", icon: "folder" },
+  { id: "automations", label: "Automations", href: "/automations", icon: "zap" },
   { id: "memories", label: "Memories", href: "/memories", icon: "memory" },
   { id: "skills", label: "Skills", href: "/skills", icon: "skills" },
-  { id: "terminal", label: "Terminal", href: "/terminal", icon: "terminal" },
   { id: "settings", label: "Settings", href: "/settings", icon: "settings" },
 ];

@@ -5,18 +5,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const CONNECT_TIMEOUT_SECS: u64 = 45;
 const PROMPT_TIMEOUT_SECS: u64 = 300;
@@ -157,7 +151,7 @@ impl AcpManager {
         chat_id: &str,
         stored_session_id: Option<&str>,
     ) -> Result<String, String> {
-        let mut command = Command::new(&launch.command);
+        let mut command = crate::util::hidden_command(&launch.command);
         command
             .args(&launch.args)
             .envs(launch.env.iter().cloned())
@@ -165,9 +159,6 @@ impl AcpManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = command
             .spawn()
@@ -206,6 +197,8 @@ impl AcpManager {
         let transport_for_reader = Arc::clone(&transport);
         let app_for_reader = app.clone();
         let chat_for_reader = chat_id.to_string();
+        // The agent's fs/read|write requests are confined to this project dir.
+        let cwd_for_reader = cwd.to_string();
 
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -246,19 +239,26 @@ impl AcpManager {
                         continue;
                     }
 
-                    if let Some(id) = value.get("id").and_then(|id| id.as_u64()) {
-                        if let Some(response) =
-                            handle_client_request(method, value.get("params"))
-                        {
-                            let reply = json!({
+                    if let Some(id) = value.get("id").cloned().filter(|v| !v.is_null()) {
+                        // Every agent->client request gets a reply. Unhandled
+                        // methods and out-of-scope fs paths get a JSON-RPC error
+                        // instead of silence (silence hangs a strict peer) or an
+                        // unrestricted filesystem read/write (the old behavior).
+                        let reply = match handle_client_request(
+                            method,
+                            value.get("params"),
+                            &cwd_for_reader,
+                        ) {
+                            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                            Err((code, message)) => json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
-                                "result": response,
-                            });
-                            if let Ok(mut writer) = transport_for_reader.stdin.lock() {
-                                let _ = writeln!(writer, "{}", reply.to_string());
-                                let _ = writer.flush();
-                            }
+                                "error": { "code": code, "message": message },
+                            }),
+                        };
+                        if let Ok(mut writer) = transport_for_reader.stdin.lock() {
+                            let _ = writeln!(writer, "{}", reply);
+                            let _ = writer.flush();
                         }
                         continue;
                     }
@@ -292,7 +292,7 @@ impl AcpManager {
                 "clientInfo": {
                     "name": "swerve-build",
                     "title": "Swerve Build",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }),
             CONNECT_TIMEOUT_SECS,
@@ -557,23 +557,92 @@ fn resolve_mcp_binary() -> Result<String, String> {
     Err("swervebuild-mcp binary not found. Rebuild the project.".to_string())
 }
 
-fn handle_client_request(method: &str, params: Option<&Value>) -> Option<Value> {
+/// Handle an agent->client JSON-RPC request. Returns `Ok(result)` or
+/// `Err((code, message))` (a JSON-RPC error object). The two `fs/*` methods are
+/// confined to `cwd` (the chat's project directory) — an agent can no longer
+/// read or overwrite arbitrary files on disk. Everything else is method-not-found.
+fn handle_client_request(
+    method: &str,
+    params: Option<&Value>,
+    cwd: &str,
+) -> Result<Value, (i64, String)> {
     match method {
         "fs/read_text_file" => {
-            let path = params?.get("path")?.as_str()?;
-            let content = fs::read_to_string(path).ok()?;
-            Some(json!({ "content": content }))
+            let path = params
+                .and_then(|p| p.get("path"))
+                .and_then(|p| p.as_str())
+                .ok_or((-32602, "missing path".to_string()))?;
+            let target = confine_to_cwd(path, cwd)
+                .ok_or((-32001, format!("path outside project directory: {path}")))?;
+            let content = fs::read_to_string(&target)
+                .map_err(|e| (-32000, format!("read failed: {e}")))?;
+            Ok(json!({ "content": content }))
         }
         "fs/write_text_file" => {
-            let path = params?.get("path")?.as_str()?;
-            let content = params?.get("content")?.as_str()?;
-            if let Some(parent) = Path::new(path).parent() {
+            let path = params
+                .and_then(|p| p.get("path"))
+                .and_then(|p| p.as_str())
+                .ok_or((-32602, "missing path".to_string()))?;
+            let content = params
+                .and_then(|p| p.get("content"))
+                .and_then(|p| p.as_str())
+                .ok_or((-32602, "missing content".to_string()))?;
+            let target = confine_to_cwd(path, cwd)
+                .ok_or((-32001, format!("path outside project directory: {path}")))?;
+            if let Some(parent) = target.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            fs::write(path, content).ok()?;
-            Some(Value::Null)
+            fs::write(&target, content).map_err(|e| (-32000, format!("write failed: {e}")))?;
+            Ok(Value::Null)
         }
-        _ => None,
+        other => Err((-32601, format!("method not supported: {other}"))),
+    }
+}
+
+/// Resolve `requested` (absolute or relative to `cwd`) and return it only if it
+/// stays inside the canonicalized `cwd`. `..` is collapsed lexically and the
+/// prefix check is case-insensitive (Windows). Returns None on any escape.
+fn confine_to_cwd(requested: &str, cwd: &str) -> Option<PathBuf> {
+    let root = strip_verbatim(&fs::canonicalize(cwd).ok()?);
+    let req = Path::new(requested);
+    let abs = if req.is_absolute() {
+        req.to_path_buf()
+    } else {
+        root.join(req)
+    };
+    let normalized = normalize_lexical(&abs);
+
+    let n = normalized.to_string_lossy().to_lowercase();
+    let r = root.to_string_lossy().to_lowercase();
+    let inside = n == r
+        || n.starts_with(&format!("{r}\\"))
+        || n.starts_with(&format!("{r}/"));
+    inside.then_some(normalized)
+}
+
+/// Collapse `.` and `..` components without touching the filesystem.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Strip Windows' `\\?\` verbatim prefix that `canonicalize` adds, so paths
+/// compare and print naturally.
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
     }
 }
 

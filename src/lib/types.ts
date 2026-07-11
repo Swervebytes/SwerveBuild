@@ -66,3 +66,105 @@ export type PermissionRequest = {
     options?: Array<{ optionId: string; name: string; kind: string }>;
   };
 };
+
+// ----- Automations (triggered agent orchestration) -----
+
+export type ExecMode = "shadow" | "write";
+
+export type ScheduleTrigger = {
+  kind: "schedule";
+  every: string; // "interval" | "daily" | "weekly"
+  interval_minutes: number;
+  hour: number;
+  minute: number;
+  weekday: number;
+  tz_offset_minutes: number;
+};
+
+export type Trigger =
+  | { kind: "manual" }
+  | ScheduleTrigger
+  | { kind: "git"; branch: string | null; last_seen_commit: string | null }
+  | { kind: "file"; path: string; glob: string | null; snapshot: string | null };
+
+export type Executor = {
+  prompt: string;
+  mode: ExecMode;
+  tools: string[];
+  deny: string[];
+  rules: string | null;
+  effort: string | null;
+  max_turns: number;
+  cwd: string;
+  web_search: boolean;
+  json_schema: unknown | null;
+  timeout_secs: number;
+  report_dir: string | null;
+};
+
+export type AutomationState = {
+  last_fired_at: number | null;
+  last_run_id: string | null;
+  last_status: string | null;
+  last_idempotency_key: string | null;
+};
+
+export type Automation = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  project_id: string | null;
+  trigger: Trigger;
+  executor: Executor;
+  overlap: "skip" | "replace";
+  retry: { launch_failure_only: boolean; backoff_secs: number[] };
+  chain_input: { from: string } | null;
+  min_interval_secs: number;
+  created_at: string;
+  updated_at: string;
+  state: AutomationState;
+};
+
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "success"
+  | "error"
+  | "cancelled"
+  | "timeout"
+  | "maxturns"
+  | "launchfailed"
+  | "unknown";
+
+export type RunRecord = {
+  id: string;
+  automation_id: string;
+  trigger_reason: string;
+  attempt: number;
+  mode: ExecMode;
+  status: RunStatus;
+  started_at: string;
+  finished_at: string | null;
+  exit_code: number | null;
+  stop_reason: string | null;
+  session_id: string | null;
+  structured_output: unknown | null;
+  final_text: string | null;
+  error: string | null;
+  seen: boolean;
+  log_file: string;
+};
+
+export type RunOutput = {
+  automationId: string;
+  runId: string;
+  type: "thought" | "text";
+  text: string;
+};
+
+export type RunFinished = {
+  automationId: string;
+  runId: string;
+  status: RunStatus;
+  error: string | null;
+};

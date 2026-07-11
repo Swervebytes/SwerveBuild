@@ -11,13 +11,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -133,19 +126,29 @@ impl ProviderStore {
         if !path.exists() {
             return ProviderStore::default();
         }
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return ProviderStore::default();
+        };
+        match serde_json::from_str(&raw) {
+            Ok(store) => store,
+            Err(err) => {
+                if let Some(dest) =
+                    crate::paths::quarantine_corrupt(&path, &crate::store::Store::now())
+                {
+                    eprintln!(
+                        "providers.json failed to parse ({err}); quarantined to {}",
+                        dest.display()
+                    );
+                }
+                ProviderStore::default()
+            }
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
         let path = Self::path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, raw).map_err(|e| e.to_string())
+        crate::paths::write_atomic(&path, raw.as_bytes()).map_err(|e| e.to_string())
     }
 }
 
@@ -235,12 +238,10 @@ pub fn resolve_launch(provider: &Provider) -> Result<AcpLaunch, String> {
 }
 
 fn command_version(path: &Path) -> Option<String> {
-    let mut cmd = Command::new(path);
-    cmd.arg("--version");
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let output = cmd.output().ok()?;
+    let output = crate::util::hidden_command(path)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

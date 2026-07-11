@@ -1,6 +1,7 @@
 //! App-local data under `~/.swervebuild`. Migrates from legacy `~/.swervegrok` on first use.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
@@ -87,4 +88,43 @@ pub fn providers_file() -> PathBuf {
 
 pub fn attachments_dir() -> PathBuf {
     data_dir().join("attachments")
+}
+
+/// Automation definitions (triggered-agent orchestration). Separate from
+/// `data.json` so the background scheduler never races chat writes.
+pub fn automations_file() -> PathBuf {
+    data_dir().join("automations.json")
+}
+
+/// Per-automation run records + transcripts live under `runs/<automation_id>/`.
+pub fn runs_dir() -> PathBuf {
+    data_dir().join("runs")
+}
+
+pub fn run_dir(automation_id: &str) -> PathBuf {
+    runs_dir().join(automation_id)
+}
+
+/// Write bytes atomically: write to a sibling `<path>.tmp` then rename over the
+/// target. On Windows `fs::rename` maps to `MoveFileExW` with REPLACE_EXISTING,
+/// so a crash mid-write can never leave a torn primary file. Creates parents.
+pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)
+}
+
+/// Rename a file that failed to parse to `<name>.corrupt-<suffix>` instead of
+/// silently overwriting it on the next save. Returns the quarantine path on
+/// success so the caller can log it. Best-effort — never panics.
+pub fn quarantine_corrupt(path: &Path, suffix: &str) -> Option<PathBuf> {
+    let mut dest = path.as_os_str().to_owned();
+    dest.push(format!(".corrupt-{suffix}"));
+    let dest = PathBuf::from(dest);
+    fs::rename(path, &dest).ok().map(|_| dest)
 }

@@ -51,11 +51,38 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["chat_id"]
             }),
         },
+        ToolDef {
+            name: "swervebuild_list_automations".into(),
+            description: "List Swerve Build automations (triggered agents): id, name, whether enabled, trigger, execution mode, and last run status.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "swervebuild_list_automation_runs".into(),
+            description: "List recent runs for an automation: run id, status, what triggered it, timestamps, and final output.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "automation_id": { "type": "string", "description": "Swerve Build automation id" },
+                    "limit": { "type": "number", "description": "Max runs to return (default 10)" }
+                },
+                "required": ["automation_id"]
+            }),
+        },
     ]
 }
 
 fn data_path() -> PathBuf {
     swerve_build_lib::paths::data_file()
+}
+
+fn load_json(path: PathBuf) -> Value {
+    if !path.exists() {
+        return json!({});
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}))
 }
 
 fn load_store() -> Value {
@@ -123,11 +150,74 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .collect();
             Ok(json!({ "chats": filtered }))
         }
-        "swervebuild_get_app_status" | "swervegrok_get_app_status" => Ok(json!({
-            "data_path": data_path().display().to_string(),
-            "project_count": store.get("projects").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0),
-            "chat_count": store.get("chats").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0),
-        })),
+        "swervebuild_get_app_status" | "swervegrok_get_app_status" => {
+            let autos = load_json(swerve_build_lib::paths::automations_file());
+            Ok(json!({
+                "data_path": data_path().display().to_string(),
+                "project_count": store.get("projects").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0),
+                "chat_count": store.get("chats").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0),
+                "automation_count": autos.get("automations").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0),
+                "automations_paused": autos.get("paused").and_then(|v| v.as_bool()).unwrap_or(false),
+            }))
+        }
+        "swervebuild_list_automations" | "swervegrok_list_automations" => {
+            let autos = load_json(swerve_build_lib::paths::automations_file());
+            let paused = autos.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+            let list = autos.get("automations").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+            let out: Vec<Value> = list
+                .iter()
+                .map(|a| {
+                    json!({
+                        "id": a.get("id"),
+                        "name": a.get("name"),
+                        "enabled": a.get("enabled"),
+                        "project_id": a.get("project_id"),
+                        "trigger": a.get("trigger"),
+                        "mode": a.get("executor").and_then(|e| e.get("mode")),
+                        "last_status": a.get("state").and_then(|s| s.get("last_status")),
+                        "last_fired_at": a.get("state").and_then(|s| s.get("last_fired_at")),
+                    })
+                })
+                .collect();
+            Ok(json!({ "paused": paused, "automations": out }))
+        }
+        "swervebuild_list_automation_runs" | "swervegrok_list_automation_runs" => {
+            let automation_id = args
+                .get("automation_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "automation_id required".to_string())?;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let dir = swerve_build_lib::paths::run_dir(automation_id);
+            let mut runs: Vec<Value> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                        continue; // skip .jsonl transcripts and .prompt.txt
+                    }
+                    if let Some(v) = std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    {
+                        runs.push(json!({
+                            "run_id": v.get("id"),
+                            "status": v.get("status"),
+                            "trigger_reason": v.get("trigger_reason"),
+                            "started_at": v.get("started_at"),
+                            "finished_at": v.get("finished_at"),
+                            "final_text": v.get("final_text"),
+                        }));
+                    }
+                }
+            }
+            runs.sort_by(|a, b| {
+                let sa = a.get("started_at").and_then(|s| s.as_str()).unwrap_or("");
+                let sb = b.get("started_at").and_then(|s| s.as_str()).unwrap_or("");
+                sb.cmp(sa) // newest first
+            });
+            runs.truncate(limit);
+            Ok(json!({ "runs": runs }))
+        }
         "swervebuild_get_chat_summary" | "swervegrok_get_chat_summary" => {
             let chat_id = args
                 .get("chat_id")
@@ -161,7 +251,7 @@ fn handle(request: &RpcRequest) -> Option<Value> {
             "capabilities": { "tools": {} },
             "serverInfo": {
                 "name": "swervebuild-mcp",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             }
         }),
         "notifications/initialized" => return None,

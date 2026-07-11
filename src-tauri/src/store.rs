@@ -38,10 +38,30 @@ pub struct Chat {
     pub provider_id: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+fn default_store_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AppStore {
+    /// Schema version. Absent in pre-1.0 files (serde default = 1). Bump + add a
+    /// migration branch in `load()` when the shape changes.
+    #[serde(default = "default_store_version")]
+    pub version: u32,
+    #[serde(default)]
     pub projects: Vec<Project>,
+    #[serde(default)]
     pub chats: Vec<Chat>,
+}
+
+impl Default for AppStore {
+    fn default() -> Self {
+        AppStore {
+            version: default_store_version(),
+            projects: Vec::new(),
+            chats: Vec::new(),
+        }
+    }
 }
 
 pub struct Store;
@@ -57,20 +77,31 @@ impl Store {
             return AppStore::default();
         }
 
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+        let Ok(raw) = fs::read_to_string(&path) else {
+            return AppStore::default();
+        };
+
+        match serde_json::from_str(&raw) {
+            Ok(store) => store,
+            Err(err) => {
+                // A corrupt/truncated file must NOT be silently replaced with an
+                // empty store on the next save. Quarantine it so the data is
+                // recoverable, and surface the reason.
+                if let Some(dest) = crate::paths::quarantine_corrupt(&path, &Self::now()) {
+                    eprintln!(
+                        "data.json failed to parse ({err}); quarantined to {}",
+                        dest.display()
+                    );
+                }
+                AppStore::default()
+            }
+        }
     }
 
     pub fn save(store: &AppStore) -> Result<(), String> {
         let path = Self::data_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-
         let raw = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-        fs::write(path, raw).map_err(|e| e.to_string())
+        crate::paths::write_atomic(&path, raw.as_bytes()).map_err(|e| e.to_string())
     }
 
     pub fn now() -> String {

@@ -105,9 +105,9 @@
 
   const quickLinks: { href: string; icon: IconName; label: string; desc: string }[] = [
     { href: "/projects", icon: "folder", label: "Projects", desc: "Repos & chats" },
+    { href: "/automations", icon: "zap", label: "Automations", desc: "Triggered agents" },
     { href: "/memories", icon: "memory", label: "Memories", desc: "Grok memory" },
     { href: "/skills", icon: "skills", label: "Skills", desc: "Installed skills" },
-    { href: "/terminal", icon: "terminal", label: "Terminal", desc: "CLI access" },
     { href: "/settings", icon: "settings", label: "Settings", desc: "Providers & theme" },
   ];
 </script>

@@ -14,7 +14,7 @@ A clean, minimal Windows desktop app for [Grok Build CLI](https://github.com/xai
 
 ## Install (users)
 
-1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`). Prefer the newest version (v0.1.1+ includes chat reliability fixes).
+1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`). Prefer the newest version (v0.2.0+ adds Automations).
 2. Run the installer and open **Swerve Build**.
 3. On the home screen, click **Install Grok Build** (installs the official Grok CLI to `~/.grok/`).
 4. Click **Sign In** and complete OAuth in your browser.
@@ -40,10 +40,15 @@ The home screen shows your **active provider** and whether it is ready.
 - **Home** — Grok install, OAuth sign-in, update check, active provider status
 - **Projects** — folder-scoped repos and chats (persisted in `~/.swervebuild/`)
 - **Chat** — ACP streaming, image paste, tool approval UI, up to 3 concurrent sessions
+- **Automations** — run Grok headless on a trigger (schedule, git commit, file change, or on demand). Read-only "shadow" mode by default, live run transcripts, and a Map view of your whole automation fleet
 - **Memories** — edit Grok's global `MEMORY.md`
 - **Skills** — browse installed Grok skills
 - **Settings** — theme and provider picker
-- **MCP sidecar** — `swervebuild-mcp` exposes app state to agents in chat
+- **MCP sidecar** — `swervebuild-mcp` exposes projects, chats, and automations to agents in chat
+
+### Automations
+
+Turn any repeatable agent task into a rule: a **trigger** (a schedule, a new commit on a branch, a changed file, or a manual "Run now") fires a headless Grok run against a project. Every automation is born in **shadow mode** — a read-only tool set enforced in the app itself, so a background agent can read and reason but never touch your files (write mode is gated behind a later build). Runs stream live, are recorded as durable transcripts under `~/.swervebuild/runs/`, and can chain one automation's output into another. Switch the Automations page to **Map view** to see the whole fleet as a live graph. Automations run while Swerve Build is open.
 
 ## Develop
 
@@ -80,7 +85,7 @@ npm run tauri dev    # Full desktop app with hot reload
 npm run release
 ```
 
-Output: `src-tauri/target/release/bundle/nsis/Swerve Build_0.1.1_x64-setup.exe`
+Output: `src-tauri/target/release/bundle/nsis/Swerve Build_0.2.0_x64-setup.exe`
 
 Upload the `*-setup.exe` to GitHub Releases. The script builds the frontend and Rust binaries, stages the MCP sidecar, bundles with Tauri, then restores dev-friendly config.
 
