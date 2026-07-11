@@ -1,64 +1,74 @@
-# Swerve Build
-
-A clean, minimal Windows desktop app for [Grok Build CLI](https://github.com/xai-org/grok-cli) and other ACP agents. Project-scoped chats, tool approval, memories, skills, and multi-provider support — in one native shell.
-
 <p align="center">
-  <img src="docs/screenshot-home.png" alt="Swerve Build home screen — Grok install, sign-in, and quick links" width="820" />
+  <img src="docs/hero.png" alt="Swerve Build — a native Windows shell for Grok Build and ACP agents" width="880" />
 </p>
 
 <p align="center">
-  <img src="docs/screenshot-settings.png" alt="Swerve Build settings — theme and multi-provider agent picker" width="820" />
+  A clean desktop home for <a href="https://github.com/xai-org/grok-cli">Grok Build</a> &amp; ACP coding agents —<br/>
+  project chats, tool approval, memories, skills, and <b>triggered automations</b>, in one native Windows shell.
 </p>
 
-**License:** MIT
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows-0d1220?style=flat-square" alt="Windows" />
+  <img src="https://img.shields.io/badge/built_with-Tauri_2_·_Rust_·_Svelte_5-0d1220?style=flat-square" alt="Tauri · Rust · Svelte" />
+  <img src="https://img.shields.io/badge/license-MIT-0d1220?style=flat-square" alt="MIT" />
+  <img src="https://img.shields.io/badge/version-0.2.0-6cb5ff?style=flat-square" alt="v0.2.0" />
+</p>
 
-## Install (users)
+---
 
-1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`). Prefer the newest version (v0.2.0+ adds Automations).
-2. Run the installer and open **Swerve Build**.
-3. On the home screen, click **Install Grok Build** (installs the official Grok CLI to `~/.grok/`).
-4. Click **Sign In** and complete OAuth in your browser.
-5. Open **Projects**, add a folder, and start a chat.
+## Why Swerve Build
+
+Grok Build and other ACP agents are powerful on the command line — Swerve Build gives them a calm, native home on Windows. Scope work to a project, watch tool calls stream with an approval gate, keep memories and skills close, and — new in **v0.2.0** — let agents **run themselves** on a schedule, a commit, or a file change.
+
+## Highlights
+
+|  |  |
+|---|---|
+| **Project chats** | Folder-scoped conversations with ACP streaming, image paste, and a tool-approval UI. Up to 3 run concurrently. |
+| **Automations** | Trigger headless Grok runs on a schedule, git commit, file change, or on demand — read-only by default. |
+| **Multi-provider** | Grok works out of the box; drop in Claude Code or Gemini by putting their CLI on your PATH. |
+| **Memories &amp; Skills** | Edit Grok's memory and browse installed skills without leaving the app. |
+| **MCP sidecar** | Exposes your projects, chats, and automations to agents *inside* chat. |
+
+## Automations
+
+<p align="center">
+  <img src="docs/screenshot-automations.png" alt="Swerve Build Automations — triggered headless agents with shadow-mode safety" width="880" />
+</p>
+
+Turn any repeatable agent task into a rule. A **trigger** — a schedule, a new commit on a branch, a changed file, or a manual **Run now** — fires a headless Grok run against a project.
+
+- **Safe by default.** Every automation starts in **shadow mode**: a read-only tool set enforced in the app itself, so a background agent can read and reason but never touch your files. *(Write mode is gated behind a later build.)*
+- **Fully auditable.** Runs stream live and are saved as durable transcripts under `~/.swervebuild/runs/`.
+- **Composable.** Chain one automation's output into another's prompt.
+- **Visual.** Flip the Automations page to **Map view** to see your whole fleet as a live graph.
+
+Start from a one-click recipe — *Project summary*, *Doc-drift check*, *Find loose ends*, *Review-on-change* — and tweak from there. Automations run while Swerve Build is open.
+
+## Install
 
 No Node.js or Rust required for end users.
 
+1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`) — prefer **v0.2.0+**.
+2. Run it and open **Swerve Build**.
+3. On the home screen, click **Install Grok Build** (installs the official Grok CLI to `~/.grok/`).
+4. Click **Sign In** and finish OAuth in your browser.
+5. Open **Projects**, add a folder, and start a chat — or head to **Automations** and start from a recipe.
+
 ### Using other agents
 
-Open **Settings → Providers** and pick an available agent:
+Open **Settings → Providers** and pick an available agent. The home screen shows your active provider and whether it's ready.
 
 | Provider | How to enable |
-|----------|----------------|
+|----------|---------------|
 | **Grok** (default) | Install + sign in on the home screen |
-| **Claude Code** | Install [claude-code-acp](https://www.npmjs.com/package/claude-code-acp) and ensure it is on your PATH |
-| **Gemini** | Install the Gemini CLI and ensure `gemini` is on your PATH |
-| **Ollama / OpenAI / Anthropic** | Listed as designed — HTTP chat is not spawnable yet |
-
-The home screen shows your **active provider** and whether it is ready.
-
-## Features
-
-- **Home** — Grok install, OAuth sign-in, update check, active provider status
-- **Projects** — folder-scoped repos and chats (persisted in `~/.swervebuild/`)
-- **Chat** — ACP streaming, image paste, tool approval UI, up to 3 concurrent sessions
-- **Automations** — run Grok headless on a trigger (schedule, git commit, file change, or on demand). Read-only "shadow" mode by default, live run transcripts, and a Map view of your whole automation fleet
-- **Memories** — edit Grok's global `MEMORY.md`
-- **Skills** — browse installed Grok skills
-- **Settings** — theme and provider picker
-- **MCP sidecar** — `swervebuild-mcp` exposes projects, chats, and automations to agents in chat
-
-### Automations
-
-Turn any repeatable agent task into a rule: a **trigger** (a schedule, a new commit on a branch, a changed file, or a manual "Run now") fires a headless Grok run against a project. Every automation is born in **shadow mode** — a read-only tool set enforced in the app itself, so a background agent can read and reason but never touch your files (write mode is gated behind a later build). Runs stream live, are recorded as durable transcripts under `~/.swervebuild/runs/`, and can chain one automation's output into another. Switch the Automations page to **Map view** to see the whole fleet as a live graph. Automations run while Swerve Build is open.
+| **Claude Code** | Install [`claude-code-acp`](https://www.npmjs.com/package/claude-code-acp) and put it on your PATH |
+| **Gemini** | Install the Gemini CLI and put `gemini` on your PATH |
+| **Ollama / OpenAI / Anthropic** | Listed as designed — direct HTTP chat isn't spawnable yet |
 
 ## Develop
 
-### Prerequisites
-
-1. [Node.js](https://nodejs.org/) 18+
-2. [Rust](https://www.rust-lang.org/tools/install) (`rustup`)
-3. [Tauri prerequisites for Windows](https://tauri.app/start/prerequisites/) — WebView2 and MSVC build tools
-
-### Quick start
+**Prerequisites:** [Node.js](https://nodejs.org/) 18+, [Rust](https://www.rust-lang.org/tools/install) (`rustup`), and the [Tauri Windows prerequisites](https://tauri.app/start/prerequisites/) (WebView2 + MSVC build tools).
 
 ```powershell
 git clone https://github.com/Swervebytes/SwerveBuild.git
@@ -69,57 +79,44 @@ npm run tauri dev
 
 > Do **not** double-click `target/debug/*.exe` directly — dev mode needs the Vite server.
 
-### Scripts
+| Script | What it does |
+|--------|--------------|
+| `npm run tauri dev` | Full desktop app with hot reload |
+| `npm run dev` | Frontend only, in a browser |
+| `npm run check` | Type-check Svelte |
+| `npm run test:e2e` | CLI tests (MCP always; ACP if grok + `SWERVE_E2E_CWD` set) |
+| `npm run release` | Production Windows installer |
 
-```powershell
-npm run dev          # Frontend only (browser)
-npm run check        # Type-check Svelte
-npm run test:e2e     # CLI tests (MCP always; ACP if grok + SWERVE_E2E_CWD set)
-npm run release      # Production installer (Windows)
-npm run tauri dev    # Full desktop app with hot reload
-```
-
-### Build installer (maintainers)
-
-```powershell
-npm run release
-```
-
-Output: `src-tauri/target/release/bundle/nsis/Swerve Build_0.2.0_x64-setup.exe`
-
-Upload the `*-setup.exe` to GitHub Releases. The script builds the frontend and Rust binaries, stages the MCP sidecar, bundles with Tauri, then restores dev-friendly config.
+The release output lands at `src-tauri/target/release/bundle/nsis/Swerve Build_0.2.0_x64-setup.exe`; upload the `*-setup.exe` to GitHub Releases.
 
 ## Data locations
 
 | Path | Purpose |
 |------|---------|
 | `~/.swervebuild/data.json` | Projects, chats, messages |
+| `~/.swervebuild/automations.json` | Automation definitions |
+| `~/.swervebuild/runs/` | Per-run transcripts |
 | `~/.swervebuild/providers.json` | Active provider preference |
-| `~/.swervebuild/attachments/` | Pasted chat images |
 | `~/.grok/` | Grok CLI (auth, skills, memory, sessions) |
 
-On first launch, existing `~/.swervegrok/` data is migrated automatically to `~/.swervebuild/`.
+Existing `~/.swervegrok/` data is migrated to `~/.swervebuild/` on first launch.
 
-## Stack
+## Stack &amp; structure
 
-- [Tauri 2](https://tauri.app/) — native binary
-- [SvelteKit](https://svelte.dev/) + Svelte 5 — SPA frontend
-- Rust — ACP session pool, persistence, Grok CLI integration
-
-## Project structure
+[Tauri 2](https://tauri.app/) native shell · [SvelteKit](https://svelte.dev/) + Svelte 5 frontend · Rust backend (ACP session pool, the automation runner, persistence, and the MCP sidecar).
 
 ```
-src/                  SvelteKit UI
-src-tauri/            Rust backend (Tauri + ACP + MCP)
-  src/acp.rs          Multi-chat session pool
-  src/paths.rs        App data dir + legacy migration
-  src/providers.rs    Multi-agent provider registry
-  src/bin/            swervebuild-mcp stdio server
-scripts/              Release build helper
+src/                    SvelteKit UI (routes, components, stores)
+src-tauri/src/
+  acp.rs                Multi-chat ACP session pool
+  jobs.rs               Automation runner + scheduler
+  providers.rs          Multi-agent provider registry
+  store.rs / paths.rs   Atomic persistence + data dir
+  bin/                  swervebuild-mcp stdio server
 ```
 
 ## Contributing
 
-Contributions welcome. Keep the UI clean and dependencies minimal. Open an issue before large architectural changes.
+Contributions welcome — keep the UI clean and dependencies minimal, and open an issue before large architectural changes. Maintainers: read [`.github/REPOSITORY_POLICY.md`](.github/REPOSITORY_POLICY.md) before pushing or cutting a release. Dependabot handles npm and Cargo updates weekly.
 
-Maintainers: read [`.github/REPOSITORY_POLICY.md`](.github/REPOSITORY_POLICY.md) before pushing or cutting releases. Dependabot handles npm and Cargo updates weekly.
+**License:** [MIT](LICENSE)

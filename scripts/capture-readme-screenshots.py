@@ -88,9 +88,12 @@ def capture(path: Path) -> None:
 
 
 def main() -> int:
-    for page, filename in (("Home", "screenshot-home.png"), ("Settings", "screenshot-settings.png")):
+    for page, filename in (
+        ("Home", "screenshot-home.png"),
+        ("Automations", "screenshot-automations.png"),
+    ):
         nav(page)
-        time.sleep(0.5)
+        time.sleep(0.8)
         capture(DOCS / filename)
     print("README screenshots updated in docs/")
     return 0

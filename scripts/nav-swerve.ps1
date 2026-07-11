@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory = $true)][ValidateSet("Home", "Settings")][string]$Page
+    [Parameter(Mandatory = $true)][ValidateSet("Home", "Projects", "Automations", "Memories", "Skills", "Settings")][string]$Page
 )
 
 Add-Type -AssemblyName UIAutomationClient
