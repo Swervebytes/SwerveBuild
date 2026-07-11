@@ -702,6 +702,32 @@ impl JobManager {
         let dir = crate::paths::run_dir(&automation_id);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
+        // The automation MUST have a real project folder to run in. Guard here so
+        // a missing/empty cwd fails with a clear reason instead of spawning grok
+        // in an undefined directory.
+        let cwd = automation.executor.cwd.trim();
+        if cwd.is_empty() || !std::path::Path::new(cwd).is_dir() {
+            let msg = if cwd.is_empty() {
+                "No project folder is set for this automation — open it and choose a project.".to_string()
+            } else {
+                format!("Project folder not found: {cwd}")
+            };
+            let rec = self.launch_failed_record(
+                &automation_id,
+                &run_id,
+                &trigger_reason,
+                attempt,
+                &automation.executor.mode,
+                &msg,
+            );
+            let _ = write_run_record(&rec);
+            let _ = app.emit(
+                "automation-run-finished",
+                json!({ "automationId": automation_id, "runId": run_id, "status": "launchfailed", "error": msg }),
+            );
+            return Err(msg);
+        }
+
         // Resolve chain input (latest successful upstream output) if any.
         let chain_text = automation
             .chain_input

@@ -28,6 +28,7 @@
 
   // editor
   let editing = $state<Automation | null>(null);
+  let editorError = $state<string | null>(null);
   let advanced = $state(false);
 
   // run history (per automation id)
@@ -97,6 +98,7 @@
   function openNew() {
     const p = projects[0];
     editing = newAutomation(p?.path ?? "", p?.id ?? null);
+    editorError = null;
     advanced = false;
     showRecipes = false;
   }
@@ -106,12 +108,14 @@
     const recipe = recipes.find((r) => r.id === recipeId);
     if (!recipe) return;
     editing = recipe.build(p?.path ?? "", p?.id ?? null);
+    editorError = null;
     advanced = false;
     showRecipes = false;
   }
 
   function openEdit(a: Automation) {
     editing = structuredClone($state.snapshot(a)) as Automation;
+    editorError = null;
     advanced = false;
   }
 
@@ -119,7 +123,8 @@
     if (!editing) return;
     const project = projects.find((p) => p.id === projectId);
     editing.project_id = projectId || null;
-    if (project) editing.executor.cwd = project.path;
+    editing.executor.cwd = project ? project.path : "";
+    editorError = null;
   }
 
   function setTriggerKind(kind: string) {
@@ -143,6 +148,11 @@
 
   async function save() {
     if (!editing) return;
+    if (!editing.executor.cwd.trim()) {
+      editorError = "Choose a project — an automation needs a folder to run in.";
+      return;
+    }
+    editorError = null;
     if (!editing.name.trim()) {
       editing.name = "Untitled automation";
     }
@@ -165,6 +175,13 @@
   }
 
   async function runNow(a: Automation) {
+    if (!a.executor.cwd.trim()) {
+      inspector = { automationId: a.id, runId: "", name: a.name };
+      inspectorStatus = "launchfailed";
+      inspectorError = "No project folder is set. Edit this automation and choose a project.";
+      transcript = [];
+      return;
+    }
     busy = a.id;
     transcript = [];
     inspectorStatus = "running";
@@ -233,6 +250,15 @@
   function isSilent(a: Automation): boolean {
     return a.state.last_status === "success";
   }
+
+  // The folder an automation runs in: its project's name, or the raw path.
+  function folderLabel(a: Automation): string {
+    const p = projects.find((x) => x.id === a.project_id);
+    return p ? p.name : a.executor.cwd;
+  }
+  function hasFolder(a: Automation): boolean {
+    return !!a.executor.cwd.trim();
+  }
 </script>
 
 <svelte:window
@@ -300,18 +326,24 @@
       </label>
 
       <label class="field">
-        <span class="field-label">Project</span>
+        <span class="field-label">Project — the folder the agent runs in</span>
         <select
           class="input"
           value={editing.project_id ?? ""}
           onchange={(e) => onProjectChange((e.target as HTMLSelectElement).value)}
         >
-          <option value="">No project</option>
+          <option value="">Choose a project…</option>
           {#each projects as p (p.id)}
             <option value={p.id}>{p.name}</option>
           {/each}
         </select>
-        <span class="field-hint">{editing.executor.cwd || "Sets the working directory for the agent."}</span>
+        {#if editing.executor.cwd}
+          <span class="field-hint">Runs in <code>{editing.executor.cwd}</code></span>
+        {:else if projects.length === 0}
+          <span class="field-hint warn">No projects yet — <a href="/projects">add a project folder</a> first.</span>
+        {:else}
+          <span class="field-hint warn">Pick a project — an automation needs a folder to run in.</span>
+        {/if}
       </label>
 
       <div class="field">
@@ -453,6 +485,9 @@
         </div>
       {/if}
 
+      {#if editorError}
+        <p class="editor-error">{editorError}</p>
+      {/if}
       <div class="editor-actions">
         <button class="btn btn-ghost" type="button" onclick={() => (editing = null)}>Cancel</button>
         <button class="btn btn-primary" type="button" disabled={busy === "save"} onclick={save}>
@@ -519,7 +554,12 @@
                     {/if}
                   </div>
                   <p class="auto-sub">
-                    {triggerSummary(a.trigger)} · {lastRunText(a)}
+                    {#if hasFolder(a)}
+                      <span class="folder" title={a.executor.cwd}><Icon name="folder" size={11} /> {folderLabel(a)}</span>
+                    {:else}
+                      <span class="folder warn"><Icon name="folder" size={11} /> No project — won't run</span>
+                    {/if}
+                    · {triggerSummary(a.trigger)} · {lastRunText(a)}
                   </p>
                 </div>
               </div>
@@ -724,6 +764,22 @@
     font-size: 0.75rem;
     color: var(--text-muted);
   }
+  .field-hint.warn {
+    color: var(--warning);
+  }
+  .field-hint code {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+  }
+  .editor-error {
+    font-size: 0.8125rem;
+    color: var(--danger);
+    background: var(--danger-tint);
+    border-radius: var(--radius-sm);
+    padding: 0.5rem 0.7rem;
+    margin-bottom: 0.6rem;
+  }
   .input {
     width: 100%;
     padding: 0.5rem 0.65rem;
@@ -891,6 +947,21 @@
     font-size: 0.8125rem;
     color: var(--text-muted);
     margin-top: 0.15rem;
+  }
+  .auto-sub .folder {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    color: var(--text-secondary);
+  }
+  .auto-sub .folder :global(svg) {
+    color: var(--sc-accent);
+  }
+  .auto-sub .folder.warn {
+    color: var(--warning);
+  }
+  .auto-sub .folder.warn :global(svg) {
+    color: var(--warning);
   }
   .auto-actions {
     display: flex;
