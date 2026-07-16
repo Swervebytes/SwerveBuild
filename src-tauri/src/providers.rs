@@ -106,6 +106,32 @@ pub fn builtin_providers() -> Vec<Provider> {
 
 // ---- persistence: ~/.swervebuild/providers.json -------------------------------
 
+/// Custom-endpoint config for the built-in Grok provider — lets users run Grok
+/// Build against their own OpenAI-compatible inference (local / self-hosted /
+/// BYOK) so code never leaves the machine. The heavy lifting (writing grok's
+/// `~/.grok/config.toml`) lives in `crate::grok_config`; this struct is just the
+/// persisted state. `api_key` is stored here (like the rest of providers.json,
+/// plaintext) and injected into grok's env at launch — never written to
+/// config.toml. `previous_default` remembers the `[models] default` we displaced
+/// when enabling, so disabling restores it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrokEndpoint {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_backend: String,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub previous_default: Option<String>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProviderStore {
     #[serde(default)]
@@ -114,6 +140,8 @@ pub struct ProviderStore {
     pub model: Option<String>,
     #[serde(default)]
     pub custom: Vec<Provider>,
+    #[serde(default)]
+    pub endpoint: GrokEndpoint,
 }
 
 impl ProviderStore {
@@ -227,10 +255,17 @@ pub fn resolve_launch(provider: &Provider) -> Result<AcpLaunch, String> {
                     )
                 }
             })?;
+            let mut env = provider.env.clone();
+            // A custom Grok endpoint routes via config.toml's global `[models]
+            // default`, so every grok process needs its API key — see
+            // `grok_endpoint_env`. The headless automation runner applies it too.
+            if provider.id == "grok" {
+                env.extend(grok_endpoint_env());
+            }
             Ok(AcpLaunch {
                 command,
                 args: provider.args.clone(),
-                env: provider.env.clone(),
+                env,
                 label: provider.label.clone(),
             })
         }
@@ -310,4 +345,68 @@ pub fn test(id: &str) -> (bool, String) {
             },
         },
     }
+}
+
+// ---- custom Grok endpoint -----------------------------------------------------
+
+pub fn get_endpoint() -> GrokEndpoint {
+    ProviderStore::load().endpoint
+}
+
+/// Env vars every `grok` process should get when a custom endpoint is enabled:
+/// the API key referenced by the managed config block's `env_key`. Empty when the
+/// endpoint is off or keyless. Both the interactive chat launch and the headless
+/// automation runner apply this, because endpoint routing (config.toml `[models]
+/// default`) is global to all grok invocations.
+pub fn grok_endpoint_env() -> Vec<(String, String)> {
+    let endpoint = ProviderStore::load().endpoint;
+    if endpoint.enabled && !endpoint.api_key.is_empty() {
+        vec![(crate::grok_config::API_KEY_ENV.to_string(), endpoint.api_key)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Persist the endpoint config and reflect it into `~/.grok/config.toml`.
+/// `new_key`: `Some` replaces the stored API key (empty string clears it);
+/// `None` keeps whatever was saved before. Base URL / model are trimmed.
+pub fn save_endpoint(mut endpoint: GrokEndpoint, new_key: Option<String>) -> Result<(), String> {
+    let mut store = ProviderStore::load();
+
+    endpoint.api_key = match new_key {
+        Some(key) => key,
+        None => store.endpoint.api_key.clone(),
+    };
+    // Carry forward the displaced-default memory before (re)applying.
+    endpoint.previous_default = store.endpoint.previous_default.clone();
+
+    let base_url = endpoint.base_url.trim().to_string();
+    let model = endpoint.model.trim().to_string();
+    let backend = endpoint.api_backend.trim().to_string();
+
+    let spec = crate::grok_config::EndpointSpec {
+        enabled: endpoint.enabled,
+        base_url: &base_url,
+        model: &model,
+        api_backend: if backend.is_empty() { None } else { Some(&backend) },
+        context_window: endpoint.context_window,
+    };
+    let displaced = crate::grok_config::apply(&spec, endpoint.previous_default.as_deref())?;
+
+    if endpoint.enabled {
+        // Only overwrite the remembered default if we actually displaced one this
+        // time (re-saving while already enabled displaces nothing — keep the old).
+        if let Some(prev) = displaced {
+            endpoint.previous_default = Some(prev);
+        }
+    } else {
+        endpoint.previous_default = None;
+    }
+
+    endpoint.base_url = base_url;
+    endpoint.model = model;
+    endpoint.api_backend = backend;
+
+    store.endpoint = endpoint;
+    store.save()
 }

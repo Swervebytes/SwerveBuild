@@ -1,4 +1,5 @@
 mod acp;
+mod grok_config;
 mod jobs;
 pub mod paths;
 mod providers;
@@ -38,7 +39,11 @@ pub struct CommandResult {
     pub message: String,
 }
 
-fn grok_home() -> PathBuf {
+pub(crate) fn grok_home() -> PathBuf {
+    // Match grok's own resolution: `$GROK_HOME` overrides the default `~/.grok`.
+    if let Some(dir) = std::env::var_os("GROK_HOME").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".grok")
@@ -651,6 +656,85 @@ fn test_provider(id: String) -> CommandResult {
     CommandResult { success, message }
 }
 
+// ---------------------------------------------------- custom Grok endpoint
+
+/// What the Settings UI receives. The API key is never sent back — only whether
+/// one is stored — so the secret doesn't round-trip into the frontend.
+#[derive(Serialize)]
+struct GrokEndpointView {
+    enabled: bool,
+    base_url: String,
+    model: String,
+    api_backend: String,
+    context_window: Option<u32>,
+    has_api_key: bool,
+    config_path: String,
+}
+
+impl GrokEndpointView {
+    fn current() -> Self {
+        let endpoint = providers::get_endpoint();
+        GrokEndpointView {
+            enabled: endpoint.enabled,
+            base_url: endpoint.base_url,
+            model: endpoint.model,
+            api_backend: endpoint.api_backend,
+            context_window: endpoint.context_window,
+            has_api_key: !endpoint.api_key.is_empty(),
+            config_path: grok_config::config_file_display(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GrokEndpointInput {
+    enabled: bool,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_backend: String,
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// `None` keeps the stored key; `Some("")` clears it; `Some(k)` replaces it.
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[tauri::command]
+fn get_grok_endpoint() -> GrokEndpointView {
+    GrokEndpointView::current()
+}
+
+#[tauri::command]
+fn set_grok_endpoint(input: GrokEndpointInput) -> Result<GrokEndpointView, String> {
+    if input.enabled {
+        if input.base_url.trim().is_empty() {
+            return Err("Enter a Base URL before turning routing on.".into());
+        }
+        if input.model.trim().is_empty() {
+            return Err("Enter a Model id before turning routing on.".into());
+        }
+    }
+
+    let endpoint = providers::GrokEndpoint {
+        enabled: input.enabled,
+        base_url: input.base_url,
+        model: input.model,
+        api_key: String::new(), // resolved inside save_endpoint from `new_key`
+        api_backend: input.api_backend,
+        context_window: input.context_window,
+        previous_default: None, // managed inside save_endpoint
+    };
+    providers::save_endpoint(endpoint, input.api_key)?;
+    Ok(GrokEndpointView::current())
+}
+
+#[tauri::command]
+fn test_grok_endpoint() -> CommandResult {
+    let (success, message) = grok_config::verify();
+    CommandResult { success, message }
+}
+
 // -------------------------------------------------------------- automations
 
 #[tauri::command]
@@ -775,6 +859,9 @@ pub fn run() {
             set_active_provider,
             get_provider_status,
             test_provider,
+            get_grok_endpoint,
+            set_grok_endpoint,
+            test_grok_endpoint,
             list_automations,
             save_automation,
             delete_automation,

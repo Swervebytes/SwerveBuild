@@ -15,7 +15,24 @@
     authenticated: boolean;
   };
 
+  type GrokEndpoint = {
+    enabled: boolean;
+    base_url: string;
+    model: string;
+    api_backend: string;
+    context_window: number | null;
+    has_api_key: boolean;
+    config_path: string;
+  };
+
   let grokStatus = $state<GrokStatus | null>(null);
+
+  let endpoint = $state<GrokEndpoint | null>(null);
+  let apiKeyInput = $state("");
+  let epSaving = $state(false);
+  let epTesting = $state(false);
+  let epMessage = $state<string | null>(null);
+  let epError = $state(false);
 
   const themeOptions: { value: ThemePref; label: string; icon: IconName }[] = [
     { value: "system", label: "System", icon: "settings" },
@@ -29,7 +46,57 @@
     } catch {
       grokStatus = { installed: false, version: null, path: null, authenticated: false };
     }
+    try {
+      endpoint = await invoke<GrokEndpoint>("get_grok_endpoint");
+    } catch (e) {
+      epMessage = String(e);
+      epError = true;
+    }
   });
+
+  async function saveEndpoint() {
+    if (!endpoint) return;
+    epSaving = true;
+    epMessage = null;
+    epError = false;
+    try {
+      const input = {
+        enabled: endpoint.enabled,
+        base_url: endpoint.base_url,
+        model: endpoint.model,
+        api_backend: endpoint.api_backend,
+        context_window: endpoint.context_window,
+        // Only send a key when the user typed one; blank keeps the stored key.
+        api_key: apiKeyInput.trim() === "" ? null : apiKeyInput,
+      };
+      endpoint = await invoke<GrokEndpoint>("set_grok_endpoint", { input });
+      apiKeyInput = "";
+      epMessage = endpoint.enabled
+        ? "Saved — Grok now routes through your endpoint."
+        : "Saved — Grok uses its default hosted routing.";
+    } catch (e) {
+      epMessage = String(e);
+      epError = true;
+    } finally {
+      epSaving = false;
+    }
+  }
+
+  async function testEndpoint() {
+    epTesting = true;
+    epMessage = null;
+    epError = false;
+    try {
+      const r = await invoke<{ success: boolean; message: string }>("test_grok_endpoint");
+      epMessage = r.message;
+      epError = !r.success;
+    } catch (e) {
+      epMessage = String(e);
+      epError = true;
+    } finally {
+      epTesting = false;
+    }
+  }
 </script>
 
 <div class="page">
@@ -70,6 +137,104 @@
       on your PATH. HTTP / local-LLM providers are designed and coming soon.
     </p>
     <ProviderList />
+  </section>
+
+  <section class="card">
+    <div class="group-head">
+      <h2 class="group-title">Custom endpoint (advanced)</h2>
+      <StatusPill
+        tone={endpoint?.enabled ? "success" : "muted"}
+        label={endpoint?.enabled ? "Routing on" : "Off"}
+      />
+    </div>
+    <p class="group-note">
+      Point Grok Build at your own OpenAI-compatible inference — local, self-hosted, or a gateway — so
+      your code never leaves the machine. Swerve writes a managed <code>[model.swerve-endpoint]</code>
+      block to your <code>~/.grok/config.toml</code> (backed up first) and, while routing is on, sets it
+      as Grok's default model. The API key is injected at launch, never written to the config file.
+    </p>
+    {#if endpoint}
+      <Field label="Base URL" hint="Your endpoint's OpenAI-compatible base, e.g. http://localhost:11434/v1">
+        <input
+          class="input"
+          type="text"
+          spellcheck="false"
+          autocapitalize="off"
+          placeholder="http://localhost:11434/v1"
+          bind:value={endpoint.base_url}
+        />
+      </Field>
+      <Field label="Model" hint="Model id the endpoint serves.">
+        <input
+          class="input"
+          type="text"
+          spellcheck="false"
+          autocapitalize="off"
+          placeholder="qwen2.5-coder:14b"
+          bind:value={endpoint.model}
+        />
+      </Field>
+      <Field
+        label="API key"
+        hint={endpoint.has_api_key
+          ? "A key is saved — leave blank to keep it, or type a new one to replace."
+          : "Passed to your endpoint via env; stored locally, never sent to xAI."}
+      >
+        <input
+          class="input"
+          type="password"
+          autocomplete="off"
+          placeholder={endpoint.has_api_key ? "•••••••• (saved)" : "sk-…"}
+          bind:value={apiKeyInput}
+        />
+      </Field>
+      <Field label="API backend" hint="Wire format your endpoint speaks.">
+        <select class="input" bind:value={endpoint.api_backend}>
+          <option value="">chat_completions (default)</option>
+          <option value="responses">responses</option>
+          <option value="anthropic">anthropic</option>
+        </select>
+      </Field>
+      <Field label="Route Grok through this endpoint" hint="Off keeps xAI's hosted models." row>
+        <div class="segmented" role="radiogroup" aria-label="Endpoint routing">
+          <button
+            class="seg"
+            class:active={!endpoint.enabled}
+            type="button"
+            role="radio"
+            aria-checked={!endpoint.enabled}
+            onclick={() => endpoint && (endpoint.enabled = false)}
+          >
+            Off
+          </button>
+          <button
+            class="seg"
+            class:active={endpoint.enabled}
+            type="button"
+            role="radio"
+            aria-checked={endpoint.enabled}
+            onclick={() => endpoint && (endpoint.enabled = true)}
+          >
+            On
+          </button>
+        </div>
+      </Field>
+      <div class="ep-actions">
+        <button class="btn btn-sm" type="button" disabled={epSaving} onclick={saveEndpoint}>
+          {epSaving ? "Saving…" : "Save endpoint"}
+        </button>
+        <button class="btn btn-sm btn-ghost" type="button" disabled={epTesting} onclick={testEndpoint}>
+          <Icon name="refresh" size={13} />
+          {epTesting ? "Checking…" : "Test"}
+        </button>
+      </div>
+      {#if epMessage}
+        <p class="ep-msg" class:error={epError}>{epMessage}</p>
+      {/if}
+      <p class="ep-path mono-label">{endpoint.config_path}</p>
+    {:else}
+      <p class="group-note">Loading endpoint settings…</p>
+    {/if}
   </section>
 
   <section class="card">
@@ -216,5 +381,47 @@
   .about-line {
     font-size: 0.875rem;
     margin-bottom: 0.25rem;
+  }
+
+  .input {
+    width: 100%;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-muted);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.8125rem;
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--sc-accent);
+  }
+  select.input {
+    cursor: pointer;
+  }
+  .ep-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1rem;
+  }
+  .ep-msg {
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+    margin-top: 0.6rem;
+    word-break: break-word;
+  }
+  .ep-msg.error {
+    color: var(--danger, #ff6b6b);
+  }
+  .ep-path {
+    font-size: 0.7rem;
+    color: var(--text-faint);
+    margin-top: 0.5rem;
+    word-break: break-all;
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
   }
 </style>

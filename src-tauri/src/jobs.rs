@@ -756,6 +756,9 @@ impl JobManager {
         command
             .args(&args)
             .env("GROK_DISABLE_AUTOUPDATER", "1")
+            // A custom Grok endpoint routes globally via config.toml, so headless
+            // automation runs need its API key just like interactive chats do.
+            .envs(crate::providers::grok_endpoint_env())
             .current_dir(&exec.cwd)
             .stdin(Stdio::null()) // headless: never pipe stdin (a CLI reading to EOF would hang)
             .stdout(Stdio::piped())

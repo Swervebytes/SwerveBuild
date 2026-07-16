@@ -28,3 +28,4 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 tauri-plugin-dialog = "2"
+toml_edit = "0.22"
