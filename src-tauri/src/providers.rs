@@ -10,6 +10,7 @@
 // Settings UI) already understands Http providers.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +133,31 @@ pub struct GrokEndpoint {
     pub previous_default: Option<String>,
 }
 
+/// A registered local GGUF, served by the app-managed llama-server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalModel {
+    /// Registry/config id: `swerve-local-<slug>` — also the server's model alias.
+    pub id: String,
+    pub label: String,
+    pub path: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub added_at: String,
+}
+
+/// Persisted state for the local inference server. Port and token are chosen
+/// once and reused so the managed `config.toml` blocks stay stable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalConfig {
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub api_token: Option<String>,
+    #[serde(default)]
+    pub models: Vec<LocalModel>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProviderStore {
     #[serde(default)]
@@ -146,6 +172,8 @@ pub struct ProviderStore {
     /// alongside whatever `grok models` reports).
     #[serde(default)]
     pub custom_model_ids: Vec<String>,
+    #[serde(default)]
+    pub local: LocalConfig,
 }
 
 impl ProviderStore {
@@ -376,19 +404,27 @@ pub fn get_endpoint() -> GrokEndpoint {
     ProviderStore::load().endpoint
 }
 
-/// Env vars every `grok` process should get when a custom-endpoint API key is
-/// saved: the key referenced by the managed config block's `env_key`. Injected
-/// whenever a key exists — not just when global routing is on — because the
-/// endpoint model can also be selected per-chat/per-trigger via `-m`; the extra
-/// env var is harmless when unused. Both the interactive chat launch and the
-/// headless automation runner apply this.
+/// Env vars every `grok` process should get so managed models authenticate:
+/// the custom-endpoint API key and the local llama-server token, each under the
+/// env var its config block's `env_key` references. Injected whenever they
+/// exist — models can be selected per-chat/per-trigger via `-m`, so the vars
+/// must be present regardless of global routing; extra vars are harmless when
+/// unused. Both the chat launch and the headless automation runner apply this.
 pub fn grok_endpoint_env() -> Vec<(String, String)> {
-    let endpoint = ProviderStore::load().endpoint;
-    if !endpoint.api_key.is_empty() {
-        vec![(crate::grok_config::API_KEY_ENV.to_string(), endpoint.api_key)]
-    } else {
-        Vec::new()
+    let store = ProviderStore::load();
+    let mut env = Vec::new();
+    if !store.endpoint.api_key.is_empty() {
+        env.push((
+            crate::grok_config::API_KEY_ENV.to_string(),
+            store.endpoint.api_key,
+        ));
     }
+    if let Some(token) = store.local.api_token {
+        if !store.local.models.is_empty() {
+            env.push((crate::grok_config::LOCAL_API_KEY_ENV.to_string(), token));
+        }
+    }
+    env
 }
 
 /// Persist the endpoint config and reflect it into `~/.grok/config.toml`.
@@ -530,7 +566,141 @@ pub fn list_models() -> Vec<ModelInfo> {
         });
     }
 
+    for m in &store.local.models {
+        out.push(ModelInfo {
+            id: m.id.clone(),
+            label: m.label.clone(),
+            kind: "local".into(),
+            note: Some(human_size(m.size_bytes)),
+            is_default: false,
+        });
+    }
+
     out
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{:.0} MB", bytes as f64 / 1e6)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+// ---- local model registry -----------------------------------------------------
+
+/// Persisted port for the local server (chosen once so config.toml stays
+/// stable; re-chosen only if never set).
+pub fn ensure_local_port() -> Result<u16, String> {
+    let mut store = ProviderStore::load();
+    if let Some(port) = store.local.port {
+        return Ok(port);
+    }
+    let port = crate::local_llm::find_free_port()?;
+    store.local.port = Some(port);
+    store.save()?;
+    Ok(port)
+}
+
+/// Generated once; passed to llama-server as `--api-key` and to grok via env,
+/// so nothing else on the machine can quietly use the server.
+pub fn ensure_local_token() -> Result<String, String> {
+    let mut store = ProviderStore::load();
+    if let Some(token) = store.local.api_token.clone() {
+        return Ok(token);
+    }
+    let token = crate::store::Store::new_id();
+    store.local.api_token = Some(token.clone());
+    store.save()?;
+    Ok(token)
+}
+
+/// Slugify a GGUF file stem into a config-safe id under our namespace.
+fn local_id_from_path(path: &str, taken: &[String]) -> String {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let mut slug: String = stem
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        slug = "model".into();
+    }
+    let base = format!("{}{}", crate::grok_config::LOCAL_PREFIX, slug);
+    let mut id = base.clone();
+    let mut n = 2;
+    while taken.iter().any(|t| t == &id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+/// Register a GGUF from disk and sync the managed config blocks.
+pub fn add_local_model(path: String) -> Result<Vec<LocalModel>, String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("Not a file: {path}"));
+    }
+    if p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("gguf".into()) {
+        return Err("Pick a .gguf model file.".to_string());
+    }
+
+    let mut store = ProviderStore::load();
+    if store.local.models.iter().any(|m| m.path == path) {
+        return Err("That model file is already registered.".to_string());
+    }
+    let taken: Vec<String> = store.local.models.iter().map(|m| m.id.clone()).collect();
+    let id = local_id_from_path(&path, &taken);
+    let label = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let size_bytes = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+
+    store.local.models.push(LocalModel {
+        id,
+        label,
+        path,
+        size_bytes,
+        added_at: crate::store::Store::now(),
+    });
+    store.save()?;
+    sync_local_config(&store)?;
+    Ok(store.local.models)
+}
+
+pub fn remove_local_model(id: &str) -> Result<Vec<LocalModel>, String> {
+    let mut store = ProviderStore::load();
+    store.local.models.retain(|m| m.id != id);
+    store.save()?;
+    sync_local_config(&store)?;
+    Ok(store.local.models)
+}
+
+/// Reflect the registry into `~/.grok/config.toml` (`[model.swerve-local-*]`).
+fn sync_local_config(store: &ProviderStore) -> Result<(), String> {
+    let port = match store.local.port {
+        Some(p) => p,
+        None => ensure_local_port()?,
+    };
+    let entries: Vec<(String, String)> = store
+        .local
+        .models
+        .iter()
+        .map(|m| (m.id.clone(), m.label.clone()))
+        .collect();
+    crate::grok_config::apply_local_models(&entries, port)
 }
 
 #[cfg(test)]
@@ -587,5 +757,14 @@ mod tests {
         let mut args = vec!["--some-flag".to_string()];
         insert_grok_model_flag(&mut args, "m1");
         assert_eq!(args, vec!["--some-flag", "-m", "m1"]);
+    }
+
+    #[test]
+    fn local_id_slugifies_and_uniquifies() {
+        let id = local_id_from_path("E:/x/Qwen2.5-Coder (Q4_K_M).gguf", &[]);
+        assert_eq!(id, "swerve-local-qwen2-5-coder-q4-k-m");
+        let taken = vec![id.clone()];
+        let id2 = local_id_from_path("E:/y/Qwen2.5-Coder (Q4_K_M).gguf", &taken);
+        assert_eq!(id2, "swerve-local-qwen2-5-coder-q4-k-m-2");
     }
 }

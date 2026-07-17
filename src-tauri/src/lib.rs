@@ -1,6 +1,7 @@
 mod acp;
 mod grok_config;
 mod jobs;
+mod local_llm;
 pub mod paths;
 mod providers;
 mod store;
@@ -534,8 +535,22 @@ async fn start_chat_session(
     let chat_id_for_task = chat_id.clone();
     let acp = acp.inner().clone();
     let acp_for_task = Arc::clone(&acp);
+    // Local models need the app's llama-server up before grok spawns. Done in
+    // the blocking task — first load of a big GGUF can take minutes.
+    let local_model = chat
+        .model_id
+        .clone()
+        .filter(|m| provider.id == "grok" && m.starts_with(grok_config::LOCAL_PREFIX));
 
     let session_id = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(model) = local_model.as_deref() {
+            if let Some(other) = local_model_conflict(&acp_for_task, model) {
+                return Err(format!(
+                    "One local model runs at a time — \"{other}\" is connected on another local model. Close that chat first."
+                ));
+            }
+            local_llm::manager().ensure_for_model(&app, model)?;
+        }
         acp_for_task.ensure_session(
             app,
             &launch,
@@ -771,6 +786,93 @@ fn set_custom_model_ids(ids: Vec<String>) -> Result<Vec<providers::ModelInfo>, S
     Ok(providers::list_models())
 }
 
+// ------------------------------------------------------------- local models
+
+#[derive(Serialize)]
+struct LocalState {
+    engine_installed: bool,
+    engine_version: String,
+    server: local_llm::ServerStatus,
+    models: Vec<providers::LocalModel>,
+}
+
+impl LocalState {
+    fn current() -> Self {
+        LocalState {
+            engine_installed: local_llm::engine_installed(),
+            engine_version: local_llm::ENGINE_TAG.to_string(),
+            server: local_llm::manager().status(),
+            models: providers::ProviderStore::load().local.models,
+        }
+    }
+}
+
+#[tauri::command]
+fn get_local_state() -> LocalState {
+    LocalState::current()
+}
+
+#[tauri::command]
+async fn install_local_engine(app: tauri::AppHandle) -> Result<CommandResult, String> {
+    let message = tauri::async_runtime::spawn_blocking(move || local_llm::install_engine(&app))
+        .await
+        .map_err(|e| format!("install task failed: {e}"))??;
+    Ok(CommandResult { success: true, message })
+}
+
+#[tauri::command]
+fn add_local_model(path: String) -> Result<LocalState, String> {
+    providers::add_local_model(path)?;
+    Ok(LocalState::current())
+}
+
+#[tauri::command]
+fn remove_local_model(app: tauri::AppHandle, id: String) -> Result<LocalState, String> {
+    // If the server is currently serving this model, stop it first.
+    let status = local_llm::manager().status();
+    if status.model_id.as_deref() == Some(id.as_str()) {
+        local_llm::manager().stop(&app);
+    }
+    providers::remove_local_model(&id)?;
+    Ok(LocalState::current())
+}
+
+/// Preload a local model (start the server) without opening a chat.
+#[tauri::command]
+async fn start_local_server(app: tauri::AppHandle, model_id: String) -> Result<LocalState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        local_llm::manager().ensure_for_model(&app, &model_id)
+    })
+    .await
+    .map_err(|e| format!("start task failed: {e}"))??;
+    Ok(LocalState::current())
+}
+
+#[tauri::command]
+fn stop_local_server(app: tauri::AppHandle) -> LocalState {
+    local_llm::manager().stop(&app);
+    LocalState::current()
+}
+
+/// One local model runs at a time; block a swap while another ACTIVE chat is
+/// pinned to a different local model (its next message would hit the wrong
+/// server). Idle chats are fine — they respawn on their own model later.
+fn local_model_conflict(acp: &AcpManager, want: &str) -> Option<String> {
+    let active = acp.list_active();
+    let store = Store::load();
+    store
+        .chats
+        .iter()
+        .filter(|c| active.contains(&c.id))
+        .find(|c| {
+            c.model_id
+                .as_deref()
+                .map(|m| m.starts_with(grok_config::LOCAL_PREFIX) && m != want)
+                .unwrap_or(false)
+        })
+        .map(|c| c.title.clone())
+}
+
 // -------------------------------------------------------------- automations
 
 #[tauri::command]
@@ -901,6 +1003,12 @@ pub fn run() {
             list_models,
             set_chat_model,
             set_custom_model_ids,
+            get_local_state,
+            install_local_engine,
+            add_local_model,
+            remove_local_model,
+            start_local_server,
+            stop_local_server,
             list_automations,
             save_automation,
             delete_automation,
@@ -919,6 +1027,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 acp_exit.close_all();
                 jobs_exit.cancel_all();
+                local_llm::manager().shutdown();
             }
         });
 }

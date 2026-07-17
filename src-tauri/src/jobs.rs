@@ -479,8 +479,10 @@ fn effective_mode(_mode: ExecMode) -> ExecMode {
 /// Build the grok headless argument vector with structural shadow enforcement.
 fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
     let mode = effective_mode(exec.mode);
+    // No bare `-p`: as of grok 0.2.102, `-p/--single` REQUIRES an inline prompt
+    // value (exit 2 without one) and `--prompt-file` alone selects headless
+    // single-turn mode. Earlier builds tolerated `-p` next to `--prompt-file`.
     let mut args: Vec<String> = vec![
-        "-p".into(),
         "--output-format".into(),
         "streaming-json".into(),
         "--no-auto-update".into(),
@@ -761,6 +763,26 @@ impl JobManager {
         });
 
         let args = build_grok_args(&exec, &prompt_path.to_string_lossy());
+
+        // Local model? The app's llama-server must be serving it before grok
+        // launches — bring it up (or fail the run with a clear message).
+        if let Some(model) = exec
+            .model
+            .as_deref()
+            .filter(|m| m.starts_with(crate::grok_config::LOCAL_PREFIX))
+        {
+            if let Err(e) = crate::local_llm::manager().ensure_for_model(&app, model) {
+                let msg = format!("local model unavailable: {e}");
+                let rec = self.launch_failed_record(&automation_id, &run_id, &trigger_reason, attempt, &automation.executor.mode, &msg);
+                let _ = write_run_record(&rec);
+                let _ = app.emit(
+                    "automation-run-finished",
+                    json!({ "automationId": automation_id, "runId": run_id, "status": "launchfailed", "error": msg }),
+                );
+                self.maybe_retry(app.clone(), automation, trigger_reason, attempt, RunStatus::LaunchFailed);
+                return Err(msg);
+            }
+        }
 
         let mut command = crate::util::hidden_command(&grok);
         command

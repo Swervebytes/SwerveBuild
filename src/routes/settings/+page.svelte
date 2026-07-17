@@ -7,6 +7,7 @@
   import Field from "$lib/components/ui/Field.svelte";
   import ProviderList from "$lib/components/providers/ProviderList.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
+  import LocalModelsCard from "$lib/components/models/LocalModelsCard.svelte";
 
   type GrokStatus = {
     installed: boolean;
@@ -202,6 +203,19 @@
         <p class="ep-msg">{idsMessage}</p>
       {/if}
     </div>
+  </section>
+
+  <section class="card">
+    <div class="group-head">
+      <h2 class="group-title">Local models</h2>
+      <span class="mono-label">llama.cpp · runs on this machine</span>
+    </div>
+    <p class="group-note">
+      Run models entirely on this PC — no Ollama, no cloud, no sign-in. Swerve downloads its own
+      inference engine once, then any <code>.gguf</code> you add becomes a model selectable in chats
+      and automations. One local model is loaded at a time; the server listens on localhost only.
+    </p>
+    <LocalModelsCard />
   </section>
 
   <section class="card">

@@ -21,6 +21,11 @@ use toml_edit::{value, DocumentMut, Item, Table};
 pub const MODEL_ID: &str = "swerve-endpoint";
 /// The env var grok reads for the endpoint API key (referenced as `env_key`).
 pub const API_KEY_ENV: &str = "SWERVE_GROK_API_KEY";
+/// Prefix for app-managed local-model blocks (`[model.swerve-local-<slug>]`).
+pub const LOCAL_PREFIX: &str = "swerve-local-";
+/// The env var carrying the app-generated token for the local llama-server
+/// (distinct from the endpoint key — both can be live at once).
+pub const LOCAL_API_KEY_ENV: &str = "SWERVE_LOCAL_API_KEY";
 
 /// The fields Swerve manages for the custom endpoint. Strings are pre-trimmed by
 /// the caller.
@@ -154,6 +159,52 @@ fn transform(
     displaced
 }
 
+/// Sync the app-managed local-model blocks (`[model.swerve-local-<slug>]`) to
+/// exactly `entries` (slug, label): upsert each against the app's local server,
+/// and remove stale `swerve-local-*` blocks no longer registered. Only blocks
+/// under our prefix are ever touched — the user's own models and the
+/// `swerve-endpoint` block are left alone.
+pub fn apply_local_models(entries: &[(String, String)], port: u16) -> Result<(), String> {
+    backup_once();
+    let mut doc = load_doc()?;
+    transform_local(&mut doc, entries, port);
+    save_doc(&doc)
+}
+
+/// Pure document transform for local-model blocks — split from I/O for tests.
+fn transform_local(doc: &mut DocumentMut, entries: &[(String, String)], port: u16) {
+    if !doc.contains_key("model") || !doc["model"].is_table() {
+        let mut parent = Table::new();
+        parent.set_implicit(true);
+        doc["model"] = Item::Table(parent);
+    }
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+
+    if let Some(models) = doc["model"].as_table_mut() {
+        // Drop stale blocks in our namespace only.
+        let stale: Vec<String> = models
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .filter(|k| k.starts_with(LOCAL_PREFIX) && !entries.iter().any(|(slug, _)| k == slug))
+            .collect();
+        for key in stale {
+            models.remove(&key);
+        }
+    }
+
+    for (slug, label) in entries {
+        let mut tbl = Table::new();
+        // llama-server is started with `--model-alias <slug>`, so the model
+        // field matches what the server reports.
+        tbl["model"] = value(slug.as_str());
+        tbl["base_url"] = value(base_url.as_str());
+        tbl["name"] = value(label.as_str());
+        tbl["env_key"] = value(LOCAL_API_KEY_ENV);
+        tbl["api_backend"] = value("chat_completions");
+        doc["model"][slug.as_str()] = Item::Table(tbl);
+    }
+}
+
 /// Read back `config.toml` and report what Swerve wrote — used by the Settings
 /// "Test" button. Returns `(ok, human message)`.
 pub fn verify() -> (bool, String) {
@@ -276,6 +327,47 @@ mod tests {
         let displaced = transform(&mut d, &spec(false), Some("whatever"));
         assert_eq!(displaced, None);
         assert_eq!(d["models"]["default"].as_str(), Some("grok-build"));
+    }
+
+    fn locals(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn local_blocks_written_with_port_and_env() {
+        let mut d = DocumentMut::new();
+        transform_local(&mut d, &locals(&[("swerve-local-qwen", "Qwen Coder")]), 43117);
+        let out = d.to_string();
+        assert!(out.contains("[model.swerve-local-qwen]"), "{out}");
+        assert!(out.contains(r#"base_url = "http://127.0.0.1:43117/v1""#), "{out}");
+        assert!(out.contains(r#"env_key = "SWERVE_LOCAL_API_KEY""#), "{out}");
+        assert!(out.contains(r#"api_backend = "chat_completions""#), "{out}");
+        assert!(!out.contains("[model]\n"), "parent should stay implicit:\n{out}");
+    }
+
+    #[test]
+    fn local_sync_removes_stale_ours_only() {
+        let mut d = doc(concat!(
+            "[model.swerve-local-old]\nmodel = \"old\"\n\n",
+            "[model.swerve-endpoint]\nmodel = \"e\"\n\n",
+            "[model.users-own]\nmodel = \"keep\"\n# hand comment\n",
+        ));
+        transform_local(&mut d, &locals(&[("swerve-local-new", "New")]), 5000);
+        let out = d.to_string();
+        assert!(!out.contains("swerve-local-old"), "stale block kept:\n{out}");
+        assert!(out.contains("[model.swerve-local-new]"), "{out}");
+        assert!(out.contains("[model.swerve-endpoint]"), "endpoint clobbered:\n{out}");
+        assert!(out.contains("[model.users-own]"), "user block clobbered:\n{out}");
+        assert!(out.contains("# hand comment"), "user comment lost:\n{out}");
+    }
+
+    #[test]
+    fn local_sync_empty_clears_namespace() {
+        let mut d = doc("[model.swerve-local-a]\nmodel = \"a\"\n\n[model.other]\nmodel = \"o\"\n");
+        transform_local(&mut d, &[], 5000);
+        let out = d.to_string();
+        assert!(!out.contains("swerve-local-a"), "{out}");
+        assert!(out.contains("[model.other]"), "{out}");
     }
 
     // Exercises the real file-IO path (`apply`) end to end against a temp
