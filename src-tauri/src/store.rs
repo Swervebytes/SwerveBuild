@@ -36,6 +36,10 @@ pub struct Chat {
     /// Which provider this chat is bound to. None => use the global active provider.
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// Model this chat runs on, passed to the agent via `-m` at spawn.
+    /// None => the agent's own default model.
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 fn default_store_version() -> u32 {
@@ -144,5 +148,25 @@ impl Store {
         } else {
             title
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_json_predating_model_id_deserializes() {
+        // Chats saved before per-chat models existed must load unchanged.
+        let chat: Chat = serde_json::from_str(
+            r#"{
+                "id": "c1", "project_id": "p1", "title": "Old chat",
+                "created_at": "1", "updated_at": "2", "messages": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(chat.model_id, None);
+        assert_eq!(chat.provider_id, None);
+        assert_eq!(chat.grok_session_id, None);
     }
 }

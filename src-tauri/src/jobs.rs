@@ -188,6 +188,9 @@ pub struct Executor {
     pub rules: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Model this automation runs on (`grok -m`). None => the agent's default.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     #[serde(default)]
@@ -211,6 +214,7 @@ impl Default for Executor {
             deny: Vec::new(),
             rules: None,
             effort: None,
+            model: None,
             max_turns: default_max_turns(),
             cwd: String::new(),
             web_search: false,
@@ -516,6 +520,12 @@ fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
         if !effort.is_empty() {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+    }
+    if let Some(model) = &exec.model {
+        if !model.trim().is_empty() {
+            args.push("-m".into());
+            args.push(model.trim().to_string());
         }
     }
     if let Some(rules) = &exec.rules {
@@ -1545,4 +1555,37 @@ pub fn unseen_failure_count() -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_args_passes_model_flag() {
+        let mut exec = Executor::default();
+        exec.model = Some("grok-4.5".into());
+        let args = build_grok_args(&exec, "p.txt");
+        let pos = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(args[pos + 1], "grok-4.5");
+    }
+
+    #[test]
+    fn build_args_omits_model_when_unset_or_blank() {
+        let args = build_grok_args(&Executor::default(), "p.txt");
+        assert!(!args.contains(&"-m".to_string()));
+
+        let mut exec = Executor::default();
+        exec.model = Some("   ".into());
+        let args = build_grok_args(&exec, "p.txt");
+        assert!(!args.contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn executor_json_without_model_field_deserializes() {
+        // Old automations.json entries predate the model field.
+        let exec: Executor =
+            serde_json::from_str(r#"{ "prompt": "hi", "cwd": "E:/x" }"#).unwrap();
+        assert_eq!(exec.model, None);
+    }
 }

@@ -7,6 +7,7 @@
   import type { Chat, ChatMessage, PermissionRequest, Project } from "$lib/types";
   import { loadWorkspace } from "$lib/workspace";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
+  import { providerStore } from "$lib/stores/providers.svelte";
   import { imageSrc } from "$lib/attachments";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
@@ -25,12 +26,15 @@
   let streaming = $state<StreamMessage[]>([]);
   let sessionReady = $state(false);
   let sending = $state(false);
+  let modelSwitching = $state(false);
   let error = $state<string | null>(null);
   let activeSessionCount = $state(0);
   let permissionQueue = $state<Array<PermissionRequest & { chatTitle: string }>>([]);
 
   const chatId = $derived($page.params.id);
   const currentPermission = $derived(permissionQueue[0] ?? null);
+  // `-m` is a grok flag; hide the model picker when another agent backs this chat.
+  const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
 
   let unlistenUpdate: (() => void) | null = null;
   let unlistenReady: (() => void) | null = null;
@@ -209,6 +213,28 @@
     bootstrap(id, gen);
   });
 
+  /// Mid-chat model switch: persist the choice, respawn the agent with the new
+  /// `-m`, and let `session/load` restore the conversation — feels in-place.
+  async function switchModel(id: string | null) {
+    if (!chat || modelSwitching || sending) return;
+    modelSwitching = true;
+    error = null;
+    try {
+      await invoke("set_chat_model", { chatId: chat.id, modelId: id });
+      chat = { ...chat, model_id: id };
+      await invoke("close_chat_session", { chatId: chat.id });
+      sessionReady = false;
+      await invoke("start_chat_session", { chatId: chat.id });
+      sessionReady = true;
+      await refreshActiveSessions();
+    } catch (err) {
+      sessionReady = false;
+      error = `Model switch failed: ${String(err)} — send a message to reconnect.`;
+    } finally {
+      modelSwitching = false;
+    }
+  }
+
   async function sendMessage(text: string, images: string[]) {
     if (!chat || sending) return;
     if (!text && images.length === 0) return;
@@ -295,6 +321,10 @@
       projectPath={project?.path}
       connected={sessionReady}
       {activeSessionCount}
+      showModelPicker={chatProviderId === "grok"}
+      modelId={chat?.model_id ?? null}
+      {modelSwitching}
+      onmodelchange={switchModel}
     />
   </div>
 

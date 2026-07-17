@@ -7,7 +7,8 @@
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import RunMap from "$lib/components/automations/RunMap.svelte";
-  import type { Automation, RunRecord, RunFinished, RunOutput } from "$lib/types";
+  import { invoke } from "@tauri-apps/api/core";
+  import type { Automation, ModelInfo, RunRecord, RunFinished, RunOutput } from "$lib/types";
   import {
     newAutomation,
     recipes,
@@ -30,6 +31,7 @@
   let editing = $state<Automation | null>(null);
   let editorError = $state<string | null>(null);
   let advanced = $state(false);
+  let modelOptions = $state<ModelInfo[]>([]);
 
   // run history (per automation id)
   let expanded = $state<Record<string, boolean>>({});
@@ -57,6 +59,11 @@
       await workspaceStore.refresh();
       await automationsStore.refresh();
       loading = false;
+      try {
+        modelOptions = await invoke<ModelInfo[]>("list_models");
+      } catch {
+        modelOptions = [];
+      }
     })();
 
     listen<RunOutput>("automation-run-output", (e) => {
@@ -449,6 +456,15 @@
               <option value="low">Low</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>
+            </select>
+          </label>
+          <label class="field row">
+            <span class="field-label">Model</span>
+            <select class="input narrow" bind:value={editing.executor.model}>
+              <option value={null}>Default</option>
+              {#each modelOptions as m (m.id)}
+                <option value={m.id}>{m.kind === "endpoint" ? "Custom endpoint" : m.label}</option>
+              {/each}
             </select>
           </label>
           <label class="field row">

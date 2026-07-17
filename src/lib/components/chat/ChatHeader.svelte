@@ -1,6 +1,7 @@
 <script lang="ts">
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import ProviderPicker from "$lib/components/providers/ProviderPicker.svelte";
+  import ModelPicker from "$lib/components/models/ModelPicker.svelte";
 
   let {
     title,
@@ -8,12 +9,21 @@
     projectPath,
     connected,
     activeSessionCount = 0,
+    showModelPicker = false,
+    modelId = null,
+    modelSwitching = false,
+    onmodelchange,
   }: {
     title: string;
     projectName?: string;
     projectPath?: string;
     connected: boolean;
     activeSessionCount?: number;
+    /** Model picker only makes sense for the Grok provider (`-m` is grok's flag). */
+    showModelPicker?: boolean;
+    modelId?: string | null;
+    modelSwitching?: boolean;
+    onmodelchange?: (id: string | null) => void;
   } = $props();
 </script>
 
@@ -38,6 +48,9 @@
     {/if}
     {#if activeSessionCount > 0}
       <span class="badge badge-muted">{activeSessionCount}/3</span>
+    {/if}
+    {#if showModelPicker && onmodelchange}
+      <ModelPicker value={modelId} disabled={modelSwitching} onchange={onmodelchange} />
     {/if}
     <ProviderPicker />
     <a class="btn btn-ghost btn-sm" href="/projects">All chats</a>

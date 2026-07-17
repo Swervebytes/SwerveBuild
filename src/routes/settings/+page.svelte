@@ -25,7 +25,19 @@
     config_path: string;
   };
 
+  type ModelInfo = {
+    id: string;
+    label: string;
+    kind: "hosted" | "custom" | "endpoint";
+    note: string | null;
+    is_default: boolean;
+  };
+
   let grokStatus = $state<GrokStatus | null>(null);
+
+  let customIds = $state("");
+  let idsSaving = $state(false);
+  let idsMessage = $state<string | null>(null);
 
   let endpoint = $state<GrokEndpoint | null>(null);
   let apiKeyInput = $state("");
@@ -52,7 +64,37 @@
       epMessage = String(e);
       epError = true;
     }
+    try {
+      const models = await invoke<ModelInfo[]>("list_models");
+      customIds = models
+        .filter((m) => m.kind === "custom")
+        .map((m) => m.id)
+        .join(", ");
+    } catch {
+      /* model list is optional here */
+    }
   });
+
+  async function saveCustomIds() {
+    idsSaving = true;
+    idsMessage = null;
+    try {
+      const ids = customIds
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const models = await invoke<ModelInfo[]>("set_custom_model_ids", { ids });
+      customIds = models
+        .filter((m) => m.kind === "custom")
+        .map((m) => m.id)
+        .join(", ");
+      idsMessage = "Saved — these IDs now appear in the model pickers.";
+    } catch (e) {
+      idsMessage = String(e);
+    } finally {
+      idsSaving = false;
+    }
+  }
 
   async function saveEndpoint() {
     if (!endpoint) return;
@@ -137,6 +179,29 @@
       on your PATH. HTTP / local-LLM providers are designed and coming soon.
     </p>
     <ProviderList />
+    <div class="ids-block">
+      <Field
+        label="Extra model IDs"
+        hint="Comma-separated hosted model IDs to add to the model pickers (e.g. a beta ID). Chats and automations pass the ID to Grok via -m."
+      >
+        <div class="ids-row">
+          <input
+            class="input"
+            type="text"
+            spellcheck="false"
+            autocapitalize="off"
+            placeholder="grok-4.5-mini, my-beta-model"
+            bind:value={customIds}
+          />
+          <button class="btn btn-sm" type="button" disabled={idsSaving} onclick={saveCustomIds}>
+            {idsSaving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </Field>
+      {#if idsMessage}
+        <p class="ep-msg">{idsMessage}</p>
+      {/if}
+    </div>
   </section>
 
   <section class="card">
@@ -404,6 +469,17 @@
     display: flex;
     gap: 0.5rem;
     margin-top: 1rem;
+  }
+  .ids-block {
+    margin-top: 1rem;
+  }
+  .ids-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+  .ids-row .input {
+    flex: 1;
   }
   .ep-msg {
     font-size: 0.8125rem;

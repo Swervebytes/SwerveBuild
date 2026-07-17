@@ -142,6 +142,10 @@ pub struct ProviderStore {
     pub custom: Vec<Provider>,
     #[serde(default)]
     pub endpoint: GrokEndpoint,
+    /// Extra hosted model IDs the user added by hand (shown in the model picker
+    /// alongside whatever `grok models` reports).
+    #[serde(default)]
+    pub custom_model_ids: Vec<String>,
 }
 
 impl ProviderStore {
@@ -237,7 +241,7 @@ pub fn is_available(provider: &Provider) -> bool {
     }
 }
 
-pub fn resolve_launch(provider: &Provider) -> Result<AcpLaunch, String> {
+pub fn resolve_launch(provider: &Provider, model_id: Option<&str>) -> Result<AcpLaunch, String> {
     match provider.kind {
         ProviderKind::Http => Err(format!(
             "{} is an HTTP / local provider — chat sessions aren't supported yet. Pick an ACP agent (Grok, Claude Code, Gemini).",
@@ -255,21 +259,40 @@ pub fn resolve_launch(provider: &Provider) -> Result<AcpLaunch, String> {
                     )
                 }
             })?;
+            let mut args = provider.args.clone();
             let mut env = provider.env.clone();
-            // A custom Grok endpoint routes via config.toml's global `[models]
-            // default`, so every grok process needs its API key — see
-            // `grok_endpoint_env`. The headless automation runner applies it too.
             if provider.id == "grok" {
+                if let Some(model) = model_id.filter(|m| !m.trim().is_empty()) {
+                    insert_grok_model_flag(&mut args, model.trim());
+                }
+                // A custom Grok endpoint's API key rides in via env — see
+                // `grok_endpoint_env`. The headless automation runner applies it too.
                 env.extend(grok_endpoint_env());
             }
             Ok(AcpLaunch {
                 command,
-                args: provider.args.clone(),
+                args,
                 env,
                 label: provider.label.clone(),
             })
         }
     }
+}
+
+/// Insert `-m <model>` where the grok CLI accepts it: `-m` is an option of the
+/// `agent` subcommand and must precede `stdio` — `grok agent -m X stdio` runs,
+/// while `grok agent stdio -m X` exits 2 with "unexpected argument" (verified
+/// against v0.2.93). So it goes immediately after "agent"; if there's no
+/// "agent" in the args (plain/headless invocations take `-m` at root level),
+/// appending is correct.
+fn insert_grok_model_flag(args: &mut Vec<String>, model: &str) {
+    let at = args
+        .iter()
+        .position(|a| a == "agent")
+        .map(|p| p + 1)
+        .unwrap_or(args.len());
+    args.insert(at, model.to_string());
+    args.insert(at, "-m".into());
 }
 
 fn command_version(path: &Path) -> Option<String> {
@@ -353,14 +376,15 @@ pub fn get_endpoint() -> GrokEndpoint {
     ProviderStore::load().endpoint
 }
 
-/// Env vars every `grok` process should get when a custom endpoint is enabled:
-/// the API key referenced by the managed config block's `env_key`. Empty when the
-/// endpoint is off or keyless. Both the interactive chat launch and the headless
-/// automation runner apply this, because endpoint routing (config.toml `[models]
-/// default`) is global to all grok invocations.
+/// Env vars every `grok` process should get when a custom-endpoint API key is
+/// saved: the key referenced by the managed config block's `env_key`. Injected
+/// whenever a key exists — not just when global routing is on — because the
+/// endpoint model can also be selected per-chat/per-trigger via `-m`; the extra
+/// env var is harmless when unused. Both the interactive chat launch and the
+/// headless automation runner apply this.
 pub fn grok_endpoint_env() -> Vec<(String, String)> {
     let endpoint = ProviderStore::load().endpoint;
-    if endpoint.enabled && !endpoint.api_key.is_empty() {
+    if !endpoint.api_key.is_empty() {
         vec![(crate::grok_config::API_KEY_ENV.to_string(), endpoint.api_key)]
     } else {
         Vec::new()
@@ -409,4 +433,159 @@ pub fn save_endpoint(mut endpoint: GrokEndpoint, new_key: Option<String>) -> Res
 
     store.endpoint = endpoint;
     store.save()
+}
+
+// ---- model registry -----------------------------------------------------------
+//
+// A "model" is anything a chat or automation can pin via `grok -m`: a hosted
+// model reported by `grok models`, a hosted ID the user added by hand, or the
+// managed custom-endpoint entry. Local GGUF models join this list in a later
+// phase — same registry, one more kind.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+    /// "hosted" (from `grok models`), "custom" (user-added ID), or "endpoint".
+    pub kind: String,
+    pub note: Option<String>,
+    pub is_default: bool,
+}
+
+/// Parse `grok models` stdout. The list follows an "Available models:" header,
+/// one per line, e.g. `  * grok-4.5 (default)` — the star and/or "(default)"
+/// suffix mark the agent's default. Prose lines (anything with spaces after
+/// cleanup) are skipped so header/footer text can't leak in as model IDs.
+fn parse_grok_models(output: &str) -> Vec<(String, bool)> {
+    let mut in_list = false;
+    let mut out = Vec::new();
+    for raw in output.lines() {
+        let line = raw.trim();
+        if !in_list {
+            if line.starts_with("Available models") {
+                in_list = true;
+            }
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let mut is_default = line.starts_with('*');
+        let mut name = line.trim_start_matches('*').trim();
+        if let Some(stripped) = name.strip_suffix("(default)") {
+            name = stripped.trim();
+            is_default = true;
+        }
+        if name.is_empty() || name.contains(' ') {
+            continue;
+        }
+        out.push((name.to_string(), is_default));
+    }
+    out
+}
+
+/// Everything selectable in the model pickers. Queries the grok CLI live so the
+/// hosted list tracks whatever xAI currently offers this account; degrades to
+/// custom/endpoint entries only when grok is missing or the query fails.
+pub fn list_models() -> Vec<ModelInfo> {
+    let mut out: Vec<ModelInfo> = Vec::new();
+
+    if let Some(grok) = crate::resolve_grok_executable() {
+        if let Ok(output) = crate::util::hidden_command(&grok).arg("models").output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for (id, is_default) in parse_grok_models(&stdout) {
+                out.push(ModelInfo {
+                    label: id.clone(),
+                    id,
+                    kind: "hosted".into(),
+                    note: None,
+                    is_default,
+                });
+            }
+        }
+    }
+
+    let store = ProviderStore::load();
+    for id in &store.custom_model_ids {
+        if out.iter().any(|m| &m.id == id) {
+            continue;
+        }
+        out.push(ModelInfo {
+            id: id.clone(),
+            label: id.clone(),
+            kind: "custom".into(),
+            note: Some("added by you".into()),
+            is_default: false,
+        });
+    }
+
+    let endpoint = store.endpoint;
+    if !endpoint.base_url.trim().is_empty() {
+        out.push(ModelInfo {
+            id: crate::grok_config::MODEL_ID.into(),
+            label: "Custom endpoint".into(),
+            kind: "endpoint".into(),
+            note: Some(endpoint.base_url.trim().to_string()),
+            is_default: false,
+        });
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_models_single_default() {
+        let out = parse_grok_models(
+            "You are logged in with grok.com.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n",
+        );
+        assert_eq!(out, vec![("grok-4.5".to_string(), true)]);
+    }
+
+    #[test]
+    fn parse_models_multiple_mixed_markers() {
+        let out = parse_grok_models(
+            "Available models:\n  * grok-4.5 (default)\n    grok-code-fast-1\n  grok-4\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                ("grok-4.5".to_string(), true),
+                ("grok-code-fast-1".to_string(), false),
+                ("grok-4".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_models_ignores_prose_and_preamble() {
+        let out = parse_grok_models(
+            "Default model: grok-4.5\nThese are not models.\nAvailable models:\n  * grok-4.5\n  some trailing prose here\n",
+        );
+        assert_eq!(out, vec![("grok-4.5".to_string(), true)]);
+    }
+
+    #[test]
+    fn parse_models_empty_when_no_header() {
+        assert!(parse_grok_models("no list in this output").is_empty());
+    }
+
+    #[test]
+    fn model_flag_inserted_between_agent_and_stdio() {
+        // Regression: `grok agent stdio -m X` exits 2 — the flag must precede
+        // the stdio subcommand.
+        let mut args = vec!["agent".to_string(), "stdio".to_string()];
+        insert_grok_model_flag(&mut args, "grok-4.5");
+        assert_eq!(args, vec!["agent", "-m", "grok-4.5", "stdio"]);
+    }
+
+    #[test]
+    fn model_flag_appended_when_no_agent_subcommand() {
+        let mut args = vec!["--some-flag".to_string()];
+        insert_grok_model_flag(&mut args, "m1");
+        assert_eq!(args, vec!["--some-flag", "-m", "m1"]);
+    }
 }

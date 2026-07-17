@@ -417,6 +417,7 @@ fn create_chat(project_id: String, title: Option<String>) -> Result<Chat, String
         messages: Vec::new(),
         grok_session_id: None,
         provider_id: None,
+        model_id: None,
     };
 
     Store::touch_project(&mut store, &resolved_project_id);
@@ -527,7 +528,7 @@ async fn start_chat_session(
         .and_then(|id| providers::get_provider(&id))
         .or_else(|| providers::get_provider(&providers::active_id()))
         .ok_or_else(|| "No provider configured".to_string())?;
-    let launch = providers::resolve_launch(&provider)?;
+    let launch = providers::resolve_launch(&provider, chat.model_id.as_deref())?;
     let project_path = project.path.clone();
     let stored_session = chat.grok_session_id.clone();
     let chat_id_for_task = chat_id.clone();
@@ -735,6 +736,41 @@ fn test_grok_endpoint() -> CommandResult {
     CommandResult { success, message }
 }
 
+// ------------------------------------------------------------ model registry
+
+#[tauri::command]
+fn list_models() -> Vec<providers::ModelInfo> {
+    providers::list_models()
+}
+
+/// Pin a chat to a model (None/blank clears back to the agent default). The
+/// switch takes effect on the next session spawn — the frontend closes and
+/// restarts the session, and `session/load` restores the conversation.
+#[tauri::command]
+fn set_chat_model(chat_id: String, model_id: Option<String>) -> Result<(), String> {
+    let mut store = Store::load();
+    let chat = store
+        .chats
+        .iter_mut()
+        .find(|c| c.id == chat_id)
+        .ok_or_else(|| "Chat not found".to_string())?;
+    chat.model_id = model_id.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    chat.updated_at = Store::now();
+    Store::save(&store)
+}
+
+#[tauri::command]
+fn set_custom_model_ids(ids: Vec<String>) -> Result<Vec<providers::ModelInfo>, String> {
+    let mut store = providers::ProviderStore::load();
+    store.custom_model_ids = ids
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    store.save()?;
+    Ok(providers::list_models())
+}
+
 // -------------------------------------------------------------- automations
 
 #[tauri::command]
@@ -862,6 +898,9 @@ pub fn run() {
             get_grok_endpoint,
             set_grok_endpoint,
             test_grok_endpoint,
+            list_models,
+            set_chat_model,
+            set_custom_model_ids,
             list_automations,
             save_automation,
             delete_automation,
