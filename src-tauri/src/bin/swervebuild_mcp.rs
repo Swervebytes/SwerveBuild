@@ -283,10 +283,14 @@ fn main() {
     let mut stdout = io::stdout();
 
     for line in stdin.lock().lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
+        // Strip any BOM a host shell's pipe machinery may prepend (Windows
+        // PowerShell 5.1 injects a UTF-8 preamble into redirected stdin, which
+        // would otherwise make the first request unparseable) before parsing.
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() {
             continue;
         }
-        let Ok(request) = serde_json::from_str::<RpcRequest>(&line) else {
+        let Ok(request) = serde_json::from_str::<RpcRequest>(line) else {
             continue;
         };
         if let Some(response) = handle(&request) {
