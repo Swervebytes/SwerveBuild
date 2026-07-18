@@ -4,15 +4,13 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { goto } from "$app/navigation";
-  import type { Chat, ChatMessage, PermissionRequest, Project } from "$lib/types";
-  import { loadWorkspace } from "$lib/workspace";
+  import type { Chat, ChatMessage, Project } from "$lib/types";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
   import { imageSrc } from "$lib/attachments";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
-  import PermissionModal from "$lib/components/chat/PermissionModal.svelte";
 
   type StreamMessage = {
     id: string;
@@ -29,16 +27,12 @@
   let modelSwitching = $state(false);
   let error = $state<string | null>(null);
   let activeSessionCount = $state(0);
-  let permissionQueue = $state<Array<PermissionRequest & { chatTitle: string }>>([]);
 
-  const chatId = $derived($page.params.id);
-  const currentPermission = $derived(permissionQueue[0] ?? null);
   // `-m` is a grok flag; hide the model picker when another agent backs this chat.
   const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
 
   let unlistenUpdate: (() => void) | null = null;
   let unlistenReady: (() => void) | null = null;
-  let unlistenPermission: (() => void) | null = null;
   let bootstrapGen = 0;
 
   function resetStream() {
@@ -176,35 +170,6 @@
     }
   }
 
-  async function enqueuePermission(request: PermissionRequest) {
-    const workspace = await loadWorkspace();
-    const title = workspace.chats.find((item) => item.id === request.chatId)?.title ?? "Chat";
-    if (
-      permissionQueue.some(
-        (item) => item.chatId === request.chatId && item.requestId === request.requestId,
-      )
-    ) {
-      return;
-    }
-    permissionQueue = [...permissionQueue, { ...request, chatTitle: title }];
-  }
-
-  async function respondPermission(optionId: string) {
-    const pending = permissionQueue[0];
-    if (!pending) return;
-
-    try {
-      await invoke("respond_chat_permission", {
-        chatId: pending.chatId,
-        requestId: pending.requestId,
-        optionId,
-      });
-      permissionQueue = permissionQueue.slice(1);
-    } catch (err) {
-      error = String(err);
-    }
-  }
-
   $effect(() => {
     const id = $page.params.id;
     if (!id) return;
@@ -299,16 +264,9 @@
       unlistenReady = unlisten;
     });
 
-    listen<PermissionRequest>("chat-permission-request", (event) => {
-      enqueuePermission(event.payload);
-    }).then((unlisten) => {
-      unlistenPermission = unlisten;
-    });
-
     return () => {
       unlistenUpdate?.();
       unlistenReady?.();
-      unlistenPermission?.();
     };
   });
 </script>
@@ -344,15 +302,6 @@
     <Composer disabled={!chat || sending} {sending} onsend={sendMessage} />
   </div>
 </div>
-
-{#if currentPermission}
-  <PermissionModal
-    request={currentPermission}
-    queueLength={permissionQueue.length}
-    isBackground={currentPermission.chatId !== chatId}
-    onrespond={respondPermission}
-  />
-{/if}
 
 <style>
   .chat-page {

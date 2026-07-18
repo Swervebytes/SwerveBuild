@@ -9,6 +9,8 @@
   import { theme } from "$lib/stores/theme.svelte";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
+  import { permissionStore } from "$lib/stores/permissions.svelte";
+  import PermissionModal from "$lib/components/chat/PermissionModal.svelte";
 
   const FEEDBACK_URL = "https://feedback.roaringbytes.com/?project=swervebuild";
 
@@ -22,6 +24,9 @@
     theme.init();
     workspaceStore.refresh();
     providerStore.load();
+    // App-level tool-approval listener, so a background chat's permission
+    // request surfaces on any page — not only when the chat route is mounted.
+    permissionStore.start();
   });
 
   async function openFeedback() {
@@ -55,6 +60,15 @@
     <Icon name="chat" size={15} />
     <span>Feedback</span>
   </button>
+{/if}
+
+{#if permissionStore.current}
+  <PermissionModal
+    request={permissionStore.current}
+    queueLength={permissionStore.queueLength}
+    isBackground={permissionStore.current.chatId !== $page.params.id}
+    onrespond={(o) => permissionStore.respond(o)}
+  />
 {/if}
 
 <style>
