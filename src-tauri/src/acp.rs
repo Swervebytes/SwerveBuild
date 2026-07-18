@@ -525,12 +525,27 @@ fn now_secs() -> u64 {
 
 fn mcp_servers_config() -> Result<Value, String> {
     let mcp_path = resolve_mcp_binary()?;
-    Ok(json!([{
+    let mut servers = vec![json!({
         "name": "swervebuild",
         "command": mcp_path,
         "args": [],
         "env": []
-    }]))
+    })];
+
+    // SwerveBytes engine (swervebytes-core): the verified-Byte runtime.
+    // Optional — auto-included whenever its MCP server is installed on PATH
+    // (`pip install swervebytes` puts `swervebytes-mcp` there). Chat agents
+    // then get run/verify/retire/audit tools over the Byte registry.
+    if let Some(sb) = crate::which_on_path("swervebytes-mcp") {
+        servers.push(json!({
+            "name": "swervebytes",
+            "command": sb.display().to_string(),
+            "args": [],
+            "env": []
+        }));
+    }
+
+    Ok(Value::Array(servers))
 }
 
 fn resolve_mcp_binary() -> Result<String, String> {
