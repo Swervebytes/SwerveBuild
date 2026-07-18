@@ -662,6 +662,7 @@ fn strip_verbatim(p: &Path) -> PathBuf {
 }
 
 pub fn save_grok_session_id(chat_id: &str, session_id: &str) -> Result<(), String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     if let Some(chat) = store.chats.iter_mut().find(|c| c.id == chat_id) {
         chat.grok_session_id = Some(session_id.to_string());
