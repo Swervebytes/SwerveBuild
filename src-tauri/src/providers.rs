@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -523,22 +524,54 @@ fn parse_grok_models(output: &str) -> Vec<(String, bool)> {
 /// Everything selectable in the model pickers. Queries the grok CLI live so the
 /// hosted list tracks whatever xAI currently offers this account; degrades to
 /// custom/endpoint entries only when grok is missing or the query fails.
+/// `grok models` shells out to the CLI, and the model pickers call this on every
+/// open — each one spawning a subprocess on the UI thread. Cache the parsed
+/// hosted list briefly. User-added, endpoint and local models are read from the
+/// store below and stay immediate, so newly registered models still appear at once.
+static HOSTED_CACHE: Mutex<Option<(u64, Vec<(String, bool)>)>> = Mutex::new(None);
+const HOSTED_TTL_SECS: u64 = 60;
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn hosted_models() -> Vec<(String, bool)> {
+    let now = now_secs();
+    if let Ok(guard) = HOSTED_CACHE.lock() {
+        if let Some((at, cached)) = guard.as_ref() {
+            if now.saturating_sub(*at) < HOSTED_TTL_SECS {
+                return cached.clone();
+            }
+        }
+    }
+
+    let mut fresh = Vec::new();
+    if let Some(grok) = crate::resolve_grok_executable() {
+        if let Ok(output) = crate::util::hidden_command(&grok).arg("models").output() {
+            fresh = parse_grok_models(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    if let Ok(mut guard) = HOSTED_CACHE.lock() {
+        *guard = Some((now, fresh.clone()));
+    }
+    fresh
+}
+
 pub fn list_models() -> Vec<ModelInfo> {
     let mut out: Vec<ModelInfo> = Vec::new();
 
-    if let Some(grok) = crate::resolve_grok_executable() {
-        if let Ok(output) = crate::util::hidden_command(&grok).arg("models").output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for (id, is_default) in parse_grok_models(&stdout) {
-                out.push(ModelInfo {
-                    label: id.clone(),
-                    id,
-                    kind: "hosted".into(),
-                    note: None,
-                    is_default,
-                });
-            }
-        }
+    for (id, is_default) in hosted_models() {
+        out.push(ModelInfo {
+            label: id.clone(),
+            id,
+            kind: "hosted".into(),
+            note: None,
+            is_default,
+        });
     }
 
     let store = ProviderStore::load();
