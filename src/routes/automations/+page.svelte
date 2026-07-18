@@ -169,6 +169,9 @@
     try {
       await automationsStore.save($state.snapshot(editing) as Automation);
       editing = null;
+    } catch (err) {
+      // Previously uncaught: a failed save left the editor open with no feedback.
+      editorError = `Couldn't save this automation: ${String(err)}`;
     } finally {
       busy = null;
     }
