@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { parseBlocks, type Inline } from "$lib/markdown";
 
   let {
     role,
@@ -65,6 +66,7 @@
   <div class="body">
     <div class="role mono-label">{role === "user" ? "You" : "Assistant"}</div>
     <div class="content" class:live>
+      {#snippet inlines(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "code"}<code class="md-ic">{n.v}</code>{:else if n.t === "strong"}<strong>{@render inlines(n.c)}</strong>{:else if n.t === "em"}<em>{@render inlines(n.c)}</em>{/if}{/each}{/snippet}
       {#each segments as seg, i}
         {#if seg.type === "code"}
           <div class="code">
@@ -77,8 +79,34 @@
             </div>
             <pre><code>{seg.content}</code></pre>
           </div>
-        {:else}
+        {:else if live}
+          <!-- While streaming, render plain text: markdown is still half-formed
+               (open fences, partial tables) and would flicker. Finalized messages
+               below get the full render. -->
           <p class="text">{seg.content}</p>
+        {:else}
+          <div class="md">
+            {#each parseBlocks(seg.content) as b}
+              {#if b.t === "h"}
+                <div class="md-h" data-level={b.level}>{@render inlines(b.c)}</div>
+              {:else if b.t === "p"}
+                <p class="text">{#each b.lines as line, li}{#if li > 0}<br />{/if}{@render inlines(line)}{/each}</p>
+              {:else if b.t === "ul"}
+                <ul class="md-list">{#each b.items as it}<li>{@render inlines(it)}</li>{/each}</ul>
+              {:else if b.t === "ol"}
+                <ol class="md-list md-ol">{#each b.items as it}<li>{@render inlines(it)}</li>{/each}</ol>
+              {:else if b.t === "quote"}
+                <blockquote class="md-quote">{#each b.lines as line, li}{#if li > 0}<br />{/if}{@render inlines(line)}{/each}</blockquote>
+              {:else if b.t === "table"}
+                <div class="md-table-wrap">
+                  <table class="md-table">
+                    <thead><tr>{#each b.header as h}<th>{@render inlines(h)}</th>{/each}</tr></thead>
+                    <tbody>{#each b.rows as r}<tr>{#each r as c}<td>{@render inlines(c)}</td>{/each}</tr>{/each}</tbody>
+                  </table>
+                </div>
+              {/if}
+            {/each}
+          </div>
         {/if}
       {/each}
     </div>
@@ -213,5 +241,92 @@
     max-height: 120px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
+  }
+
+  /* Rendered markdown (finalized assistant/user messages) */
+  .md {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    min-width: 0;
+  }
+  .md-h {
+    font-weight: 650;
+    color: var(--text-primary);
+    line-height: 1.3;
+    margin-top: 0.15rem;
+  }
+  .md-h[data-level="1"] {
+    font-size: 1.15rem;
+  }
+  .md-h[data-level="2"] {
+    font-size: 1.05rem;
+  }
+  .md-h[data-level="3"] {
+    font-size: 0.975rem;
+  }
+  .md-h[data-level="4"],
+  .md-h[data-level="5"],
+  .md-h[data-level="6"] {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    text-transform: none;
+  }
+  .md-list {
+    margin: 0;
+    padding-left: 1.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.9375rem;
+    line-height: 1.55;
+    color: var(--text-primary);
+  }
+  .user .md-list {
+    color: var(--text-secondary);
+  }
+  .md-list li {
+    padding-left: 0.15rem;
+  }
+  .md-ic {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--bg-muted);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.04rem 0.3rem;
+    overflow-wrap: anywhere;
+  }
+  .md-quote {
+    margin: 0;
+    padding: 0.15rem 0 0.15rem 0.8rem;
+    border-left: 3px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.9375rem;
+    line-height: 1.55;
+  }
+  .md-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .md-table {
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+  .md-table th,
+  .md-table td {
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  .md-table th {
+    background: var(--bg-surface-2);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .md-table td {
+    color: var(--text-secondary);
   }
 </style>
