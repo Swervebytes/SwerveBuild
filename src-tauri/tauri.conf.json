@@ -25,7 +25,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/.swervebuild/**", "$HOME/.swervegrok/**"]
+        "scope": ["$HOME/.swervebuild/attachments/**", "$HOME/.swervegrok/attachments/**"]
       }
     }
   },

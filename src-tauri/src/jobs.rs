@@ -499,12 +499,25 @@ fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
 
     // Effective tools: in shadow, intersect with the read-safe allowlist.
     let effective: Vec<String> = match mode {
-        ExecMode::Shadow => exec
-            .tools
-            .iter()
-            .filter(|t| READ_SAFE_TOOLS.contains(&t.as_str()))
-            .cloned()
-            .collect(),
+        ExecMode::Shadow => {
+            let filtered: Vec<String> = exec
+                .tools
+                .iter()
+                .filter(|t| READ_SAFE_TOOLS.contains(&t.as_str()))
+                .cloned()
+                .collect();
+            // Shadow must ALWAYS emit `--tools`. An empty intersection (the user
+            // cleared every tool, or a hand-edited automations.json listed none of
+            // the read-safe tools) must NOT fall through to the branch below that
+            // omits the flag — grok would then run with its DEFAULT full toolset,
+            // silently granting write/shell inside a "read-only" run. Fall back to
+            // the whole read-safe set so the flag is always present and binding.
+            if filtered.is_empty() {
+                READ_SAFE_TOOLS.iter().map(|s| s.to_string()).collect()
+            } else {
+                filtered
+            }
+        }
         ExecMode::Write => exec.tools.clone(),
     };
     if !effective.is_empty() {
@@ -1535,11 +1548,29 @@ pub fn delete_automation(id: &str) -> Result<(), String> {
     store.save()
 }
 
+/// Reject ids that could escape the runs directory when used in a path join.
+/// Real automation/run ids are UUIDs or `a-<uuid>` — ASCII alnum, `-`, `_`. This
+/// is defense-in-depth for the Tauri command layer (the MCP sidecar validates its
+/// agent-supplied ids separately) so no crafted id can traverse out of `runs/`.
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn list_runs(automation_id: &str) -> Vec<RunRecord> {
+    if !is_safe_id(automation_id) {
+        return Vec::new();
+    }
     list_run_records(automation_id)
 }
 
 pub fn read_run_log(automation_id: &str, run_id: &str) -> Result<String, String> {
+    if !is_safe_id(automation_id) || !is_safe_id(run_id) {
+        return Err("invalid id".to_string());
+    }
     let path = run_log_path(automation_id, run_id);
     if !path.exists() {
         return Ok(String::new());
@@ -1548,7 +1579,13 @@ pub fn read_run_log(automation_id: &str, run_id: &str) -> Result<String, String>
 }
 
 pub fn mark_runs_seen(automation_id: &str, run_ids: Vec<String>) -> Result<(), String> {
+    if !is_safe_id(automation_id) {
+        return Err("invalid automation_id".to_string());
+    }
     for run_id in run_ids {
+        if !is_safe_id(&run_id) {
+            continue;
+        }
         let path = run_meta_path(automation_id, &run_id);
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(mut rec) = serde_json::from_str::<RunRecord>(&raw) {
@@ -1609,5 +1646,57 @@ mod tests {
         let exec: Executor =
             serde_json::from_str(r#"{ "prompt": "hi", "cwd": "E:/x" }"#).unwrap();
         assert_eq!(exec.model, None);
+    }
+
+    #[test]
+    fn shadow_with_empty_tools_falls_back_to_read_safe_not_default() {
+        // Regression (shadow bypass): clearing every tool must NOT drop `--tools`
+        // — an absent flag hands grok its full default (write + shell) toolset
+        // inside a supposedly read-only run. It must fall back to the read-safe set.
+        let mut exec = Executor::default();
+        exec.tools = vec![];
+        let args = build_grok_args(&exec, "p.txt");
+        let pos = args
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools must always be present in shadow mode");
+        let value = &args[pos + 1];
+        for t in READ_SAFE_TOOLS {
+            assert!(
+                value.split(',').any(|v| v == *t),
+                "read-safe tool {t} missing from {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_drops_non_read_safe_tools() {
+        // A hand-edited automations.json listing write/shell tools is filtered
+        // down to the read-safe intersection; write/shell never survive.
+        let mut exec = Executor::default();
+        exec.tools = vec![
+            "read_file".into(),
+            "run_terminal_cmd".into(),
+            "edit_file".into(),
+        ];
+        let args = build_grok_args(&exec, "p.txt");
+        let pos = args.iter().position(|a| a == "--tools").expect("--tools present");
+        let value = &args[pos + 1];
+        assert!(value.split(',').any(|v| v == "read_file"));
+        assert!(!value.contains("run_terminal_cmd"), "shell tool leaked: {value}");
+        assert!(!value.contains("edit_file"), "write tool leaked: {value}");
+    }
+
+    #[test]
+    fn is_safe_id_rejects_path_traversal() {
+        // Real ids pass; anything with separators or dots escaping runs/ is rejected.
+        assert!(is_safe_id("8f14e45f-ceea-467a-9575-0123456789ab"));
+        assert!(is_safe_id("a-1b2c3d4e5f60"));
+        assert!(!is_safe_id("../etc"));
+        assert!(!is_safe_id("..\\..\\secret"));
+        assert!(!is_safe_id("a/b"));
+        assert!(!is_safe_id("a\\b"));
+        assert!(!is_safe_id(""));
+        assert!(!is_safe_id("has space"));
     }
 }

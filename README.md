@@ -69,7 +69,7 @@ Open **Settings → Providers** and pick an available agent. The home screen sho
 
 ### Run Grok against your own endpoint
 
-In **Settings → Custom endpoint (advanced)**, point Grok Build at any OpenAI-compatible inference — local (Ollama, llama.cpp), self-hosted, or a gateway. Swerve writes a managed `[model.swerve-endpoint]` block to `~/.grok/config.toml` (backing the file up first) and routes Grok's default model to it while enabled. The endpoint's API key is injected at launch and **never written to disk**; because it satisfies Grok's own auth, **no xAI sign-in is required** — so your code can stay entirely on your machine. Both chats and Automations follow the endpoint. Turn routing off to return to xAI's hosted models.
+In **Settings → Custom endpoint (advanced)**, point Grok Build at any OpenAI-compatible inference — local (Ollama, llama.cpp), self-hosted, or a gateway. Swerve writes a managed `[model.swerve-endpoint]` block to `~/.grok/config.toml` (backing the file up first) and routes Grok's default model to it while enabled. The endpoint's API key is stored locally in `~/.swervebuild/providers.json` and injected into Grok's environment at launch — **never written into Grok's `config.toml`**; because it satisfies Grok's own auth, **no xAI sign-in is required** — so your code can stay entirely on your machine. Both chats and Automations follow the endpoint. Turn routing off to return to xAI's hosted models.
 
 ## Develop
 

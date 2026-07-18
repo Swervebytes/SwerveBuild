@@ -116,8 +116,8 @@ pub fn install_engine(app: &AppHandle) -> Result<String, String> {
             "-Command",
             &format!(
                 "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                zip.display(),
-                dir.display()
+                ps_quote(&zip.display().to_string()),
+                ps_quote(&dir.display().to_string())
             ),
         ])
         .status();
@@ -156,7 +156,7 @@ fn file_sha256(path: &PathBuf) -> Result<String, String> {
             "-Command",
             &format!(
                 "(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash",
-                path.display()
+                ps_quote(&path.display().to_string())
             ),
         ])
         .output()
@@ -165,6 +165,14 @@ fn file_sha256(path: &PathBuf) -> Result<String, String> {
         return Err("hashing the download failed".to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Escape a string for embedding inside a PowerShell single-quoted literal: a
+/// literal `'` becomes `''`. Without this, a data dir under a home path that
+/// contains an apostrophe (e.g. `C:\Users\O'Brien`) would break — or let content
+/// break out of — the `Expand-Archive` / `Get-FileHash` command strings below.
+fn ps_quote(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 fn find_file(root: &PathBuf, name: &str) -> Option<PathBuf> {
