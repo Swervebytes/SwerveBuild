@@ -34,12 +34,20 @@
 
   onMount(() => {
     refreshMax();
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     appWindow()
       ?.onResized(() => refreshMax())
-      .then((fn) => (unlisten = fn))
+      .then((fn) => {
+        // Unmount may beat this resolve; detach immediately if so, else remember.
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
       .catch(() => {});
-    return () => unlisten?.();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   });
 </script>
 

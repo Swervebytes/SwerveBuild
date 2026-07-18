@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { page } from "$app/stores";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
+  import { subscribe } from "$lib/events";
   import { goto } from "$app/navigation";
   import type { Chat, ChatMessage, Project } from "$lib/types";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
@@ -31,8 +31,6 @@
   // `-m` is a grok flag; hide the model picker when another agent backs this chat.
   const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
 
-  let unlistenUpdate: (() => void) | null = null;
-  let unlistenReady: (() => void) | null = null;
   let bootstrapGen = 0;
 
   function resetStream() {
@@ -257,26 +255,19 @@
   }
 
   onMount(() => {
-    listen<{ chatId: string; params: Record<string, unknown> }>("chat-update", (event) => {
-      if (event.payload.chatId !== $page.params.id) return;
-      appendStream(event.payload.params);
-    }).then((unlisten) => {
-      unlistenUpdate = unlisten;
-    });
-
-    listen<{ chatId: string }>("chat-session-ready", (event) => {
-      if (event.payload.chatId === $page.params.id) {
-        sessionReady = true;
-      }
-      refreshActiveSessions();
-    }).then((unlisten) => {
-      unlistenReady = unlisten;
-    });
-
-    return () => {
-      unlistenUpdate?.();
-      unlistenReady?.();
-    };
+    const offs = [
+      subscribe<{ chatId: string; params: Record<string, unknown> }>("chat-update", (event) => {
+        if (event.payload.chatId !== $page.params.id) return;
+        appendStream(event.payload.params);
+      }),
+      subscribe<{ chatId: string }>("chat-session-ready", (event) => {
+        if (event.payload.chatId === $page.params.id) {
+          sessionReady = true;
+        }
+        refreshActiveSessions();
+      }),
+    ];
+    return () => offs.forEach((o) => o());
   });
 </script>
 

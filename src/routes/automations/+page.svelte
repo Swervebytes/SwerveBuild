@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { subscribe } from "$lib/events";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { automationsStore } from "$lib/stores/automations.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
@@ -52,8 +52,6 @@
   );
   const enabledCount = $derived(automations.filter((a) => a.enabled).length);
 
-  let unlisteners: Array<() => void> = [];
-
   onMount(() => {
     (async () => {
       await workspaceStore.refresh();
@@ -66,36 +64,36 @@
       }
     })();
 
-    listen<RunOutput>("automation-run-output", (e) => {
-      if (!inspector || e.payload.runId !== inspector.runId) return;
-      const line: TranscriptLine = { kind: e.payload.type, text: e.payload.text };
-      if (line.kind === "text") {
-        const last = transcript[transcript.length - 1];
-        if (last && last.kind === "text") {
-          last.text += line.text;
-          transcript = [...transcript];
-          return;
+    const offs = [
+      subscribe<RunOutput>("automation-run-output", (e) => {
+        if (!inspector || e.payload.runId !== inspector.runId) return;
+        const line: TranscriptLine = { kind: e.payload.type, text: e.payload.text };
+        if (line.kind === "text") {
+          const last = transcript[transcript.length - 1];
+          if (last && last.kind === "text") {
+            last.text += line.text;
+            transcript = [...transcript];
+            return;
+          }
         }
-      }
-      transcript = [...transcript, line];
-    }).then((u) => unlisteners.push(u));
+        transcript = [...transcript, line];
+      }),
 
-    listen<{ automationId: string; runId: string }>("automation-run-started", () => {
-      automationsStore.refresh();
-    }).then((u) => unlisteners.push(u));
+      subscribe<{ automationId: string; runId: string }>("automation-run-started", () => {
+        automationsStore.refresh();
+      }),
 
-    listen<RunFinished>("automation-run-finished", (e) => {
-      automationsStore.refresh();
-      loadRuns(e.payload.automationId);
-      if (inspector && e.payload.runId === inspector.runId) {
-        inspectorStatus = e.payload.status;
-        inspectorError = e.payload.error;
-      }
-    }).then((u) => unlisteners.push(u));
+      subscribe<RunFinished>("automation-run-finished", (e) => {
+        automationsStore.refresh();
+        loadRuns(e.payload.automationId);
+        if (inspector && e.payload.runId === inspector.runId) {
+          inspectorStatus = e.payload.status;
+          inspectorError = e.payload.error;
+        }
+      }),
+    ];
 
-    return () => {
-      unlisteners.forEach((u) => u());
-    };
+    return () => offs.forEach((o) => o());
   });
 
   async function loadRuns(automationId: string) {

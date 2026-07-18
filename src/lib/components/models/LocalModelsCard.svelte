@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
+  import { subscribe } from "$lib/events";
   import { open } from "@tauri-apps/plugin-dialog";
   import Icon from "$lib/components/ui/Icon.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
@@ -34,8 +34,6 @@
   let message = $state<string | null>(null);
   let isError = $state(false);
 
-  let unlisteners: Array<() => void> = [];
-
   async function refresh() {
     try {
       local = await invoke<LocalState>("get_local_state");
@@ -47,13 +45,15 @@
 
   onMount(() => {
     refresh();
-    listen<EngineProgress>("local-engine-progress", (ev) => {
-      progress = ev.payload;
-    }).then((u) => unlisteners.push(u));
-    listen<ServerStatus>("local-llm-status", (ev) => {
-      if (local) local = { ...local, server: ev.payload };
-    }).then((u) => unlisteners.push(u));
-    return () => unlisteners.forEach((u) => u());
+    const offs = [
+      subscribe<EngineProgress>("local-engine-progress", (ev) => {
+        progress = ev.payload;
+      }),
+      subscribe<ServerStatus>("local-llm-status", (ev) => {
+        if (local) local = { ...local, server: ev.payload };
+      }),
+    ];
+    return () => offs.forEach((o) => o());
   });
 
   async function installEngine() {
