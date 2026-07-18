@@ -122,32 +122,41 @@ fn get_grok_status() -> GrokStatus {
 }
 
 #[tauri::command]
-fn install_grok() -> CommandResult {
-    let script = "irm https://x.ai/cli/install.ps1 | iex";
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .status();
+async fn install_grok() -> CommandResult {
+    // The installer takes minutes; running it synchronously on the main thread
+    // froze the entire UI until it finished. Do it on a blocking worker instead.
+    tauri::async_runtime::spawn_blocking(|| {
+        let script = "irm https://x.ai/cli/install.ps1 | iex";
+        let status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .status();
 
-    match status {
-        Ok(result) if result.success() => CommandResult {
-            success: true,
-            message: "Grok Build installed successfully.".into(),
-        },
-        Ok(result) => CommandResult {
-            success: false,
-            message: format!("Installer exited with code {:?}", result.code()),
-        },
-        Err(error) => CommandResult {
-            success: false,
-            message: format!("Failed to run installer: {error}"),
-        },
-    }
+        match status {
+            Ok(result) if result.success() => CommandResult {
+                success: true,
+                message: "Grok Build installed successfully.".into(),
+            },
+            Ok(result) => CommandResult {
+                success: false,
+                message: format!("Installer exited with code {:?}", result.code()),
+            },
+            Err(error) => CommandResult {
+                success: false,
+                message: format!("Failed to run installer: {error}"),
+            },
+        }
+    })
+    .await
+    .unwrap_or_else(|e| CommandResult {
+        success: false,
+        message: format!("Install task failed: {e}"),
+    })
 }
 
 fn spawn_hidden_grok_login(grok: &Path) -> std::io::Result<()> {
