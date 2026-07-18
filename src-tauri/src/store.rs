@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,9 +69,23 @@ impl Default for AppStore {
     }
 }
 
+/// Serializes every read-modify-write of data.json across threads: main-thread
+/// commands and spawn_blocking session saves both mutate it, and without this a
+/// concurrent load..save pair silently clobbers the other's changes (message
+/// loss). Hold the guard across the whole load..mutate..save window. Single
+/// process only (a second app instance would bypass it — see single-instance).
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
 pub struct Store;
 
 impl Store {
+    /// Acquire the process-wide data.json write lock. Hold the returned guard
+    /// across a full load..mutate..save sequence. NEVER call another function
+    /// that also takes this lock while holding it — std Mutex is not reentrant.
+    pub fn lock() -> MutexGuard<'static, ()> {
+        STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn data_path() -> PathBuf {
         crate::paths::data_file()
     }

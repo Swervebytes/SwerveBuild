@@ -356,6 +356,7 @@ fn get_workspace() -> AppStore {
 
 #[tauri::command]
 fn add_project(path: String) -> Result<Project, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let now = Store::now();
 
@@ -392,6 +393,7 @@ fn add_project(path: String) -> Result<Project, String> {
 
 #[tauri::command]
 fn remove_project(project_id: String) -> Result<(), String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     store.projects.retain(|p| p.id != project_id);
     store.chats.retain(|c| c.project_id != project_id);
@@ -400,6 +402,7 @@ fn remove_project(project_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn create_chat(project_id: String, title: Option<String>) -> Result<Chat, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let resolved_project_id = store
         .projects
@@ -430,6 +433,7 @@ fn create_chat(project_id: String, title: Option<String>) -> Result<Chat, String
 #[tauri::command]
 fn remove_chat(chat_id: String, acp: State<'_, Arc<AcpManager>>) -> Result<(), String> {
     acp.close_chat(&chat_id);
+    let _guard = Store::lock();
     let mut store = Store::load();
     store.chats.retain(|c| c.id != chat_id);
     Store::save(&store)
@@ -437,6 +441,7 @@ fn remove_chat(chat_id: String, acp: State<'_, Arc<AcpManager>>) -> Result<(), S
 
 #[tauri::command]
 fn rename_chat(chat_id: String, title: String) -> Result<Chat, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let chat = store
         .chats
@@ -469,6 +474,7 @@ fn append_chat_message(
     content: String,
     images: Vec<String>,
 ) -> Result<ChatMessage, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let chat = store
         .chats
@@ -505,7 +511,7 @@ async fn start_chat_session(
     acp: State<'_, Arc<AcpManager>>,
     chat_id: String,
 ) -> Result<CommandResult, String> {
-    let mut store = Store::load();
+    let store = Store::load();
     let chat = store
         .chats
         .iter()
@@ -518,9 +524,15 @@ async fn start_chat_session(
         .find(|p| p.id == chat.project_id)
         .ok_or_else(|| "Project not found".to_string())?;
 
-    if let Some(entry) = store.chats.iter_mut().find(|c| c.id == chat_id) {
-        entry.updated_at = Store::now();
-        Store::save(&store)?;
+    // Tight lock scope: touch updated_at and release BEFORE the session spawn,
+    // which later calls save_grok_session_id (also a store writer that locks).
+    {
+        let _guard = Store::lock();
+        let mut fresh = Store::load();
+        if let Some(entry) = fresh.chats.iter_mut().find(|c| c.id == chat_id) {
+            entry.updated_at = Store::now();
+            Store::save(&fresh)?;
+        }
     }
 
     let provider = chat
@@ -763,6 +775,7 @@ fn list_models() -> Vec<providers::ModelInfo> {
 /// restarts the session, and `session/load` restores the conversation.
 #[tauri::command]
 fn set_chat_model(chat_id: String, model_id: Option<String>) -> Result<(), String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let chat = store
         .chats

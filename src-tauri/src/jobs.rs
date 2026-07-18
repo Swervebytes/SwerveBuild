@@ -462,6 +462,10 @@ fn prune_runs(automation_id: &str, keep: usize) {
     for rec in records.into_iter().skip(keep) {
         let _ = fs::remove_file(run_meta_path(automation_id, &rec.id));
         let _ = fs::remove_file(run_log_path(automation_id, &rec.id));
+        // The per-run prompt file was previously never pruned — a slow disk leak.
+        let _ = fs::remove_file(
+            crate::paths::run_dir(automation_id).join(format!("{}.prompt.txt", rec.id)),
+        );
     }
 }
 
