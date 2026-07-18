@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use store::{AppStore, Chat, ChatMessage, Project, Store};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Serialize)]
 pub struct GrokStatus {
@@ -975,6 +975,16 @@ pub fn run() {
     let jobs_sched = job_mgr.clone();
 
     tauri::Builder::default()
+        // Must be the FIRST plugin: a second launch focuses the existing window
+        // instead of starting a second app — which would run a second scheduler
+        // and a second data.json writer, defeating the in-process store lock.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(acp)
