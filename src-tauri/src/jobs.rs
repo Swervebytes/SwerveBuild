@@ -1024,7 +1024,7 @@ impl JobManager {
             };
             let _ = write_run_record(&rec);
             write_report_sink(&automation, &rec);
-            update_automation_state(&automation_id, &run_id_w, status);
+            update_automation_state(&automation_id, &run_id_w, status, &trigger_reason);
             prune_runs(&automation_id, 50);
 
             if let Ok(mut g) = jm.running.lock() {
@@ -1238,7 +1238,13 @@ pub fn spawn_scheduler(app: AppHandle, jm: Arc<JobManager>) {
                                     }),
                                 }
                             } else if let Some(occ) = most_recent_occurrence(s, now) {
-                                if a.state.last_fired_at.unwrap_or(0) < occ {
+                                // A never-fired rule baselines off its creation time, so a
+                                // brand-new daily/weekly automation doesn't instantly "catch
+                                // up" on an occurrence that happened before it existed — it
+                                // waits for the next one. Genuine catch-up (app was closed
+                                // over a scheduled time) still works via last_fired_at.
+                                let baseline = a.state.last_fired_at.unwrap_or_else(|| created_secs(a));
+                                if baseline < occ {
                                     fires.push(FireAction {
                                         automation: a.clone(),
                                         reason: "schedule-catchup".into(),
@@ -1323,6 +1329,12 @@ pub fn spawn_scheduler(app: AppHandle, jm: Arc<JobManager>) {
             let _ = rx.recv_timeout(Duration::from_secs(next_wait.clamp(2, 30)));
         }
     });
+}
+
+/// Epoch seconds an automation was created. Legacy/unparseable values yield 0,
+/// which preserves the old catch-up-from-zero behavior for pre-existing data.
+fn created_secs(a: &Automation) -> u64 {
+    a.created_at.parse::<u64>().unwrap_or(0)
 }
 
 /// Most recent scheduled occurrence (UTC secs) for a daily/weekly schedule, or
@@ -1460,13 +1472,26 @@ fn status_str(status: RunStatus) -> &'static str {
 }
 
 /// Update the automation's runtime state after a run finishes.
-fn update_automation_state(automation_id: &str, run_id: &str, status: RunStatus) {
+///
+/// `last_fired_at` is deliberately NOT re-stamped for scheduler-driven runs: the
+/// scheduler stamps it at FIRE time, and stamping again at FINISH time drifts
+/// every interval schedule later by the run's duration (a 10-minute run pushed
+/// the next fire 10 minutes out, compounding every cycle). Manual runs get no
+/// fire-time stamp, so they record one here.
+fn update_automation_state(
+    automation_id: &str,
+    run_id: &str,
+    status: RunStatus,
+    trigger_reason: &str,
+) {
     let _g = store_guard();
     let mut store = AutomationStore::load();
     if let Some(a) = store.automations.iter_mut().find(|a| a.id == automation_id) {
         a.state.last_run_id = Some(run_id.to_string());
         a.state.last_status = Some(status_str(status).to_string());
-        a.state.last_fired_at = Some(now_secs());
+        if trigger_reason == "manual" {
+            a.state.last_fired_at = Some(now_secs());
+        }
         let _ = store.save();
     }
 }
@@ -1689,6 +1714,72 @@ mod tests {
         assert!(value.split(',').any(|v| v == "read_file"));
         assert!(!value.contains("run_terminal_cmd"), "shell tool leaked: {value}");
         assert!(!value.contains("edit_file"), "write tool leaked: {value}");
+    }
+
+    // 2026-01-01 00:00:00 UTC (a Thursday) — day 20454 since the epoch.
+    const JAN_1_2026: u64 = 1_767_225_600;
+
+    fn daily_at(hour: u32) -> ScheduleTrigger {
+        ScheduleTrigger {
+            every: "daily".into(),
+            hour,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn most_recent_occurrence_daily_after_the_time_is_today() {
+        // Now = 10:00; the 09:00 slot already passed today.
+        let occ = most_recent_occurrence(&daily_at(9), JAN_1_2026 + 10 * 3600).unwrap();
+        assert_eq!(occ, JAN_1_2026 + 9 * 3600);
+    }
+
+    #[test]
+    fn most_recent_occurrence_daily_before_the_time_is_yesterday() {
+        // Now = 08:00; today's 09:00 hasn't happened, so the most recent is yesterday's.
+        let occ = most_recent_occurrence(&daily_at(9), JAN_1_2026 + 8 * 3600).unwrap();
+        assert_eq!(occ, JAN_1_2026 - 86400 + 9 * 3600);
+    }
+
+    #[test]
+    fn most_recent_occurrence_ignores_interval_schedules() {
+        let s = ScheduleTrigger {
+            every: "interval".into(),
+            ..Default::default()
+        };
+        assert!(most_recent_occurrence(&s, JAN_1_2026).is_none());
+    }
+
+    #[test]
+    fn new_daily_automation_does_not_catch_up_on_a_pre_creation_occurrence() {
+        // Regression: a brand-new daily rule used to baseline off 0 and fire
+        // immediately for a slot that predated it. Created at 10:00, the 09:00
+        // slot is older than the automation, so it must NOT fire.
+        let now = JAN_1_2026 + 10 * 3600;
+        let occ = most_recent_occurrence(&daily_at(9), now).unwrap();
+        let mut a = Automation {
+            id: "a-1".into(),
+            name: "n".into(),
+            enabled: true,
+            project_id: None,
+            trigger: Trigger::Schedule(daily_at(9)),
+            executor: Executor::default(),
+            overlap: OverlapPolicy::Skip,
+            retry: RetryPolicy::default(),
+            chain_input: None,
+            min_interval_secs: 0,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            state: AutomationState::default(),
+            extra: Default::default(),
+        };
+        let baseline = a.state.last_fired_at.unwrap_or_else(|| created_secs(&a));
+        assert!(baseline >= occ, "new automation must not fire for a pre-creation slot");
+
+        // But one created yesterday (never fired) SHOULD catch up on today's slot.
+        a.created_at = (JAN_1_2026 - 86400).to_string();
+        let baseline = a.state.last_fired_at.unwrap_or_else(|| created_secs(&a));
+        assert!(baseline < occ, "pre-existing automation should still catch up");
     }
 
     #[test]
