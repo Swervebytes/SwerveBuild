@@ -43,7 +43,7 @@ struct ActiveSession {
     session_id: String,
     child: Child,
     transport: Arc<SessionTransport>,
-    last_accessed: AtomicU64,
+    last_accessed: Arc<AtomicU64>,
 }
 
 impl Default for AcpManager {
@@ -204,6 +204,10 @@ impl AcpManager {
         let chat_for_reader = chat_id.to_string();
         // The agent's fs/read|write requests are confined to this project dir.
         let cwd_for_reader = cwd.to_string();
+        // Shared with ActiveSession so streaming activity keeps this session warm
+        // in the LRU — a mid-turn chat must not be evicted when a 4th chat opens.
+        let last_accessed = Arc::new(AtomicU64::new(now_secs()));
+        let last_accessed_reader = Arc::clone(&last_accessed);
 
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -218,6 +222,9 @@ impl AcpManager {
 
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                     if method == "session/update" {
+                        // Streaming counts as access so the LRU keeps a mid-turn
+                        // session alive even if it hasn't been sent to recently.
+                        last_accessed_reader.store(now_secs(), Ordering::SeqCst);
                         if !transport_for_reader.suppress_updates.load(Ordering::SeqCst) {
                             let _ = app_for_reader.emit(
                                 "chat-update",
@@ -297,7 +304,7 @@ impl AcpManager {
             session_id: String::new(),
             child,
             transport: Arc::clone(&transport),
-            last_accessed: AtomicU64::new(now_secs()),
+            last_accessed,
         };
 
         let agent_caps = active.transport.rpc(
