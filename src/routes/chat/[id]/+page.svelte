@@ -200,6 +200,15 @@
     }
   }
 
+  async function stopGenerating() {
+    if (!chat) return;
+    try {
+      await invoke("cancel_chat_prompt", { chatId: chat.id });
+    } catch (err) {
+      error = String(err);
+    }
+  }
+
   async function sendMessage(text: string, images: string[]) {
     if (!chat || sending) return;
     if (!text && images.length === 0) return;
@@ -299,7 +308,7 @@
   {/if}
 
   <div class="reading-col composer-wrap">
-    <Composer disabled={!chat || sending} {sending} onsend={sendMessage} />
+    <Composer disabled={!chat || sending} {sending} onsend={sendMessage} onstop={stopGenerating} />
   </div>
 </div>
 

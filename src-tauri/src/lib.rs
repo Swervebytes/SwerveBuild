@@ -630,6 +630,14 @@ async fn send_chat_message(
 }
 
 #[tauri::command]
+fn cancel_chat_prompt(
+    acp: State<'_, Arc<AcpManager>>,
+    chat_id: String,
+) -> Result<(), String> {
+    acp.cancel_prompt(&chat_id)
+}
+
+#[tauri::command]
 fn list_providers() -> Vec<ProviderView> {
     providers::views()
 }
@@ -1015,6 +1023,7 @@ pub fn run() {
             close_chat_session,
             respond_chat_permission,
             send_chat_message,
+            cancel_chat_prompt,
             list_providers,
             get_active_provider,
             set_active_provider,

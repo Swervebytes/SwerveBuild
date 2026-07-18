@@ -13,7 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 const CONNECT_TIMEOUT_SECS: u64 = 45;
-const PROMPT_TIMEOUT_SECS: u64 = 300;
+// Agentic coding turns can run many minutes; a short ceiling aborts a
+// still-working agent and truncates its reply (the old 300s bug). Wait long, and
+// rely on two faster signals instead: the reader thread unblocks this wait the
+// moment grok's stdout closes (process died), and the user can Stop a turn
+// (session/cancel).
+const PROMPT_TIMEOUT_SECS: u64 = 1800;
 const MAX_CONCURRENT_SESSIONS: usize = 3;
 
 pub struct AcpManager {
@@ -272,6 +277,19 @@ impl AcpManager {
                     }
                 }
             }
+
+            // stdout closed: grok exited (crash, kill, or clean exit). Unblock any
+            // in-flight RPC — dropping the pending senders makes their recv()
+            // return Err at once, so a send_prompt waiting on a now-dead agent
+            // fails fast instead of hanging out the full timeout — and tell the UI
+            // this chat's session is gone so it can show a reconnect hint.
+            if let Ok(mut pending) = transport_for_reader.responses.lock() {
+                pending.clear();
+            }
+            let _ = app_for_reader.emit(
+                "chat-session-ended",
+                json!({ "chatId": chat_for_reader }),
+            );
         });
 
         let mut active = ActiveSession {
@@ -443,6 +461,28 @@ impl AcpManager {
         )?;
 
         Ok(())
+    }
+
+    /// Cancel the in-flight turn for a chat. ACP `session/cancel` is a
+    /// notification (no response): the agent aborts the current turn and then
+    /// responds to the pending `session/prompt`, so the waiting `send_prompt`
+    /// unblocks and the caller saves whatever partial reply arrived.
+    pub fn cancel_prompt(&self, chat_id: &str) -> Result<(), String> {
+        let (transport, session_id) = {
+            let guard = self
+                .sessions
+                .lock()
+                .map_err(|_| "ACP session lock poisoned".to_string())?;
+            let active = guard
+                .get(chat_id)
+                .ok_or_else(|| "No active session for this chat.".to_string())?;
+            (Arc::clone(&active.transport), active.session_id.clone())
+        };
+        transport.write_json_line(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id }
+        }))
     }
 }
 
