@@ -39,7 +39,6 @@ struct SessionTransport {
 }
 
 struct ActiveSession {
-    chat_id: String,
     session_id: String,
     child: Child,
     transport: Arc<SessionTransport>,
@@ -113,17 +112,6 @@ impl AcpManager {
                 session.bump_access();
             }
         }
-    }
-
-    fn session_id_for(&self, chat_id: &str) -> Result<String, String> {
-        let guard = self
-            .sessions
-            .lock()
-            .map_err(|_| "ACP session lock poisoned".to_string())?;
-        guard
-            .get(chat_id)
-            .map(|s| s.session_id.clone())
-            .ok_or_else(|| "Chat session not found".to_string())
     }
 
     fn evict_if_needed(&self) {
@@ -300,7 +288,6 @@ impl AcpManager {
         });
 
         let mut active = ActiveSession {
-            chat_id: chat_id.to_string(),
             session_id: String::new(),
             child,
             transport: Arc::clone(&transport),
