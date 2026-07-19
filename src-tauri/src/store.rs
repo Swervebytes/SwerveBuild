@@ -13,12 +13,25 @@ pub struct Project {
     pub last_opened_at: String,
 }
 
+/// One non-prose segment of an assistant turn — the reasoning and tool-call
+/// trail that streamed live. It used to be discarded when the reply was saved,
+/// so reloading a chat lost everything but the final text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePart {
+    /// "thought" | "tool"
+    pub kind: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub role: String,
     pub content: String,
     pub images: Vec<String>,
+    /// Reasoning/tool trail captured during streaming. Absent in older data.
+    #[serde(default)]
+    pub parts: Vec<MessagePart>,
     pub created_at: String,
 }
 
@@ -169,6 +182,40 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_parts_round_trip_through_json() {
+        // The reasoning/tool trail must survive the exact serialize/deserialize
+        // path data.json uses — that round trip IS the persistence guarantee.
+        let msg = ChatMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: "done".into(),
+            images: vec![],
+            parts: vec![
+                MessagePart { kind: "thought".into(), text: "weighing options".into() },
+                MessagePart { kind: "tool".into(), text: "read_file src/main.rs".into() },
+            ],
+            created_at: "1".into(),
+        };
+        let back: ChatMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back.parts.len(), 2);
+        assert_eq!(back.parts[0].kind, "thought");
+        assert_eq!(back.parts[0].text, "weighing options");
+        assert_eq!(back.parts[1].kind, "tool");
+        assert_eq!(back.parts[1].text, "read_file src/main.rs");
+    }
+
+    #[test]
+    fn message_json_predating_parts_deserializes() {
+        // Messages saved before the reasoning/tool trail existed must still load.
+        let msg: ChatMessage = serde_json::from_str(
+            r#"{ "id": "m1", "role": "assistant", "content": "hi",
+                 "images": [], "created_at": "1" }"#,
+        )
+        .unwrap();
+        assert!(msg.parts.is_empty());
+    }
 
     #[test]
     fn chat_json_predating_model_id_deserializes() {

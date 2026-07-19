@@ -4,7 +4,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { subscribe } from "$lib/events";
   import { goto } from "$app/navigation";
-  import type { Chat, ChatMessage, Project } from "$lib/types";
+  import type { Chat, ChatMessage, MessagePart, Project } from "$lib/types";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
   import { imageSrc } from "$lib/attachments";
@@ -103,11 +103,21 @@
       text = `${text}\n\n_${note}_`;
     }
 
+    // Persist the reasoning/tool trail with the reply. It used to be dropped on
+    // save, so reloading a chat lost everything except the final prose.
+    const parts: MessagePart[] = streaming
+      .filter((item) => item.role === "tool" || item.kind === "thought")
+      .map((item) => ({
+        kind: item.role === "tool" ? ("tool" as const) : ("thought" as const),
+        text: item.content,
+      }));
+
     const saved = await invoke<ChatMessage>("append_chat_message", {
       chatId: chat.id,
       role: "assistant",
       content: text,
       images: [],
+      parts,
     });
 
     chat = {
@@ -224,6 +234,7 @@
       const userMessage = await invoke<ChatMessage>("append_chat_message", {
         chatId: chat.id,
         role: "user",
+        parts: [],
         content: text,
         images,
       });

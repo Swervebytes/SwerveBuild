@@ -6,11 +6,19 @@ export type Project = {
   last_opened_at: string;
 };
 
+/// A non-prose segment of an assistant turn (reasoning or a tool call) that
+/// streamed live and is now persisted alongside the reply.
+export type MessagePart = {
+  kind: "thought" | "tool";
+  text: string;
+};
+
 export type ChatMessage = {
   id: string;
   role: string;
   content: string;
   images: string[];
+  parts?: MessagePart[];
   created_at: string;
 };
 

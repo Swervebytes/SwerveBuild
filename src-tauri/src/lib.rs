@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use store::{AppStore, Chat, ChatMessage, Project, Store};
+use store::{AppStore, Chat, ChatMessage, MessagePart, Project, Store};
 use std::sync::Arc;
 use tauri::{Manager, State};
 
@@ -482,6 +482,7 @@ fn append_chat_message(
     role: String,
     content: String,
     images: Vec<String>,
+    parts: Option<Vec<MessagePart>>,
 ) -> Result<ChatMessage, String> {
     let _guard = Store::lock();
     let mut store = Store::load();
@@ -496,6 +497,7 @@ fn append_chat_message(
         role,
         content,
         images,
+        parts: parts.unwrap_or_default(),
         created_at: Store::now(),
     };
 
