@@ -75,6 +75,18 @@ fn data_path() -> PathBuf {
     swerve_build_lib::paths::data_file()
 }
 
+/// Reject ids that could escape the runs directory when joined into a path. This
+/// server is reachable by the chat agent (it's wired in as an MCP server), so an
+/// `automation_id` like `..\..\..\Users\me\.grok` must never reach `run_dir`.
+/// Real ids are UUIDs or `a-<uuid>` — ASCII alnum, `-`, `_`.
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn load_json(path: PathBuf) -> Value {
     if !path.exists() {
         return json!({});
@@ -186,6 +198,9 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .get("automation_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "automation_id required".to_string())?;
+            if !is_safe_id(automation_id) {
+                return Err("invalid automation_id".to_string());
+            }
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             let dir = swerve_build_lib::paths::run_dir(automation_id);
             let mut runs: Vec<Value> = Vec::new();
@@ -283,10 +298,14 @@ fn main() {
     let mut stdout = io::stdout();
 
     for line in stdin.lock().lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
+        // Strip any BOM a host shell's pipe machinery may prepend (Windows
+        // PowerShell 5.1 injects a UTF-8 preamble into redirected stdin, which
+        // would otherwise make the first request unparseable) before parsing.
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() {
             continue;
         }
-        let Ok(request) = serde_json::from_str::<RpcRequest>(&line) else {
+        let Ok(request) = serde_json::from_str::<RpcRequest>(line) else {
             continue;
         };
         if let Some(response) = handle(&request) {

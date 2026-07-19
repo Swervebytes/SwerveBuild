@@ -7,11 +7,13 @@
     sending = false,
     placeholder = "Ask Grok to build, fix, or explain…  ⏎ send · ⇧⏎ newline · paste an image",
     onsend,
+    onstop,
   }: {
     disabled?: boolean;
     sending?: boolean;
     placeholder?: string;
     onsend: (text: string, images: string[]) => void;
+    onstop?: () => void;
   } = $props();
 
   let draft = $state("");
@@ -81,16 +83,28 @@
       onpaste={onPaste}
       rows="1"
     ></textarea>
-    <button
-      class="send"
-      type="button"
-      onclick={submit}
-      disabled={!canSend}
-      aria-label="Send"
-      title="Send (Enter)"
-    >
-      <Icon name="send" size={17} />
-    </button>
+    {#if sending && onstop}
+      <button
+        class="send stop"
+        type="button"
+        onclick={onstop}
+        aria-label="Stop generating"
+        title="Stop generating"
+      >
+        <Icon name="close" size={16} />
+      </button>
+    {:else}
+      <button
+        class="send"
+        type="button"
+        onclick={submit}
+        disabled={!canSend}
+        aria-label="Send"
+        title="Send (Enter)"
+      >
+        <Icon name="send" size={17} />
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -184,5 +198,16 @@
   .send:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+  .send.stop {
+    background: var(--bg-surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    opacity: 1;
+  }
+  .send.stop:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+    box-shadow: none;
   }
 </style>

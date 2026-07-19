@@ -188,6 +188,9 @@ pub struct Executor {
     pub rules: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Model this automation runs on (`grok -m`). None => the agent's default.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     #[serde(default)]
@@ -211,6 +214,7 @@ impl Default for Executor {
             deny: Vec::new(),
             rules: None,
             effort: None,
+            model: None,
             max_turns: default_max_turns(),
             cwd: String::new(),
             web_search: false,
@@ -458,6 +462,10 @@ fn prune_runs(automation_id: &str, keep: usize) {
     for rec in records.into_iter().skip(keep) {
         let _ = fs::remove_file(run_meta_path(automation_id, &rec.id));
         let _ = fs::remove_file(run_log_path(automation_id, &rec.id));
+        // The per-run prompt file was previously never pruned — a slow disk leak.
+        let _ = fs::remove_file(
+            crate::paths::run_dir(automation_id).join(format!("{}.prompt.txt", rec.id)),
+        );
     }
 }
 
@@ -475,8 +483,10 @@ fn effective_mode(_mode: ExecMode) -> ExecMode {
 /// Build the grok headless argument vector with structural shadow enforcement.
 fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
     let mode = effective_mode(exec.mode);
+    // No bare `-p`: as of grok 0.2.102, `-p/--single` REQUIRES an inline prompt
+    // value (exit 2 without one) and `--prompt-file` alone selects headless
+    // single-turn mode. Earlier builds tolerated `-p` next to `--prompt-file`.
     let mut args: Vec<String> = vec![
-        "-p".into(),
         "--output-format".into(),
         "streaming-json".into(),
         "--no-auto-update".into(),
@@ -493,12 +503,25 @@ fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
 
     // Effective tools: in shadow, intersect with the read-safe allowlist.
     let effective: Vec<String> = match mode {
-        ExecMode::Shadow => exec
-            .tools
-            .iter()
-            .filter(|t| READ_SAFE_TOOLS.contains(&t.as_str()))
-            .cloned()
-            .collect(),
+        ExecMode::Shadow => {
+            let filtered: Vec<String> = exec
+                .tools
+                .iter()
+                .filter(|t| READ_SAFE_TOOLS.contains(&t.as_str()))
+                .cloned()
+                .collect();
+            // Shadow must ALWAYS emit `--tools`. An empty intersection (the user
+            // cleared every tool, or a hand-edited automations.json listed none of
+            // the read-safe tools) must NOT fall through to the branch below that
+            // omits the flag — grok would then run with its DEFAULT full toolset,
+            // silently granting write/shell inside a "read-only" run. Fall back to
+            // the whole read-safe set so the flag is always present and binding.
+            if filtered.is_empty() {
+                READ_SAFE_TOOLS.iter().map(|s| s.to_string()).collect()
+            } else {
+                filtered
+            }
+        }
         ExecMode::Write => exec.tools.clone(),
     };
     if !effective.is_empty() {
@@ -516,6 +539,12 @@ fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
         if !effort.is_empty() {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+    }
+    if let Some(model) = &exec.model {
+        if !model.trim().is_empty() {
+            args.push("-m".into());
+            args.push(model.trim().to_string());
         }
     }
     if let Some(rules) = &exec.rules {
@@ -752,10 +781,33 @@ impl JobManager {
 
         let args = build_grok_args(&exec, &prompt_path.to_string_lossy());
 
+        // Local model? The app's llama-server must be serving it before grok
+        // launches — bring it up (or fail the run with a clear message).
+        if let Some(model) = exec
+            .model
+            .as_deref()
+            .filter(|m| m.starts_with(crate::grok_config::LOCAL_PREFIX))
+        {
+            if let Err(e) = crate::local_llm::manager().ensure_for_model(&app, model) {
+                let msg = format!("local model unavailable: {e}");
+                let rec = self.launch_failed_record(&automation_id, &run_id, &trigger_reason, attempt, &automation.executor.mode, &msg);
+                let _ = write_run_record(&rec);
+                let _ = app.emit(
+                    "automation-run-finished",
+                    json!({ "automationId": automation_id, "runId": run_id, "status": "launchfailed", "error": msg }),
+                );
+                self.maybe_retry(app.clone(), automation, trigger_reason, attempt, RunStatus::LaunchFailed);
+                return Err(msg);
+            }
+        }
+
         let mut command = crate::util::hidden_command(&grok);
         command
             .args(&args)
             .env("GROK_DISABLE_AUTOUPDATER", "1")
+            // A custom Grok endpoint routes globally via config.toml, so headless
+            // automation runs need its API key just like interactive chats do.
+            .envs(crate::providers::grok_endpoint_env())
             .current_dir(&exec.cwd)
             .stdin(Stdio::null()) // headless: never pipe stdin (a CLI reading to EOF would hang)
             .stdout(Stdio::piped())
@@ -972,7 +1024,7 @@ impl JobManager {
             };
             let _ = write_run_record(&rec);
             write_report_sink(&automation, &rec);
-            update_automation_state(&automation_id, &run_id_w, status);
+            update_automation_state(&automation_id, &run_id_w, status, &trigger_reason);
             prune_runs(&automation_id, 50);
 
             if let Ok(mut g) = jm.running.lock() {
@@ -1186,7 +1238,13 @@ pub fn spawn_scheduler(app: AppHandle, jm: Arc<JobManager>) {
                                     }),
                                 }
                             } else if let Some(occ) = most_recent_occurrence(s, now) {
-                                if a.state.last_fired_at.unwrap_or(0) < occ {
+                                // A never-fired rule baselines off its creation time, so a
+                                // brand-new daily/weekly automation doesn't instantly "catch
+                                // up" on an occurrence that happened before it existed — it
+                                // waits for the next one. Genuine catch-up (app was closed
+                                // over a scheduled time) still works via last_fired_at.
+                                let baseline = a.state.last_fired_at.unwrap_or_else(|| created_secs(a));
+                                if baseline < occ {
                                     fires.push(FireAction {
                                         automation: a.clone(),
                                         reason: "schedule-catchup".into(),
@@ -1271,6 +1329,12 @@ pub fn spawn_scheduler(app: AppHandle, jm: Arc<JobManager>) {
             let _ = rx.recv_timeout(Duration::from_secs(next_wait.clamp(2, 30)));
         }
     });
+}
+
+/// Epoch seconds an automation was created. Legacy/unparseable values yield 0,
+/// which preserves the old catch-up-from-zero behavior for pre-existing data.
+fn created_secs(a: &Automation) -> u64 {
+    a.created_at.parse::<u64>().unwrap_or(0)
 }
 
 /// Most recent scheduled occurrence (UTC secs) for a daily/weekly schedule, or
@@ -1408,13 +1472,26 @@ fn status_str(status: RunStatus) -> &'static str {
 }
 
 /// Update the automation's runtime state after a run finishes.
-fn update_automation_state(automation_id: &str, run_id: &str, status: RunStatus) {
+///
+/// `last_fired_at` is deliberately NOT re-stamped for scheduler-driven runs: the
+/// scheduler stamps it at FIRE time, and stamping again at FINISH time drifts
+/// every interval schedule later by the run's duration (a 10-minute run pushed
+/// the next fire 10 minutes out, compounding every cycle). Manual runs get no
+/// fire-time stamp, so they record one here.
+fn update_automation_state(
+    automation_id: &str,
+    run_id: &str,
+    status: RunStatus,
+    trigger_reason: &str,
+) {
     let _g = store_guard();
     let mut store = AutomationStore::load();
     if let Some(a) = store.automations.iter_mut().find(|a| a.id == automation_id) {
         a.state.last_run_id = Some(run_id.to_string());
         a.state.last_status = Some(status_str(status).to_string());
-        a.state.last_fired_at = Some(now_secs());
+        if trigger_reason == "manual" {
+            a.state.last_fired_at = Some(now_secs());
+        }
         let _ = store.save();
     }
 }
@@ -1500,11 +1577,29 @@ pub fn delete_automation(id: &str) -> Result<(), String> {
     store.save()
 }
 
+/// Reject ids that could escape the runs directory when used in a path join.
+/// Real automation/run ids are UUIDs or `a-<uuid>` — ASCII alnum, `-`, `_`. This
+/// is defense-in-depth for the Tauri command layer (the MCP sidecar validates its
+/// agent-supplied ids separately) so no crafted id can traverse out of `runs/`.
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn list_runs(automation_id: &str) -> Vec<RunRecord> {
+    if !is_safe_id(automation_id) {
+        return Vec::new();
+    }
     list_run_records(automation_id)
 }
 
 pub fn read_run_log(automation_id: &str, run_id: &str) -> Result<String, String> {
+    if !is_safe_id(automation_id) || !is_safe_id(run_id) {
+        return Err("invalid id".to_string());
+    }
     let path = run_log_path(automation_id, run_id);
     if !path.exists() {
         return Ok(String::new());
@@ -1513,7 +1608,13 @@ pub fn read_run_log(automation_id: &str, run_id: &str) -> Result<String, String>
 }
 
 pub fn mark_runs_seen(automation_id: &str, run_ids: Vec<String>) -> Result<(), String> {
+    if !is_safe_id(automation_id) {
+        return Err("invalid automation_id".to_string());
+    }
     for run_id in run_ids {
+        if !is_safe_id(&run_id) {
+            continue;
+        }
         let path = run_meta_path(automation_id, &run_id);
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(mut rec) = serde_json::from_str::<RunRecord>(&raw) {
@@ -1542,4 +1643,155 @@ pub fn unseen_failure_count() -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_args_passes_model_flag() {
+        let mut exec = Executor::default();
+        exec.model = Some("grok-4.5".into());
+        let args = build_grok_args(&exec, "p.txt");
+        let pos = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(args[pos + 1], "grok-4.5");
+    }
+
+    #[test]
+    fn build_args_omits_model_when_unset_or_blank() {
+        let args = build_grok_args(&Executor::default(), "p.txt");
+        assert!(!args.contains(&"-m".to_string()));
+
+        let mut exec = Executor::default();
+        exec.model = Some("   ".into());
+        let args = build_grok_args(&exec, "p.txt");
+        assert!(!args.contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn executor_json_without_model_field_deserializes() {
+        // Old automations.json entries predate the model field.
+        let exec: Executor =
+            serde_json::from_str(r#"{ "prompt": "hi", "cwd": "E:/x" }"#).unwrap();
+        assert_eq!(exec.model, None);
+    }
+
+    #[test]
+    fn shadow_with_empty_tools_falls_back_to_read_safe_not_default() {
+        // Regression (shadow bypass): clearing every tool must NOT drop `--tools`
+        // — an absent flag hands grok its full default (write + shell) toolset
+        // inside a supposedly read-only run. It must fall back to the read-safe set.
+        let mut exec = Executor::default();
+        exec.tools = vec![];
+        let args = build_grok_args(&exec, "p.txt");
+        let pos = args
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools must always be present in shadow mode");
+        let value = &args[pos + 1];
+        for t in READ_SAFE_TOOLS {
+            assert!(
+                value.split(',').any(|v| v == *t),
+                "read-safe tool {t} missing from {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_drops_non_read_safe_tools() {
+        // A hand-edited automations.json listing write/shell tools is filtered
+        // down to the read-safe intersection; write/shell never survive.
+        let mut exec = Executor::default();
+        exec.tools = vec![
+            "read_file".into(),
+            "run_terminal_cmd".into(),
+            "edit_file".into(),
+        ];
+        let args = build_grok_args(&exec, "p.txt");
+        let pos = args.iter().position(|a| a == "--tools").expect("--tools present");
+        let value = &args[pos + 1];
+        assert!(value.split(',').any(|v| v == "read_file"));
+        assert!(!value.contains("run_terminal_cmd"), "shell tool leaked: {value}");
+        assert!(!value.contains("edit_file"), "write tool leaked: {value}");
+    }
+
+    // 2026-01-01 00:00:00 UTC (a Thursday) — day 20454 since the epoch.
+    const JAN_1_2026: u64 = 1_767_225_600;
+
+    fn daily_at(hour: u32) -> ScheduleTrigger {
+        ScheduleTrigger {
+            every: "daily".into(),
+            hour,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn most_recent_occurrence_daily_after_the_time_is_today() {
+        // Now = 10:00; the 09:00 slot already passed today.
+        let occ = most_recent_occurrence(&daily_at(9), JAN_1_2026 + 10 * 3600).unwrap();
+        assert_eq!(occ, JAN_1_2026 + 9 * 3600);
+    }
+
+    #[test]
+    fn most_recent_occurrence_daily_before_the_time_is_yesterday() {
+        // Now = 08:00; today's 09:00 hasn't happened, so the most recent is yesterday's.
+        let occ = most_recent_occurrence(&daily_at(9), JAN_1_2026 + 8 * 3600).unwrap();
+        assert_eq!(occ, JAN_1_2026 - 86400 + 9 * 3600);
+    }
+
+    #[test]
+    fn most_recent_occurrence_ignores_interval_schedules() {
+        let s = ScheduleTrigger {
+            every: "interval".into(),
+            ..Default::default()
+        };
+        assert!(most_recent_occurrence(&s, JAN_1_2026).is_none());
+    }
+
+    #[test]
+    fn new_daily_automation_does_not_catch_up_on_a_pre_creation_occurrence() {
+        // Regression: a brand-new daily rule used to baseline off 0 and fire
+        // immediately for a slot that predated it. Created at 10:00, the 09:00
+        // slot is older than the automation, so it must NOT fire.
+        let now = JAN_1_2026 + 10 * 3600;
+        let occ = most_recent_occurrence(&daily_at(9), now).unwrap();
+        let mut a = Automation {
+            id: "a-1".into(),
+            name: "n".into(),
+            enabled: true,
+            project_id: None,
+            trigger: Trigger::Schedule(daily_at(9)),
+            executor: Executor::default(),
+            overlap: OverlapPolicy::Skip,
+            retry: RetryPolicy::default(),
+            chain_input: None,
+            min_interval_secs: 0,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            state: AutomationState::default(),
+            extra: Default::default(),
+        };
+        let baseline = a.state.last_fired_at.unwrap_or_else(|| created_secs(&a));
+        assert!(baseline >= occ, "new automation must not fire for a pre-creation slot");
+
+        // But one created yesterday (never fired) SHOULD catch up on today's slot.
+        a.created_at = (JAN_1_2026 - 86400).to_string();
+        let baseline = a.state.last_fired_at.unwrap_or_else(|| created_secs(&a));
+        assert!(baseline < occ, "pre-existing automation should still catch up");
+    }
+
+    #[test]
+    fn is_safe_id_rejects_path_traversal() {
+        // Real ids pass; anything with separators or dots escaping runs/ is rejected.
+        assert!(is_safe_id("8f14e45f-ceea-467a-9575-0123456789ab"));
+        assert!(is_safe_id("a-1b2c3d4e5f60"));
+        assert!(!is_safe_id("../etc"));
+        assert!(!is_safe_id("..\\..\\secret"));
+        assert!(!is_safe_id("a/b"));
+        assert!(!is_safe_id("a\\b"));
+        assert!(!is_safe_id(""));
+        assert!(!is_safe_id("has space"));
+    }
 }

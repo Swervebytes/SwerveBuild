@@ -1,5 +1,7 @@
 mod acp;
+mod grok_config;
 mod jobs;
+mod local_llm;
 pub mod paths;
 mod providers;
 mod store;
@@ -12,9 +14,9 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use store::{AppStore, Chat, ChatMessage, Project, Store};
+use store::{AppStore, Chat, ChatMessage, MessagePart, Project, Store};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Serialize)]
 pub struct GrokStatus {
@@ -38,7 +40,11 @@ pub struct CommandResult {
     pub message: String,
 }
 
-fn grok_home() -> PathBuf {
+pub(crate) fn grok_home() -> PathBuf {
+    // Match grok's own resolution: `$GROK_HOME` overrides the default `~/.grok`.
+    if let Some(dir) = std::env::var_os("GROK_HOME").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".grok")
@@ -116,32 +122,41 @@ fn get_grok_status() -> GrokStatus {
 }
 
 #[tauri::command]
-fn install_grok() -> CommandResult {
-    let script = "irm https://x.ai/cli/install.ps1 | iex";
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .status();
+async fn install_grok() -> CommandResult {
+    // The installer takes minutes; running it synchronously on the main thread
+    // froze the entire UI until it finished. Do it on a blocking worker instead.
+    tauri::async_runtime::spawn_blocking(|| {
+        let script = "irm https://x.ai/cli/install.ps1 | iex";
+        let status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .status();
 
-    match status {
-        Ok(result) if result.success() => CommandResult {
-            success: true,
-            message: "Grok Build installed successfully.".into(),
-        },
-        Ok(result) => CommandResult {
-            success: false,
-            message: format!("Installer exited with code {:?}", result.code()),
-        },
-        Err(error) => CommandResult {
-            success: false,
-            message: format!("Failed to run installer: {error}"),
-        },
-    }
+        match status {
+            Ok(result) if result.success() => CommandResult {
+                success: true,
+                message: "Grok Build installed successfully.".into(),
+            },
+            Ok(result) => CommandResult {
+                success: false,
+                message: format!("Installer exited with code {:?}", result.code()),
+            },
+            Err(error) => CommandResult {
+                success: false,
+                message: format!("Failed to run installer: {error}"),
+            },
+        }
+    })
+    .await
+    .unwrap_or_else(|e| CommandResult {
+        success: false,
+        message: format!("Install task failed: {e}"),
+    })
 }
 
 fn spawn_hidden_grok_login(grok: &Path) -> std::io::Result<()> {
@@ -350,6 +365,7 @@ fn get_workspace() -> AppStore {
 
 #[tauri::command]
 fn add_project(path: String) -> Result<Project, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let now = Store::now();
 
@@ -386,6 +402,7 @@ fn add_project(path: String) -> Result<Project, String> {
 
 #[tauri::command]
 fn remove_project(project_id: String) -> Result<(), String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     store.projects.retain(|p| p.id != project_id);
     store.chats.retain(|c| c.project_id != project_id);
@@ -394,6 +411,7 @@ fn remove_project(project_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn create_chat(project_id: String, title: Option<String>) -> Result<Chat, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let resolved_project_id = store
         .projects
@@ -412,6 +430,7 @@ fn create_chat(project_id: String, title: Option<String>) -> Result<Chat, String
         messages: Vec::new(),
         grok_session_id: None,
         provider_id: None,
+        model_id: None,
     };
 
     Store::touch_project(&mut store, &resolved_project_id);
@@ -423,6 +442,7 @@ fn create_chat(project_id: String, title: Option<String>) -> Result<Chat, String
 #[tauri::command]
 fn remove_chat(chat_id: String, acp: State<'_, Arc<AcpManager>>) -> Result<(), String> {
     acp.close_chat(&chat_id);
+    let _guard = Store::lock();
     let mut store = Store::load();
     store.chats.retain(|c| c.id != chat_id);
     Store::save(&store)
@@ -430,6 +450,7 @@ fn remove_chat(chat_id: String, acp: State<'_, Arc<AcpManager>>) -> Result<(), S
 
 #[tauri::command]
 fn rename_chat(chat_id: String, title: String) -> Result<Chat, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let chat = store
         .chats
@@ -461,7 +482,9 @@ fn append_chat_message(
     role: String,
     content: String,
     images: Vec<String>,
+    parts: Option<Vec<MessagePart>>,
 ) -> Result<ChatMessage, String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     let chat = store
         .chats
@@ -474,6 +497,7 @@ fn append_chat_message(
         role,
         content,
         images,
+        parts: parts.unwrap_or_default(),
         created_at: Store::now(),
     };
 
@@ -498,7 +522,7 @@ async fn start_chat_session(
     acp: State<'_, Arc<AcpManager>>,
     chat_id: String,
 ) -> Result<CommandResult, String> {
-    let mut store = Store::load();
+    let store = Store::load();
     let chat = store
         .chats
         .iter()
@@ -511,9 +535,15 @@ async fn start_chat_session(
         .find(|p| p.id == chat.project_id)
         .ok_or_else(|| "Project not found".to_string())?;
 
-    if let Some(entry) = store.chats.iter_mut().find(|c| c.id == chat_id) {
-        entry.updated_at = Store::now();
-        Store::save(&store)?;
+    // Tight lock scope: touch updated_at and release BEFORE the session spawn,
+    // which later calls save_grok_session_id (also a store writer that locks).
+    {
+        let _guard = Store::lock();
+        let mut fresh = Store::load();
+        if let Some(entry) = fresh.chats.iter_mut().find(|c| c.id == chat_id) {
+            entry.updated_at = Store::now();
+            Store::save(&fresh)?;
+        }
     }
 
     let provider = chat
@@ -522,14 +552,28 @@ async fn start_chat_session(
         .and_then(|id| providers::get_provider(&id))
         .or_else(|| providers::get_provider(&providers::active_id()))
         .ok_or_else(|| "No provider configured".to_string())?;
-    let launch = providers::resolve_launch(&provider)?;
+    let launch = providers::resolve_launch(&provider, chat.model_id.as_deref())?;
     let project_path = project.path.clone();
     let stored_session = chat.grok_session_id.clone();
     let chat_id_for_task = chat_id.clone();
     let acp = acp.inner().clone();
     let acp_for_task = Arc::clone(&acp);
+    // Local models need the app's llama-server up before grok spawns. Done in
+    // the blocking task — first load of a big GGUF can take minutes.
+    let local_model = chat
+        .model_id
+        .clone()
+        .filter(|m| provider.id == "grok" && m.starts_with(grok_config::LOCAL_PREFIX));
 
     let session_id = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(model) = local_model.as_deref() {
+            if let Some(other) = local_model_conflict(&acp_for_task, model) {
+                return Err(format!(
+                    "One local model runs at a time — \"{other}\" is connected on another local model. Close that chat first."
+                ));
+            }
+            local_llm::manager().ensure_for_model(&app, model)?;
+        }
         acp_for_task.ensure_session(
             app,
             &launch,
@@ -597,6 +641,14 @@ async fn send_chat_message(
 }
 
 #[tauri::command]
+fn cancel_chat_prompt(
+    acp: State<'_, Arc<AcpManager>>,
+    chat_id: String,
+) -> Result<(), String> {
+    acp.cancel_prompt(&chat_id)
+}
+
+#[tauri::command]
 fn list_providers() -> Vec<ProviderView> {
     providers::views()
 }
@@ -649,6 +701,208 @@ fn get_provider_status(id: String) -> ProviderStatus {
 fn test_provider(id: String) -> CommandResult {
     let (success, message) = providers::test(&id);
     CommandResult { success, message }
+}
+
+// ---------------------------------------------------- custom Grok endpoint
+
+/// What the Settings UI receives. The API key is never sent back — only whether
+/// one is stored — so the secret doesn't round-trip into the frontend.
+#[derive(Serialize)]
+struct GrokEndpointView {
+    enabled: bool,
+    base_url: String,
+    model: String,
+    api_backend: String,
+    context_window: Option<u32>,
+    has_api_key: bool,
+    config_path: String,
+}
+
+impl GrokEndpointView {
+    fn current() -> Self {
+        let endpoint = providers::get_endpoint();
+        GrokEndpointView {
+            enabled: endpoint.enabled,
+            base_url: endpoint.base_url,
+            model: endpoint.model,
+            api_backend: endpoint.api_backend,
+            context_window: endpoint.context_window,
+            has_api_key: !endpoint.api_key.is_empty(),
+            config_path: grok_config::config_file_display(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GrokEndpointInput {
+    enabled: bool,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_backend: String,
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// `None` keeps the stored key; `Some("")` clears it; `Some(k)` replaces it.
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[tauri::command]
+fn get_grok_endpoint() -> GrokEndpointView {
+    GrokEndpointView::current()
+}
+
+#[tauri::command]
+fn set_grok_endpoint(input: GrokEndpointInput) -> Result<GrokEndpointView, String> {
+    if input.enabled {
+        if input.base_url.trim().is_empty() {
+            return Err("Enter a Base URL before turning routing on.".into());
+        }
+        if input.model.trim().is_empty() {
+            return Err("Enter a Model id before turning routing on.".into());
+        }
+    }
+
+    let endpoint = providers::GrokEndpoint {
+        enabled: input.enabled,
+        base_url: input.base_url,
+        model: input.model,
+        api_key: String::new(), // resolved inside save_endpoint from `new_key`
+        api_backend: input.api_backend,
+        context_window: input.context_window,
+        previous_default: None, // managed inside save_endpoint
+    };
+    providers::save_endpoint(endpoint, input.api_key)?;
+    Ok(GrokEndpointView::current())
+}
+
+#[tauri::command]
+fn test_grok_endpoint() -> CommandResult {
+    let (success, message) = grok_config::verify();
+    CommandResult { success, message }
+}
+
+// ------------------------------------------------------------ model registry
+
+#[tauri::command]
+fn list_models() -> Vec<providers::ModelInfo> {
+    providers::list_models()
+}
+
+/// Pin a chat to a model (None/blank clears back to the agent default). The
+/// switch takes effect on the next session spawn — the frontend closes and
+/// restarts the session, and `session/load` restores the conversation.
+#[tauri::command]
+fn set_chat_model(chat_id: String, model_id: Option<String>) -> Result<(), String> {
+    let _guard = Store::lock();
+    let mut store = Store::load();
+    let chat = store
+        .chats
+        .iter_mut()
+        .find(|c| c.id == chat_id)
+        .ok_or_else(|| "Chat not found".to_string())?;
+    chat.model_id = model_id.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    chat.updated_at = Store::now();
+    Store::save(&store)
+}
+
+#[tauri::command]
+fn set_custom_model_ids(ids: Vec<String>) -> Result<Vec<providers::ModelInfo>, String> {
+    let mut store = providers::ProviderStore::load();
+    store.custom_model_ids = ids
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    store.save()?;
+    Ok(providers::list_models())
+}
+
+// ------------------------------------------------------------- local models
+
+#[derive(Serialize)]
+struct LocalState {
+    engine_installed: bool,
+    engine_version: String,
+    server: local_llm::ServerStatus,
+    models: Vec<providers::LocalModel>,
+}
+
+impl LocalState {
+    fn current() -> Self {
+        LocalState {
+            engine_installed: local_llm::engine_installed(),
+            engine_version: local_llm::ENGINE_TAG.to_string(),
+            server: local_llm::manager().status(),
+            models: providers::ProviderStore::load().local.models,
+        }
+    }
+}
+
+#[tauri::command]
+fn get_local_state() -> LocalState {
+    LocalState::current()
+}
+
+#[tauri::command]
+async fn install_local_engine(app: tauri::AppHandle) -> Result<CommandResult, String> {
+    let message = tauri::async_runtime::spawn_blocking(move || local_llm::install_engine(&app))
+        .await
+        .map_err(|e| format!("install task failed: {e}"))??;
+    Ok(CommandResult { success: true, message })
+}
+
+#[tauri::command]
+fn add_local_model(path: String) -> Result<LocalState, String> {
+    providers::add_local_model(path)?;
+    Ok(LocalState::current())
+}
+
+#[tauri::command]
+fn remove_local_model(app: tauri::AppHandle, id: String) -> Result<LocalState, String> {
+    // If the server is currently serving this model, stop it first.
+    let status = local_llm::manager().status();
+    if status.model_id.as_deref() == Some(id.as_str()) {
+        local_llm::manager().stop(&app);
+    }
+    providers::remove_local_model(&id)?;
+    Ok(LocalState::current())
+}
+
+/// Preload a local model (start the server) without opening a chat.
+#[tauri::command]
+async fn start_local_server(app: tauri::AppHandle, model_id: String) -> Result<LocalState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        local_llm::manager().ensure_for_model(&app, &model_id)
+    })
+    .await
+    .map_err(|e| format!("start task failed: {e}"))??;
+    Ok(LocalState::current())
+}
+
+#[tauri::command]
+fn stop_local_server(app: tauri::AppHandle) -> LocalState {
+    local_llm::manager().stop(&app);
+    LocalState::current()
+}
+
+/// One local model runs at a time; block a swap while another ACTIVE chat is
+/// pinned to a different local model (its next message would hit the wrong
+/// server). Idle chats are fine — they respawn on their own model later.
+fn local_model_conflict(acp: &AcpManager, want: &str) -> Option<String> {
+    let active = acp.list_active();
+    let store = Store::load();
+    store
+        .chats
+        .iter()
+        .filter(|c| active.contains(&c.id))
+        .find(|c| {
+            c.model_id
+                .as_deref()
+                .map(|m| m.starts_with(grok_config::LOCAL_PREFIX) && m != want)
+                .unwrap_or(false)
+        })
+        .map(|c| c.title.clone())
 }
 
 // -------------------------------------------------------------- automations
@@ -740,6 +994,16 @@ pub fn run() {
     let jobs_sched = job_mgr.clone();
 
     tauri::Builder::default()
+        // Must be the FIRST plugin: a second launch focuses the existing window
+        // instead of starting a second app — which would run a second scheduler
+        // and a second data.json writer, defeating the in-process store lock.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(acp)
@@ -770,11 +1034,24 @@ pub fn run() {
             close_chat_session,
             respond_chat_permission,
             send_chat_message,
+            cancel_chat_prompt,
             list_providers,
             get_active_provider,
             set_active_provider,
             get_provider_status,
             test_provider,
+            get_grok_endpoint,
+            set_grok_endpoint,
+            test_grok_endpoint,
+            list_models,
+            set_chat_model,
+            set_custom_model_ids,
+            get_local_state,
+            install_local_engine,
+            add_local_model,
+            remove_local_model,
+            start_local_server,
+            stop_local_server,
             list_automations,
             save_automation,
             delete_automation,
@@ -793,6 +1070,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 acp_exit.close_all();
                 jobs_exit.cancel_all();
+                local_llm::manager().shutdown();
             }
         });
 }

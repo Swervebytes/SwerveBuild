@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  A clean desktop home for <a href="https://github.com/xai-org/grok-cli">Grok Build</a> &amp; ACP coding agents —<br/>
+  A clean desktop home for <a href="https://github.com/xai-org/grok-build">Grok Build</a> &amp; ACP coding agents —<br/>
   project chats, tool approval, memories, skills, and <b>triggered automations</b>, in one native Windows shell.
 </p>
 
@@ -18,7 +18,7 @@
 
 ## Why Swerve Build
 
-Grok Build and other ACP agents are powerful on the command line — Swerve Build gives them a calm, native home on Windows. Scope work to a project, watch tool calls stream with an approval gate, keep memories and skills close, and — new in **v0.2.0** — let agents **run themselves** on a schedule, a commit, or a file change.
+Grok Build is now [open source](https://github.com/xai-org/grok-build) (Apache-2.0) — and Swerve Build is the calm, auditable way to run it on Windows. Scope work to a project, watch every tool call stream through an approval gate, keep memories and skills close, and — new in **v0.2.0** — let agents **run themselves** on a schedule, a commit, or a file change. Want your code to stay on your machine? Point Grok at your own [local or self-hosted endpoint](#run-grok-against-your-own-endpoint) — no xAI sign-in, nothing leaves the box.
 
 ## Highlights
 
@@ -27,6 +27,7 @@ Grok Build and other ACP agents are powerful on the command line — Swerve Buil
 | **Project chats** | Folder-scoped conversations with ACP streaming, image paste, and a tool-approval UI. Up to 3 run concurrently. |
 | **Automations** | Trigger headless Grok runs on a schedule, git commit, file change, or on demand — read-only by default. |
 | **Multi-provider** | Grok works out of the box; drop in Claude Code or Gemini by putting their CLI on your PATH. |
+| **Your own endpoint** | Point Grok at local or self-hosted OpenAI-compatible inference — your code never leaves the machine. |
 | **Memories &amp; Skills** | Edit Grok's memory and browse installed skills without leaving the app. |
 | **MCP sidecar** | Exposes your projects, chats, and automations to agents *inside* chat. |
 
@@ -65,6 +66,10 @@ Open **Settings → Providers** and pick an available agent. The home screen sho
 | **Claude Code** | Install [`claude-code-acp`](https://www.npmjs.com/package/claude-code-acp) and put it on your PATH |
 | **Gemini** | Install the Gemini CLI and put `gemini` on your PATH |
 | **Ollama / OpenAI / Anthropic** | Listed as designed — direct HTTP chat isn't spawnable yet |
+
+### Run Grok against your own endpoint
+
+In **Settings → Custom endpoint (advanced)**, point Grok Build at any OpenAI-compatible inference — local (Ollama, llama.cpp), self-hosted, or a gateway. Swerve writes a managed `[model.swerve-endpoint]` block to `~/.grok/config.toml` (backing the file up first) and routes Grok's default model to it while enabled. The endpoint's API key is stored locally in `~/.swervebuild/providers.json` and injected into Grok's environment at launch — **never written into Grok's `config.toml`**; because it satisfies Grok's own auth, **no xAI sign-in is required** — so your code can stay entirely on your machine. Both chats and Automations follow the endpoint. Turn routing off to return to xAI's hosted models.
 
 ## Develop
 

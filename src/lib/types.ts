@@ -6,11 +6,19 @@ export type Project = {
   last_opened_at: string;
 };
 
+/// A non-prose segment of an assistant turn (reasoning or a tool call) that
+/// streamed live and is now persisted alongside the reply.
+export type MessagePart = {
+  kind: "thought" | "tool";
+  text: string;
+};
+
 export type ChatMessage = {
   id: string;
   role: string;
   content: string;
   images: string[];
+  parts?: MessagePart[];
   created_at: string;
 };
 
@@ -22,6 +30,16 @@ export type Chat = {
   updated_at: string;
   messages: ChatMessage[];
   grok_session_id?: string | null;
+  provider_id?: string | null;
+  model_id?: string | null;
+};
+
+export type ModelInfo = {
+  id: string;
+  label: string;
+  kind: "hosted" | "custom" | "endpoint";
+  note: string | null;
+  is_default: boolean;
 };
 
 export type Workspace = {
@@ -94,6 +112,7 @@ export type Executor = {
   deny: string[];
   rules: string | null;
   effort: string | null;
+  model: string | null;
   max_turns: number;
   cwd: string;
   web_search: boolean;

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,12 +13,25 @@ pub struct Project {
     pub last_opened_at: String,
 }
 
+/// One non-prose segment of an assistant turn — the reasoning and tool-call
+/// trail that streamed live. It used to be discarded when the reply was saved,
+/// so reloading a chat lost everything but the final text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePart {
+    /// "thought" | "tool"
+    pub kind: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub role: String,
     pub content: String,
     pub images: Vec<String>,
+    /// Reasoning/tool trail captured during streaming. Absent in older data.
+    #[serde(default)]
+    pub parts: Vec<MessagePart>,
     pub created_at: String,
 }
 
@@ -36,6 +50,10 @@ pub struct Chat {
     /// Which provider this chat is bound to. None => use the global active provider.
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// Model this chat runs on, passed to the agent via `-m` at spawn.
+    /// None => the agent's own default model.
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 fn default_store_version() -> u32 {
@@ -64,9 +82,23 @@ impl Default for AppStore {
     }
 }
 
+/// Serializes every read-modify-write of data.json across threads: main-thread
+/// commands and spawn_blocking session saves both mutate it, and without this a
+/// concurrent load..save pair silently clobbers the other's changes (message
+/// loss). Hold the guard across the whole load..mutate..save window. Single
+/// process only (a second app instance would bypass it — see single-instance).
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
 pub struct Store;
 
 impl Store {
+    /// Acquire the process-wide data.json write lock. Hold the returned guard
+    /// across a full load..mutate..save sequence. NEVER call another function
+    /// that also takes this lock while holding it — std Mutex is not reentrant.
+    pub fn lock() -> MutexGuard<'static, ()> {
+        STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn data_path() -> PathBuf {
         crate::paths::data_file()
     }
@@ -144,5 +176,59 @@ impl Store {
         } else {
             title
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_parts_round_trip_through_json() {
+        // The reasoning/tool trail must survive the exact serialize/deserialize
+        // path data.json uses — that round trip IS the persistence guarantee.
+        let msg = ChatMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: "done".into(),
+            images: vec![],
+            parts: vec![
+                MessagePart { kind: "thought".into(), text: "weighing options".into() },
+                MessagePart { kind: "tool".into(), text: "read_file src/main.rs".into() },
+            ],
+            created_at: "1".into(),
+        };
+        let back: ChatMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back.parts.len(), 2);
+        assert_eq!(back.parts[0].kind, "thought");
+        assert_eq!(back.parts[0].text, "weighing options");
+        assert_eq!(back.parts[1].kind, "tool");
+        assert_eq!(back.parts[1].text, "read_file src/main.rs");
+    }
+
+    #[test]
+    fn message_json_predating_parts_deserializes() {
+        // Messages saved before the reasoning/tool trail existed must still load.
+        let msg: ChatMessage = serde_json::from_str(
+            r#"{ "id": "m1", "role": "assistant", "content": "hi",
+                 "images": [], "created_at": "1" }"#,
+        )
+        .unwrap();
+        assert!(msg.parts.is_empty());
+    }
+
+    #[test]
+    fn chat_json_predating_model_id_deserializes() {
+        // Chats saved before per-chat models existed must load unchanged.
+        let chat: Chat = serde_json::from_str(
+            r#"{
+                "id": "c1", "project_id": "p1", "title": "Old chat",
+                "created_at": "1", "updated_at": "2", "messages": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(chat.model_id, None);
+        assert_eq!(chat.provider_id, None);
+        assert_eq!(chat.grok_session_id, None);
     }
 }

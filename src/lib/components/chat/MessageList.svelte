@@ -45,6 +45,15 @@
 <div class="scroll" bind:this={scroller} onscroll={onScroll}>
   <div class="reading-col list">
     {#each messages as m (m.id)}
+      <!-- Saved reasoning/tool trail, rendered with the same components the live
+           stream uses so a reloaded chat looks like the turn did when it ran. -->
+      {#each m.parts ?? [] as part, i (i)}
+        {#if part.kind === "tool"}
+          <ToolCallChip title={part.text} />
+        {:else}
+          <ThinkingBlock content={part.text} />
+        {/if}
+      {/each}
       <MessageBubble
         role={m.role === "user" ? "user" : "assistant"}
         content={m.content}

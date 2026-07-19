@@ -2,16 +2,15 @@
   import { onMount } from "svelte";
   import { page } from "$app/stores";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
+  import { subscribe } from "$lib/events";
   import { goto } from "$app/navigation";
-  import type { Chat, ChatMessage, PermissionRequest, Project } from "$lib/types";
-  import { loadWorkspace } from "$lib/workspace";
+  import type { Chat, ChatMessage, MessagePart, Project } from "$lib/types";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
+  import { providerStore } from "$lib/stores/providers.svelte";
   import { imageSrc } from "$lib/attachments";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
-  import PermissionModal from "$lib/components/chat/PermissionModal.svelte";
 
   type StreamMessage = {
     id: string;
@@ -25,16 +24,13 @@
   let streaming = $state<StreamMessage[]>([]);
   let sessionReady = $state(false);
   let sending = $state(false);
+  let modelSwitching = $state(false);
   let error = $state<string | null>(null);
   let activeSessionCount = $state(0);
-  let permissionQueue = $state<Array<PermissionRequest & { chatTitle: string }>>([]);
 
-  const chatId = $derived($page.params.id);
-  const currentPermission = $derived(permissionQueue[0] ?? null);
+  // `-m` is a grok flag; hide the model picker when another agent backs this chat.
+  const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
 
-  let unlistenUpdate: (() => void) | null = null;
-  let unlistenReady: (() => void) | null = null;
-  let unlistenPermission: (() => void) | null = null;
   let bootstrapGen = 0;
 
   function resetStream() {
@@ -107,11 +103,21 @@
       text = `${text}\n\n_${note}_`;
     }
 
+    // Persist the reasoning/tool trail with the reply. It used to be dropped on
+    // save, so reloading a chat lost everything except the final prose.
+    const parts: MessagePart[] = streaming
+      .filter((item) => item.role === "tool" || item.kind === "thought")
+      .map((item) => ({
+        kind: item.role === "tool" ? ("tool" as const) : ("thought" as const),
+        text: item.content,
+      }));
+
     const saved = await invoke<ChatMessage>("append_chat_message", {
       chatId: chat.id,
       role: "assistant",
       content: text,
       images: [],
+      parts,
     });
 
     chat = {
@@ -172,35 +178,6 @@
     }
   }
 
-  async function enqueuePermission(request: PermissionRequest) {
-    const workspace = await loadWorkspace();
-    const title = workspace.chats.find((item) => item.id === request.chatId)?.title ?? "Chat";
-    if (
-      permissionQueue.some(
-        (item) => item.chatId === request.chatId && item.requestId === request.requestId,
-      )
-    ) {
-      return;
-    }
-    permissionQueue = [...permissionQueue, { ...request, chatTitle: title }];
-  }
-
-  async function respondPermission(optionId: string) {
-    const pending = permissionQueue[0];
-    if (!pending) return;
-
-    try {
-      await invoke("respond_chat_permission", {
-        chatId: pending.chatId,
-        requestId: pending.requestId,
-        optionId,
-      });
-      permissionQueue = permissionQueue.slice(1);
-    } catch (err) {
-      error = String(err);
-    }
-  }
-
   $effect(() => {
     const id = $page.params.id;
     if (!id) return;
@@ -208,6 +185,37 @@
     const gen = bootstrapGen;
     bootstrap(id, gen);
   });
+
+  /// Mid-chat model switch: persist the choice, respawn the agent with the new
+  /// `-m`, and let `session/load` restore the conversation — feels in-place.
+  async function switchModel(id: string | null) {
+    if (!chat || modelSwitching || sending) return;
+    modelSwitching = true;
+    error = null;
+    try {
+      await invoke("set_chat_model", { chatId: chat.id, modelId: id });
+      chat = { ...chat, model_id: id };
+      await invoke("close_chat_session", { chatId: chat.id });
+      sessionReady = false;
+      await invoke("start_chat_session", { chatId: chat.id });
+      sessionReady = true;
+      await refreshActiveSessions();
+    } catch (err) {
+      sessionReady = false;
+      error = `Model switch failed: ${String(err)} — send a message to reconnect.`;
+    } finally {
+      modelSwitching = false;
+    }
+  }
+
+  async function stopGenerating() {
+    if (!chat) return;
+    try {
+      await invoke("cancel_chat_prompt", { chatId: chat.id });
+    } catch (err) {
+      error = String(err);
+    }
+  }
 
   async function sendMessage(text: string, images: string[]) {
     if (!chat || sending) return;
@@ -226,6 +234,7 @@
       const userMessage = await invoke<ChatMessage>("append_chat_message", {
         chatId: chat.id,
         role: "user",
+        parts: [],
         content: text,
         images,
       });
@@ -257,33 +266,19 @@
   }
 
   onMount(() => {
-    listen<{ chatId: string; params: Record<string, unknown> }>("chat-update", (event) => {
-      if (event.payload.chatId !== $page.params.id) return;
-      appendStream(event.payload.params);
-    }).then((unlisten) => {
-      unlistenUpdate = unlisten;
-    });
-
-    listen<{ chatId: string }>("chat-session-ready", (event) => {
-      if (event.payload.chatId === $page.params.id) {
-        sessionReady = true;
-      }
-      refreshActiveSessions();
-    }).then((unlisten) => {
-      unlistenReady = unlisten;
-    });
-
-    listen<PermissionRequest>("chat-permission-request", (event) => {
-      enqueuePermission(event.payload);
-    }).then((unlisten) => {
-      unlistenPermission = unlisten;
-    });
-
-    return () => {
-      unlistenUpdate?.();
-      unlistenReady?.();
-      unlistenPermission?.();
-    };
+    const offs = [
+      subscribe<{ chatId: string; params: Record<string, unknown> }>("chat-update", (event) => {
+        if (event.payload.chatId !== $page.params.id) return;
+        appendStream(event.payload.params);
+      }),
+      subscribe<{ chatId: string }>("chat-session-ready", (event) => {
+        if (event.payload.chatId === $page.params.id) {
+          sessionReady = true;
+        }
+        refreshActiveSessions();
+      }),
+    ];
+    return () => offs.forEach((o) => o());
   });
 </script>
 
@@ -295,6 +290,10 @@
       projectPath={project?.path}
       connected={sessionReady}
       {activeSessionCount}
+      showModelPicker={chatProviderId === "grok"}
+      modelId={chat?.model_id ?? null}
+      {modelSwitching}
+      onmodelchange={switchModel}
     />
   </div>
 
@@ -311,18 +310,9 @@
   {/if}
 
   <div class="reading-col composer-wrap">
-    <Composer disabled={!chat || sending} {sending} onsend={sendMessage} />
+    <Composer disabled={!chat || sending} {sending} onsend={sendMessage} onstop={stopGenerating} />
   </div>
 </div>
-
-{#if currentPermission}
-  <PermissionModal
-    request={currentPermission}
-    queueLength={permissionQueue.length}
-    isBackground={currentPermission.chatId !== chatId}
-    onrespond={respondPermission}
-  />
-{/if}
 
 <style>
   .chat-page {

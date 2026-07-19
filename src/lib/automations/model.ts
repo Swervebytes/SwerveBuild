@@ -16,6 +16,7 @@ export function newAutomation(cwd = "", projectId: string | null = null): Automa
       deny: [],
       rules: null,
       effort: null,
+      model: null,
       max_turns: 15,
       cwd,
       web_search: false,

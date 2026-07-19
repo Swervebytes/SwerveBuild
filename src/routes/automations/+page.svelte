@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { subscribe } from "$lib/events";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { automationsStore } from "$lib/stores/automations.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import RunMap from "$lib/components/automations/RunMap.svelte";
-  import type { Automation, RunRecord, RunFinished, RunOutput } from "$lib/types";
+  import { invoke } from "@tauri-apps/api/core";
+  import type { Automation, ModelInfo, RunRecord, RunFinished, RunOutput } from "$lib/types";
   import {
     newAutomation,
     recipes,
@@ -30,6 +31,7 @@
   let editing = $state<Automation | null>(null);
   let editorError = $state<string | null>(null);
   let advanced = $state(false);
+  let modelOptions = $state<ModelInfo[]>([]);
 
   // run history (per automation id)
   let expanded = $state<Record<string, boolean>>({});
@@ -50,45 +52,48 @@
   );
   const enabledCount = $derived(automations.filter((a) => a.enabled).length);
 
-  let unlisteners: Array<() => void> = [];
-
   onMount(() => {
     (async () => {
       await workspaceStore.refresh();
       await automationsStore.refresh();
       loading = false;
+      try {
+        modelOptions = await invoke<ModelInfo[]>("list_models");
+      } catch {
+        modelOptions = [];
+      }
     })();
 
-    listen<RunOutput>("automation-run-output", (e) => {
-      if (!inspector || e.payload.runId !== inspector.runId) return;
-      const line: TranscriptLine = { kind: e.payload.type, text: e.payload.text };
-      if (line.kind === "text") {
-        const last = transcript[transcript.length - 1];
-        if (last && last.kind === "text") {
-          last.text += line.text;
-          transcript = [...transcript];
-          return;
+    const offs = [
+      subscribe<RunOutput>("automation-run-output", (e) => {
+        if (!inspector || e.payload.runId !== inspector.runId) return;
+        const line: TranscriptLine = { kind: e.payload.type, text: e.payload.text };
+        if (line.kind === "text") {
+          const last = transcript[transcript.length - 1];
+          if (last && last.kind === "text") {
+            last.text += line.text;
+            transcript = [...transcript];
+            return;
+          }
         }
-      }
-      transcript = [...transcript, line];
-    }).then((u) => unlisteners.push(u));
+        transcript = [...transcript, line];
+      }),
 
-    listen<{ automationId: string; runId: string }>("automation-run-started", () => {
-      automationsStore.refresh();
-    }).then((u) => unlisteners.push(u));
+      subscribe<{ automationId: string; runId: string }>("automation-run-started", () => {
+        automationsStore.refresh();
+      }),
 
-    listen<RunFinished>("automation-run-finished", (e) => {
-      automationsStore.refresh();
-      loadRuns(e.payload.automationId);
-      if (inspector && e.payload.runId === inspector.runId) {
-        inspectorStatus = e.payload.status;
-        inspectorError = e.payload.error;
-      }
-    }).then((u) => unlisteners.push(u));
+      subscribe<RunFinished>("automation-run-finished", (e) => {
+        automationsStore.refresh();
+        loadRuns(e.payload.automationId);
+        if (inspector && e.payload.runId === inspector.runId) {
+          inspectorStatus = e.payload.status;
+          inspectorError = e.payload.error;
+        }
+      }),
+    ];
 
-    return () => {
-      unlisteners.forEach((u) => u());
-    };
+    return () => offs.forEach((o) => o());
   });
 
   async function loadRuns(automationId: string) {
@@ -164,6 +169,9 @@
     try {
       await automationsStore.save($state.snapshot(editing) as Automation);
       editing = null;
+    } catch (err) {
+      // Previously uncaught: a failed save left the editor open with no feedback.
+      editorError = `Couldn't save this automation: ${String(err)}`;
     } finally {
       busy = null;
     }
@@ -449,6 +457,15 @@
               <option value="low">Low</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>
+            </select>
+          </label>
+          <label class="field row">
+            <span class="field-label">Model</span>
+            <select class="input narrow" bind:value={editing.executor.model}>
+              <option value={null}>Default</option>
+              {#each modelOptions as m (m.id)}
+                <option value={m.id}>{m.kind === "endpoint" ? "Custom endpoint" : m.label}</option>
+              {/each}
             </select>
           </label>
           <label class="field row">

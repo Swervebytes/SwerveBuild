@@ -13,7 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 const CONNECT_TIMEOUT_SECS: u64 = 45;
-const PROMPT_TIMEOUT_SECS: u64 = 300;
+// Agentic coding turns can run many minutes; a short ceiling aborts a
+// still-working agent and truncates its reply (the old 300s bug). Wait long, and
+// rely on two faster signals instead: the reader thread unblocks this wait the
+// moment grok's stdout closes (process died), and the user can Stop a turn
+// (session/cancel).
+const PROMPT_TIMEOUT_SECS: u64 = 1800;
 const MAX_CONCURRENT_SESSIONS: usize = 3;
 
 pub struct AcpManager {
@@ -34,11 +39,10 @@ struct SessionTransport {
 }
 
 struct ActiveSession {
-    chat_id: String,
     session_id: String,
     child: Child,
     transport: Arc<SessionTransport>,
-    last_accessed: AtomicU64,
+    last_accessed: Arc<AtomicU64>,
 }
 
 impl Default for AcpManager {
@@ -108,17 +112,6 @@ impl AcpManager {
                 session.bump_access();
             }
         }
-    }
-
-    fn session_id_for(&self, chat_id: &str) -> Result<String, String> {
-        let guard = self
-            .sessions
-            .lock()
-            .map_err(|_| "ACP session lock poisoned".to_string())?;
-        guard
-            .get(chat_id)
-            .map(|s| s.session_id.clone())
-            .ok_or_else(|| "Chat session not found".to_string())
     }
 
     fn evict_if_needed(&self) {
@@ -199,6 +192,10 @@ impl AcpManager {
         let chat_for_reader = chat_id.to_string();
         // The agent's fs/read|write requests are confined to this project dir.
         let cwd_for_reader = cwd.to_string();
+        // Shared with ActiveSession so streaming activity keeps this session warm
+        // in the LRU — a mid-turn chat must not be evicted when a 4th chat opens.
+        let last_accessed = Arc::new(AtomicU64::new(now_secs()));
+        let last_accessed_reader = Arc::clone(&last_accessed);
 
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -213,6 +210,9 @@ impl AcpManager {
 
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
                     if method == "session/update" {
+                        // Streaming counts as access so the LRU keeps a mid-turn
+                        // session alive even if it hasn't been sent to recently.
+                        last_accessed_reader.store(now_secs(), Ordering::SeqCst);
                         if !transport_for_reader.suppress_updates.load(Ordering::SeqCst) {
                             let _ = app_for_reader.emit(
                                 "chat-update",
@@ -272,14 +272,26 @@ impl AcpManager {
                     }
                 }
             }
+
+            // stdout closed: grok exited (crash, kill, or clean exit). Unblock any
+            // in-flight RPC — dropping the pending senders makes their recv()
+            // return Err at once, so a send_prompt waiting on a now-dead agent
+            // fails fast instead of hanging out the full timeout — and tell the UI
+            // this chat's session is gone so it can show a reconnect hint.
+            if let Ok(mut pending) = transport_for_reader.responses.lock() {
+                pending.clear();
+            }
+            let _ = app_for_reader.emit(
+                "chat-session-ended",
+                json!({ "chatId": chat_for_reader }),
+            );
         });
 
         let mut active = ActiveSession {
-            chat_id: chat_id.to_string(),
             session_id: String::new(),
             child,
             transport: Arc::clone(&transport),
-            last_accessed: AtomicU64::new(now_secs()),
+            last_accessed,
         };
 
         let agent_caps = active.transport.rpc(
@@ -444,6 +456,28 @@ impl AcpManager {
 
         Ok(())
     }
+
+    /// Cancel the in-flight turn for a chat. ACP `session/cancel` is a
+    /// notification (no response): the agent aborts the current turn and then
+    /// responds to the pending `session/prompt`, so the waiting `send_prompt`
+    /// unblocks and the caller saves whatever partial reply arrived.
+    pub fn cancel_prompt(&self, chat_id: &str) -> Result<(), String> {
+        let (transport, session_id) = {
+            let guard = self
+                .sessions
+                .lock()
+                .map_err(|_| "ACP session lock poisoned".to_string())?;
+            let active = guard
+                .get(chat_id)
+                .ok_or_else(|| "No active session for this chat.".to_string())?;
+            (Arc::clone(&active.transport), active.session_id.clone())
+        };
+        transport.write_json_line(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id }
+        }))
+    }
 }
 
 impl ActiveSession {
@@ -525,12 +559,27 @@ fn now_secs() -> u64 {
 
 fn mcp_servers_config() -> Result<Value, String> {
     let mcp_path = resolve_mcp_binary()?;
-    Ok(json!([{
+    let mut servers = vec![json!({
         "name": "swervebuild",
         "command": mcp_path,
         "args": [],
         "env": []
-    }]))
+    })];
+
+    // SwerveBytes engine (swervebytes-core): the verified-Byte runtime.
+    // Optional — auto-included whenever its MCP server is installed on PATH
+    // (`pip install swervebytes` puts `swervebytes-mcp` there). Chat agents
+    // then get run/verify/retire/audit tools over the Byte registry.
+    if let Some(sb) = crate::which_on_path("swervebytes-mcp") {
+        servers.push(json!({
+            "name": "swervebytes",
+            "command": sb.display().to_string(),
+            "args": [],
+            "env": []
+        }));
+    }
+
+    Ok(Value::Array(servers))
 }
 
 fn resolve_mcp_binary() -> Result<String, String> {
@@ -647,6 +696,7 @@ fn strip_verbatim(p: &Path) -> PathBuf {
 }
 
 pub fn save_grok_session_id(chat_id: &str, session_id: &str) -> Result<(), String> {
+    let _guard = Store::lock();
     let mut store = Store::load();
     if let Some(chat) = store.chats.iter_mut().find(|c| c.id == chat_id) {
         chat.grok_session_id = Some(session_id.to_string());

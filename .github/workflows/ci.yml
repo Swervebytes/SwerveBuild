@@ -1,0 +1,60 @@
+name: CI
+
+# Validate every push to the main branches and every PR (including Dependabot's,
+# which previously merged with nothing checking them). Runs on Windows because
+# Swerve Build is a Windows Tauri app and parts of the Rust backend are
+# Windows-specific.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Type-check (svelte-check)
+        run: npm run check
+
+      # Builds the SvelteKit frontend into ../build, which the Rust crate embeds
+      # via generate_context! — so this must run before any cargo step compiles.
+      - name: Build frontend
+        run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # The e2e script needs the debug binaries present; it exercises the MCP
+      # server fully and skips the live-grok ACP portion when grok is absent
+      # (as it is on CI), so it stays green without credentials.
+      - name: Build debug binaries
+        run: cargo build --bins --manifest-path src-tauri/Cargo.toml
+
+      - name: E2E (MCP layer; ACP auto-skips without grok)
+        run: npm run test:e2e
