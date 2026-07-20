@@ -28,17 +28,49 @@
     models: LocalModel[];
   };
   type EngineProgress = { phase: string; received: number; total: number };
+  type FitTier = "fits" | "tight" | "too_big" | "cpu_only";
+  type CatalogEntry = {
+    id: string;
+    label: string;
+    filename: string;
+    size_bytes: number;
+    quant: string;
+    context_tokens: number;
+    vram_gb: number;
+    license: string;
+    good_at: string;
+    fit: FitTier;
+    installed: boolean;
+    dest_path: string;
+  };
+  type CatalogState = {
+    models_dir: string;
+    free_bytes: number | null;
+    vram_mb: number | null;
+    entries: CatalogEntry[];
+    downloading: string | null;
+  };
+  type ModelDownloadProgress = {
+    catalogId: string;
+    phase: string;
+    received: number;
+    total: number;
+  };
 
   let local = $state<LocalState | null>(null);
+  let catalog = $state<CatalogState | null>(null);
   let installing = $state(false);
   let progress = $state<EngineProgress | null>(null);
+  let dlProgress = $state<ModelDownloadProgress | null>(null);
   let busyModel = $state<string | null>(null);
+  let downloadingId = $state<string | null>(null);
   let message = $state<string | null>(null);
   let isError = $state(false);
 
   async function refresh() {
     try {
       local = await invoke<LocalState>("get_local_state");
+      catalog = await invoke<CatalogState>("get_model_catalog");
     } catch (e) {
       message = String(e);
       isError = true;
@@ -53,6 +85,9 @@
       }),
       subscribe<ServerStatus>("local-llm-status", (ev) => {
         if (local) local = { ...local, server: ev.payload };
+      }),
+      subscribe<ModelDownloadProgress>("local-model-download-progress", (ev) => {
+        dlProgress = ev.payload;
       }),
     ];
     return () => offs.forEach((o) => o());
@@ -87,10 +122,50 @@
     if (!selected || typeof selected !== "string") return;
     try {
       local = await invoke<LocalState>("add_local_model", { path: selected });
+      catalog = await invoke<CatalogState>("get_model_catalog");
       message = "Model added — it now appears in every model picker.";
     } catch (e) {
       message = String(e);
       isError = true;
+    }
+  }
+
+  async function chooseModelsDir() {
+    message = null;
+    isError = false;
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Folder for catalog model downloads",
+    });
+    if (!selected || typeof selected !== "string") return;
+    try {
+      catalog = await invoke<CatalogState>("set_models_dir", { path: selected });
+      message = `Models folder: ${selected}`;
+    } catch (e) {
+      message = String(e);
+      isError = true;
+    }
+  }
+
+  async function downloadCatalog(id: string) {
+    message = null;
+    isError = false;
+    downloadingId = id;
+    dlProgress = { catalogId: id, phase: "downloading", received: 0, total: 1 };
+    try {
+      const r = await invoke<{ success: boolean; message: string }>("download_catalog_model", {
+        catalogId: id,
+      });
+      message = r.message;
+      await refresh();
+    } catch (e) {
+      message = String(e);
+      isError = true;
+      catalog = await invoke<CatalogState>("get_model_catalog").catch(() => catalog);
+    } finally {
+      downloadingId = null;
+      dlProgress = null;
     }
   }
 
@@ -99,6 +174,7 @@
     isError = false;
     try {
       local = await invoke<LocalState>("remove_local_model", { id });
+      catalog = await invoke<CatalogState>("get_model_catalog");
     } catch (e) {
       message = String(e);
       isError = true;
@@ -140,6 +216,11 @@
       ? Math.min(100, Math.round((progress.received / progress.total) * 100))
       : 0,
   );
+  const dlPct = $derived(
+    dlProgress && dlProgress.total > 0
+      ? Math.min(100, Math.round((dlProgress.received / dlProgress.total) * 100))
+      : 0,
+  );
 
   function serverTone(s: ServerStatus["state"]): "success" | "warning" | "danger" | "muted" {
     if (s === "ready") return "success";
@@ -156,6 +237,23 @@
     if (server.state === "starting") return `Loading ${server.model_id ?? "…"}`;
     if (server.state === "failed") return "Failed";
     return "Stopped";
+  }
+
+  function fitTone(f: FitTier): "success" | "warning" | "danger" | "muted" {
+    if (f === "fits") return "success";
+    if (f === "tight") return "warning";
+    if (f === "too_big") return "danger";
+    return "muted";
+  }
+  function fitLabel(f: FitTier): string {
+    if (f === "fits") return "Fits";
+    if (f === "tight") return "Tight";
+    if (f === "too_big") return "Too big";
+    return "CPU only";
+  }
+  function humanVram(mb: number | null): string {
+    if (mb == null) return "GPU not detected";
+    return `${(mb / 1024).toFixed(1)} GB VRAM`;
   }
 </script>
 
@@ -184,6 +282,78 @@
     </p>
   {/if}
 
+  {#if catalog}
+    <div class="catalog-head">
+      <div class="catalog-meta">
+        <span class="section-label">Available to download</span>
+        <span class="sub mono-label">
+          {humanVram(catalog.vram_mb)}
+          {#if catalog.free_bytes != null}
+            · {humanSize(catalog.free_bytes)} free
+          {/if}
+        </span>
+      </div>
+      <button
+        class="btn btn-sm btn-ghost"
+        type="button"
+        title={catalog.models_dir}
+        onclick={chooseModelsDir}
+        disabled={downloadingId !== null}
+      >
+        Folder…
+      </button>
+    </div>
+    <p class="folder mono-label" title={catalog.models_dir}>{catalog.models_dir}</p>
+
+    <div class="models catalog">
+      {#each catalog.entries as e (e.id)}
+        <div class="model-row catalog-row">
+          <div class="meta">
+            <span class="name">{e.label}</span>
+            <span class="sub mono-label">
+              {humanSize(e.size_bytes)} · {e.quant} · ~{e.vram_gb} GB VRAM · {e.license}
+            </span>
+            <span class="good-at">{e.good_at}</span>
+          </div>
+          <div class="btns">
+            <StatusPill tone={fitTone(e.fit)} label={fitLabel(e.fit)} />
+            {#if e.installed}
+              <StatusPill tone="success" label="Installed" />
+            {:else}
+              <button
+                class="btn btn-sm"
+                type="button"
+                disabled={downloadingId !== null}
+                title={e.fit === "too_big"
+                  ? "May not fit in VRAM — you can still download and try CPU/offload"
+                  : "Download from Hugging Face (resumable)"}
+                onclick={() => downloadCatalog(e.id)}
+              >
+                {downloadingId === e.id ? "Downloading…" : "Download"}
+              </button>
+            {/if}
+          </div>
+        </div>
+      {/each}
+    </div>
+
+    {#if downloadingId && dlProgress && dlProgress.catalogId === downloadingId}
+      <div class="progress">
+        <div class="bar" style="width: {dlPct}%"></div>
+      </div>
+      <p class="progress-note mono-label">
+        {dlProgress.phase} · {dlPct}%
+        {#if dlProgress.received > 0}
+          · {humanSize(dlProgress.received)}
+          {#if dlProgress.total > 1}
+            / {humanSize(dlProgress.total)}
+          {/if}
+        {/if}
+      </p>
+    {/if}
+  {/if}
+
+  <span class="section-label your-models">Your models</span>
   {#if local.models.length > 0}
     <div class="models">
       {#each local.models as m (m.id)}
@@ -219,13 +389,13 @@
     </div>
   {:else}
     <p class="empty-note">
-      No local models yet. Add any <code>.gguf</code> file — it becomes a model you can pick in any
-      chat or automation, served entirely on this machine.
+      No local models yet. Download one above, or add any <code>.gguf</code> file — it becomes a
+      model you can pick in any chat or automation, served entirely on this machine.
     </p>
   {/if}
 
   <div class="actions">
-    <button class="btn btn-sm" type="button" onclick={addModel}>
+    <button class="btn btn-sm" type="button" onclick={addModel} disabled={downloadingId !== null}>
       <Icon name="plus" size={13} />
       Add GGUF model…
     </button>
@@ -271,11 +441,47 @@
     color: var(--text-muted);
   }
 
+  .catalog-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+  .catalog-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+  .section-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+  }
+  .section-label.your-models {
+    display: block;
+    margin-top: 1rem;
+    margin-bottom: 0.35rem;
+  }
+  .folder {
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    margin: 0.25rem 0 0.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .models {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
     margin-top: 0.5rem;
+  }
+  .models.catalog {
+    margin-top: 0.35rem;
   }
   .model-row {
     display: flex;
@@ -286,6 +492,9 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-muted);
+  }
+  .catalog-row {
+    align-items: flex-start;
   }
   .meta {
     min-width: 0;
@@ -307,11 +516,19 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .good-at {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    line-height: 1.35;
+    margin-top: 0.15rem;
+  }
   .btns {
     display: flex;
     align-items: center;
     gap: 0.4rem;
     flex: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .empty-note {
