@@ -96,6 +96,21 @@ pub fn automations_file() -> PathBuf {
     data_dir().join("automations.json")
 }
 
+/// One JSON file per workflow lives here (`<workflow_id>.json`).
+pub fn workflows_dir() -> PathBuf {
+    data_dir().join("workflows")
+}
+
+/// Per-workflow run records + event logs (`workflow-runs/<id>/<run>.json|.jsonl`).
+pub fn workflow_runs_dir() -> PathBuf {
+    data_dir().join("workflow-runs")
+}
+
+/// v1 secret store for workflow `$secret()` lookups (flat name→value JSON).
+pub fn secrets_file() -> PathBuf {
+    data_dir().join("secrets.json")
+}
+
 /// Per-automation run records + transcripts live under `runs/<automation_id>/`.
 pub fn runs_dir() -> PathBuf {
     data_dir().join("runs")

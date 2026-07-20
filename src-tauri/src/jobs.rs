@@ -481,7 +481,9 @@ fn effective_mode(_mode: ExecMode) -> ExecMode {
 }
 
 /// Build the grok headless argument vector with structural shadow enforcement.
-fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
+/// Also used by the workflow Agent node's runner, so workflow agent turns get
+/// the exact same confinement as Automations.
+pub(crate) fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
     let mode = effective_mode(exec.mode);
     // No bare `-p`: as of grok 0.2.102, `-p/--single` REQUIRES an inline prompt
     // value (exit 2 without one) and `--prompt-file` alone selects headless
@@ -565,7 +567,7 @@ fn build_grok_args(exec: &Executor, prompt_file: &str) -> Vec<String> {
 }
 
 /// Standing guardrail appended to every run's system prompt.
-const STANDING_RULES: &str = "You are an unattended automation with no human present. \
+pub(crate) const STANDING_RULES: &str = "You are an unattended automation with no human present. \
 You cannot ask questions. Work only inside the project directory. Never push, merge, \
 or delete branches. If there is nothing noteworthy to report, reply with exactly SILENT.";
 
@@ -1530,14 +1532,14 @@ fn now_secs() -> u64 {
 }
 
 #[cfg(windows)]
-fn tree_kill(pid: u32) {
+pub(crate) fn tree_kill(pid: u32) {
     let _ = crate::util::hidden_command("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
 }
 
 #[cfg(not(windows))]
-fn tree_kill(_pid: u32) {}
+pub(crate) fn tree_kill(_pid: u32) {}
 
 // ----------------------------------------------------------------- command layer
 
