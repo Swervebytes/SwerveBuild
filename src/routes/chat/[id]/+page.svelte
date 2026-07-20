@@ -17,6 +17,8 @@
     role: "assistant" | "tool";
     content: string;
     kind?: string;
+    /** ACP toolCallId — used to dedupe tool_call + tool_call_update into one chip. */
+    toolCallId?: string;
   };
 
   let chat = $state<Chat | null>(null);
@@ -77,12 +79,47 @@
     }
 
     if (sessionUpdate === "tool_call" || sessionUpdate === "tool_call_update") {
+      const toolCallId =
+        (typeof inner.toolCallId === "string" && inner.toolCallId) ||
+        (typeof (inner.toolCall as Record<string, unknown> | undefined)?.toolCallId ===
+          "string" &&
+          String((inner.toolCall as Record<string, unknown>).toolCallId)) ||
+        undefined;
+      const label = text || (typeof inner.title === "string" ? inner.title : "") || sessionUpdate;
+
+      if (toolCallId) {
+        const idx = streaming.findIndex(
+          (item) => item.role === "tool" && item.toolCallId === toolCallId,
+        );
+        if (idx >= 0) {
+          const prev = streaming[idx];
+          streaming[idx] = {
+            ...prev,
+            content: label || prev.content,
+            kind: sessionUpdate,
+          };
+          streaming = [...streaming];
+          return;
+        }
+        streaming = [
+          ...streaming,
+          {
+            id: toolCallId,
+            toolCallId,
+            role: "tool",
+            content: label,
+            kind: sessionUpdate,
+          },
+        ];
+        return;
+      }
+
       streaming = [
         ...streaming,
         {
           id: crypto.randomUUID(),
           role: "tool",
-          content: text || sessionUpdate,
+          content: label,
           kind: sessionUpdate,
         },
       ];
@@ -299,6 +336,22 @@
         void finalizeAssistantMessage().then((saved) => {
           if (saved) workspaceStore.refresh();
         });
+      }),
+      subscribe<{ chatId: string }>("chat-session-ended", (event) => {
+        // Agent process died (crash, kill, clean exit). Backend already dropped
+        // the session from the map; surface a reconnect banner instead of a
+        // cryptic pipe error on the next send.
+        if (event.payload.chatId !== $page.params.id) return;
+        sessionReady = false;
+        void finalizeAssistantMessage("Partial reply saved — agent disconnected").then(
+          (saved) => {
+            if (saved) workspaceStore.refresh();
+          },
+        );
+        sending = false;
+        error =
+          "Live agent session ended. Your saved messages are below — send a message to reconnect.";
+        refreshActiveSessions();
       }),
     ];
     return () => offs.forEach((o) => o());
