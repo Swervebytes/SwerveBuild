@@ -75,7 +75,76 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["automation_id"]
             }),
         },
+        // --- App UI drive (Step 6). Require Settings grant. CDP interaction TBD. ---
+        ToolDef {
+            name: "app_ui_state".into(),
+            description: "Read SwerveBuild UI control status: human grant, current route/title (published by the app), and which drive tools are implemented. Requires Settings → Agent UI control.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "app_ui_snapshot".into(),
+            description: "Size-capped text digest of the visible SwerveBuild UI from the last published frontend state (route/title). Not a full DOM dump yet. Requires grant.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "app_ui_screenshot".into(),
+            description: "Capture the SwerveBuild window (CDP). Not implemented until drive lands; returns a clear error.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "app_ui_click".into(),
+            description: "Click a control in the SwerveBuild UI. Not implemented until CDP drive lands.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector or role+name hint" }
+                },
+                "required": ["selector"]
+            }),
+        },
+        ToolDef {
+            name: "app_ui_type".into(),
+            description: "Type into a SwerveBuild UI field. Not implemented until CDP drive lands.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["selector", "text"]
+            }),
+        },
+        ToolDef {
+            name: "app_ui_press".into(),
+            description: "Send a key to the SwerveBuild UI. Not implemented until CDP drive lands.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "e.g. Enter, Escape" }
+                },
+                "required": ["key"]
+            }),
+        },
+        ToolDef {
+            name: "app_ui_wait".into(),
+            description: "Wait for a UI condition. Not implemented until CDP drive lands.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "condition": { "type": "string" },
+                    "timeout_ms": { "type": "number" }
+                },
+                "required": ["condition"]
+            }),
+        },
     ]
+}
+
+fn app_ui_not_implemented(tool: &str) -> Result<Value, String> {
+    swerve_build_lib::app_ui::require_grant()?;
+    Err(format!(
+        "{tool}: not_implemented — CDP attach to the main WebView is not shipped yet. Grant is active; use app_ui_state / app_ui_snapshot for read-only route/title."
+    ))
 }
 
 fn data_path() -> PathBuf {
@@ -259,6 +328,39 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 "updated_at": chat.get("updated_at"),
             }))
         }
+        "app_ui_state" | "swervebuild_app_ui_state" => {
+            swerve_build_lib::app_ui::require_grant()?;
+            Ok(swerve_build_lib::app_ui::state_report())
+        }
+        "app_ui_snapshot" | "swervebuild_app_ui_snapshot" => {
+            swerve_build_lib::app_ui::require_grant()?;
+            let report = swerve_build_lib::app_ui::state_report();
+            let route = report
+                .get("route")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let title = report
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let modal = report
+                .get("permissionModalOpen")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let digest = format!(
+                "SwerveBuild UI digest (published state, not full DOM)\nroute: {route}\ntitle: {title}\npermission_modal_open: {modal}\ndrive_ready: false"
+            );
+            // Soft cap — keep under agent context budgets.
+            let capped: String = digest.chars().take(4_000).collect();
+            Ok(json!({ "digest": capped, "chars": capped.chars().count() }))
+        }
+        "app_ui_screenshot" | "swervebuild_app_ui_screenshot" => {
+            app_ui_not_implemented("app_ui_screenshot")
+        }
+        "app_ui_click" | "swervebuild_app_ui_click" => app_ui_not_implemented("app_ui_click"),
+        "app_ui_type" | "swervebuild_app_ui_type" => app_ui_not_implemented("app_ui_type"),
+        "app_ui_press" | "swervebuild_app_ui_press" => app_ui_not_implemented("app_ui_press"),
+        "app_ui_wait" | "swervebuild_app_ui_wait" => app_ui_not_implemented("app_ui_wait"),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }

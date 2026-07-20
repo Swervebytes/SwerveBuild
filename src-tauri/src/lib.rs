@@ -1,4 +1,5 @@
 mod acp;
+pub mod app_ui;
 mod env_context;
 mod grok_config;
 mod jobs;
@@ -1173,6 +1174,23 @@ fn automation_failure_count() -> usize {
     jobs::unseen_failure_count()
 }
 
+#[tauri::command]
+fn get_app_ui_grant() -> app_ui::AppUiGrant {
+    app_ui::load_grant()
+}
+
+#[tauri::command]
+fn set_app_ui_grant(granted: bool) -> Result<app_ui::AppUiGrant, String> {
+    app_ui::set_granted(granted)
+}
+
+/// Frontend publishes the visible route/title so MCP `app_ui_state` can report it
+/// without CDP. Does not require the human grant (publish is local telemetry).
+#[tauri::command]
+fn publish_app_ui_state(state: app_ui::AppUiPublishedState) -> Result<app_ui::AppUiPublishedState, String> {
+    app_ui::publish_state(state)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let acp = Arc::new(AcpManager::default());
@@ -1259,6 +1277,9 @@ pub fn run() {
             read_run_log,
             mark_runs_seen,
             automation_failure_count,
+            get_app_ui_grant,
+            set_app_ui_grant,
+            publish_app_ui_state,
             workflows_tauri::workflows_list,
             workflows_tauri::workflow_get,
             workflows_tauri::workflow_save,

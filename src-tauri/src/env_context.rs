@@ -34,7 +34,7 @@ pub struct EnvSnapshot {
     pub local_model_loaded: Option<String>,
     /// MCP / agent surfaces available this session (e.g. `swervebuild`).
     pub agent_surfaces: Vec<String>,
-    /// Whether the human granted App UI MCP control (Step 6 — always false for now).
+    /// Whether the human granted App UI MCP control (Settings → Agent UI control).
     pub app_ui_granted: bool,
 }
 
@@ -197,14 +197,13 @@ fn project_name_for(root: &Path, store: &crate::store::AppStore) -> String {
         .unwrap_or_else(|| root_str.into_owned())
 }
 
-/// MCP surfaces known for this session. App UI is Step 6 and stays off the list
-/// until that surface ships.
+/// MCP surfaces known for this session.
 fn agent_surfaces() -> Vec<String> {
-    let mut surfaces = vec!["swervebuild".to_string()];
+    let mut surfaces = vec!["swervebuild".to_string(), "app_ui".to_string()];
     if crate::which_on_path("swervebytes-mcp").is_some() {
         surfaces.push("swervebytes".to_string());
     }
-    // terminal / browser / app_ui land in Step 6
+    // terminal / browser land later in Step 6
     surfaces
 }
 
@@ -259,7 +258,7 @@ pub fn gather_for_chat(
         running_automations,
         local_model_loaded,
         agent_surfaces: agent_surfaces(),
-        app_ui_granted: false,
+        app_ui_granted: crate::app_ui::is_granted(),
     }
 }
 
@@ -311,7 +310,11 @@ pub fn gather_for_automation(
         active_chats,
         running_automations,
         local_model_loaded,
-        agent_surfaces: agent_surfaces(),
+        // Never auto-grant UI control for unattended runs — even if Settings is on.
+        agent_surfaces: agent_surfaces()
+            .into_iter()
+            .filter(|s| s != "app_ui")
+            .collect(),
         app_ui_granted: false,
     }
 }
