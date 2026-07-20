@@ -1,4 +1,5 @@
 mod acp;
+mod env_context;
 mod grok_config;
 mod jobs;
 mod local_llm;
@@ -719,6 +720,8 @@ async fn start_chat_session(
     let project_path = project.path.clone();
     let stored_session = chat.grok_session_id.clone();
     let chat_id_for_task = chat_id.clone();
+    let provider_id = provider.id.clone();
+    let model_id = chat.model_id.clone();
     let acp = acp.inner().clone();
     let acp_for_task = Arc::clone(&acp);
     // Local models need the app's llama-server up before grok spawns. Done in
@@ -727,6 +730,10 @@ async fn start_chat_session(
         .model_id
         .clone()
         .filter(|m| provider.id == "grok" && m.starts_with(grok_config::LOCAL_PREFIX));
+    let running_automations = app
+        .try_state::<Arc<JobManager>>()
+        .map(|jm| jm.running_count())
+        .unwrap_or(0);
 
     let session_id = tauri::async_runtime::spawn_blocking(move || {
         if let Some(model) = local_model.as_deref() {
@@ -744,6 +751,9 @@ async fn start_chat_session(
             &project_path,
             &chat_id_for_task,
             stored_session.as_deref(),
+            &provider_id,
+            model_id.as_deref(),
+            running_automations,
         )
     })
     .await

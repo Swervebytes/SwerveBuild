@@ -209,12 +209,20 @@ impl AgentRunner for GrokAgentRunner {
         }
         let grok = crate::resolve_grok_executable().ok_or("Grok Build is not installed.")?;
 
+        // Env context pack (Step 5) into headless `--rules`, same as automations.
+        let env_pack = crate::env_context::format_pack(&crate::env_context::gather_for_automation(
+            &cwd,
+            req.model.as_deref(),
+            "shadow (workflow agent node)",
+            0,
+            0,
+        ));
         let exec = crate::jobs::Executor {
             prompt: String::new(),
             mode: crate::jobs::ExecMode::Shadow,
             tools: Vec::new(), // empty → the builder falls back to the full read-safe set
             deny: Vec::new(),
-            rules: Some(crate::jobs::STANDING_RULES.to_string()),
+            rules: Some(format!("{env_pack}\n\n{}", crate::jobs::STANDING_RULES)),
             effort: req.effort.clone(),
             model: req.model.clone(),
             max_turns: req.max_turns,
