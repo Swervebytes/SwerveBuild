@@ -641,7 +641,7 @@ impl JobManager {
         let _ = store.save();
     }
 
-    fn running_count(&self) -> usize {
+    pub fn running_count(&self) -> usize {
         self.running.lock().map(|g| g.len()).unwrap_or(0)
     }
 
@@ -774,11 +774,24 @@ impl JobManager {
         let grok = crate::resolve_grok_executable()
             .ok_or_else(|| "Grok Build is not installed.".to_string())?;
 
-        // Standing guardrail + any per-automation rules.
+        // Env context pack (Step 5) + standing guardrail + per-automation rules.
+        // Headless grok accepts system text via `--rules`; chat ACP gets the
+        // same pack via first-prompt prepend instead.
+        let mode_label = match effective_mode(automation.executor.mode) {
+            ExecMode::Shadow => "shadow (read-only tool allowlist)",
+            ExecMode::Write => "write (unattended; no human approval UI)",
+        };
+        let env_pack = crate::env_context::format_pack(&crate::env_context::gather_for_automation(
+            cwd,
+            automation.executor.model.as_deref(),
+            mode_label,
+            0, // chat count not available from the job runner without AppHandle state
+            self.running_count(),
+        ));
         let mut exec = automation.executor.clone();
         exec.rules = Some(match &exec.rules {
-            Some(r) if !r.is_empty() => format!("{STANDING_RULES}\n{r}"),
-            _ => STANDING_RULES.to_string(),
+            Some(r) if !r.is_empty() => format!("{env_pack}\n\n{STANDING_RULES}\n{r}"),
+            _ => format!("{env_pack}\n\n{STANDING_RULES}"),
         });
 
         let args = build_grok_args(&exec, &prompt_path.to_string_lossy());

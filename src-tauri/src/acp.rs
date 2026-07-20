@@ -62,6 +62,10 @@ struct ActiveSession {
     child: Child,
     transport: Arc<SessionTransport>,
     last_accessed: Arc<AtomicU64>,
+    /// Env context pack (Step 5). Injected once on the first `session/prompt`
+    /// after spawn, then cleared. Not stored in chat history — wire-only so the
+    /// UI still shows the user's bare message.
+    env_context_pack: Mutex<Option<String>>,
 }
 
 impl Default for AcpManager {
@@ -115,6 +119,9 @@ impl AcpManager {
         cwd: &str,
         chat_id: &str,
         stored_session_id: Option<&str>,
+        provider_id: &str,
+        model_id: Option<&str>,
+        running_automations: usize,
     ) -> Result<String, String> {
         if let Ok(guard) = self.sessions.lock() {
             if guard.contains_key(chat_id) {
@@ -132,7 +139,16 @@ impl AcpManager {
         }
 
         self.evict_if_needed();
-        self.spawn_session(app, launch, cwd, chat_id, stored_session_id)
+        self.spawn_session(
+            app,
+            launch,
+            cwd,
+            chat_id,
+            stored_session_id,
+            provider_id,
+            model_id,
+            running_automations,
+        )
     }
 
     fn touch(&self, chat_id: &str) {
@@ -181,6 +197,9 @@ impl AcpManager {
         cwd: &str,
         chat_id: &str,
         stored_session_id: Option<&str>,
+        provider_id: &str,
+        model_id: Option<&str>,
+        running_automations: usize,
     ) -> Result<String, String> {
         let mut command = crate::util::hidden_command(&launch.command);
         command
@@ -394,11 +413,25 @@ impl AcpManager {
             );
         });
 
+        // Snapshot env context at session start (Step 5). Active chat count
+        // includes this session once inserted; use list_active + 1 for spawn.
+        let active_chats = self.list_active().len() + 1;
+        let snap = crate::env_context::gather_for_chat(
+            cwd,
+            provider_id,
+            &launch.label,
+            model_id,
+            active_chats,
+            running_automations,
+        );
+        let env_pack = crate::env_context::format_pack(&snap);
+
         let mut active = ActiveSession {
             session_id: String::new(),
             child,
             transport: Arc::clone(&transport),
             last_accessed,
+            env_context_pack: Mutex::new(Some(env_pack)),
         };
 
         let agent_caps = active.transport.rpc(
@@ -536,7 +569,7 @@ impl AcpManager {
     }
 
     pub fn send_prompt(&self, chat_id: &str, text: &str, images: &[String]) -> Result<(), String> {
-        let (transport, session_id) = {
+        let (transport, session_id, env_pack) = {
             let mut guard = self
                 .sessions
                 .lock()
@@ -545,9 +578,15 @@ impl AcpManager {
                 .get_mut(chat_id)
                 .ok_or_else(|| "No active session for this chat. Open the chat to connect.".to_string())?;
             active.bump_access();
+            let pack = active
+                .env_context_pack
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
             (
                 Arc::clone(&active.transport),
                 active.session_id.clone(),
+                pack,
             )
         };
 
@@ -561,6 +600,13 @@ impl AcpManager {
 
         if prompt_text.is_empty() {
             return Err("Message cannot be empty".to_string());
+        }
+
+        // Prepend env pack on first turn only. Delivery is a user-turn prefix
+        // because Grok ACP `session/new` does not expose a client system-prompt
+        // field we can rely on (design open item: verified via wire-prepend).
+        if let Some(pack) = env_pack {
+            prompt_text = format!("{pack}\n\n---\n\n{prompt_text}");
         }
 
         transport.rpc(
