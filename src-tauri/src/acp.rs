@@ -13,6 +13,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 const CONNECT_TIMEOUT_SECS: u64 = 45;
+/// ACP `initialize.protocolVersion` we advertise. Snapshot of supported
+/// providers lives in docs-internal/DEPENDENCIES.md (Step 2). Grok Build CLI
+/// 0.2.x negotiates protocol 1 successfully (verified through daily use +
+/// session/load capability probes below).
+pub const ACP_PROTOCOL_VERSION: u64 = 1;
 // Agentic coding turns can run many minutes; a short ceiling aborts a
 // still-working agent and truncates its reply (the old 300s bug). Wait long, and
 // rely on two faster signals instead: the reader thread unblocks this wait the
@@ -392,7 +397,7 @@ impl AcpManager {
         let agent_caps = active.transport.rpc(
             "initialize",
             json!({
-                "protocolVersion": 1,
+                "protocolVersion": ACP_PROTOCOL_VERSION,
                 "clientCapabilities": {
                     "fs": { "readTextFile": true, "writeTextFile": true }
                 },
