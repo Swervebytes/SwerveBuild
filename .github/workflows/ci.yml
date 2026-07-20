@@ -47,8 +47,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # --workspace includes crates/swerve-workflows (engine + integration tests).
       - name: Rust unit tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
 
       # The e2e script needs the debug binaries present; it exercises the MCP
       # server fully and skips the live-grok ACP portion when grok is absent
