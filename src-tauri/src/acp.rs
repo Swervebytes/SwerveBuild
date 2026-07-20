@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 const CONNECT_TIMEOUT_SECS: u64 = 45;
@@ -19,10 +19,21 @@ const CONNECT_TIMEOUT_SECS: u64 = 45;
 // moment grok's stdout closes (process died), and the user can Stop a turn
 // (session/cancel).
 const PROMPT_TIMEOUT_SECS: u64 = 1800;
+/// How long the reader waits for the user to approve/deny an agent file write.
+const WRITE_APPROVAL_TIMEOUT_SECS: u64 = 600;
 const MAX_CONCURRENT_SESSIONS: usize = 3;
 
+type SessionMap = HashMap<String, ActiveSession>;
+type WriteApprovalMap = HashMap<(String, u64), mpsc::Sender<bool>>;
+
 pub struct AcpManager {
-    sessions: Mutex<HashMap<String, ActiveSession>>,
+    /// Arc so the stdout reader can remove a dead session without holding
+    /// `AcpManager` itself (the reader outlives the spawn call).
+    sessions: Arc<Mutex<SessionMap>>,
+    /// Pending `fs/write_text_file` approvals keyed by (chat_id, JSON-RPC id).
+    /// The reader thread blocks on the receiver until the UI calls
+    /// `respond_permission` (or the session dies / times out).
+    write_approvals: Arc<Mutex<WriteApprovalMap>>,
 }
 
 /// Shared ACP transport — must be usable without holding `AcpManager::sessions` lock
@@ -51,7 +62,8 @@ struct ActiveSession {
 impl Default for AcpManager {
     fn default() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            write_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -65,6 +77,7 @@ impl AcpManager {
     }
 
     pub fn close_chat(&self, chat_id: &str) {
+        reject_write_approvals_for_chat(&self.write_approvals, chat_id);
         if let Ok(mut guard) = self.sessions.lock() {
             if let Some(mut active) = guard.remove(chat_id) {
                 let _ = active.child.kill();
@@ -74,6 +87,11 @@ impl AcpManager {
     }
 
     pub fn close_all(&self) {
+        if let Ok(mut map) = self.write_approvals.lock() {
+            for (_, tx) in map.drain() {
+                let _ = tx.send(false);
+            }
+        }
         if let Ok(mut guard) = self.sessions.lock() {
             for (_, mut active) in guard.drain() {
                 let _ = active.child.kill();
@@ -118,24 +136,33 @@ impl AcpManager {
     }
 
     fn evict_if_needed(&self) {
-        let mut guard = match self.sessions.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
+        let mut evicted: Vec<String> = Vec::new();
+        {
+            let mut guard = match self.sessions.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
 
-        while guard.len() >= MAX_CONCURRENT_SESSIONS {
-            let lru = guard
-                .iter()
-                .min_by_key(|(_, session)| session.last_accessed.load(Ordering::SeqCst))
-                .map(|(id, _)| id.clone());
-            if let Some(id) = lru {
-                if let Some(mut active) = guard.remove(&id) {
-                    let _ = active.child.kill();
-                    let _ = active.child.wait();
+            while guard.len() >= MAX_CONCURRENT_SESSIONS {
+                let lru = guard
+                    .iter()
+                    .min_by_key(|(_, session)| session.last_accessed.load(Ordering::SeqCst))
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru {
+                    if let Some(mut active) = guard.remove(&id) {
+                        let _ = active.child.kill();
+                        let _ = active.child.wait();
+                    }
+                    evicted.push(id);
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
+        }
+        // Reject write approvals outside the sessions lock (lock order:
+        // write_approvals before sessions in respond_permission / close_chat).
+        for id in evicted {
+            reject_write_approvals_for_chat(&self.write_approvals, &id);
         }
     }
 
@@ -200,6 +227,11 @@ impl AcpManager {
         // in the LRU — a mid-turn chat must not be evicted when a 4th chat opens.
         let last_accessed = Arc::new(AtomicU64::new(now_secs()));
         let last_accessed_reader = Arc::clone(&last_accessed);
+        let write_approvals_for_reader = Arc::clone(&self.write_approvals);
+        let sessions_for_cleanup = Arc::clone(&self.sessions);
+        let transport_for_cleanup = Arc::clone(&transport);
+        let write_approvals_for_cleanup = Arc::clone(&self.write_approvals);
+        let chat_for_cleanup = chat_for_reader.clone();
 
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -248,17 +280,42 @@ impl AcpManager {
                         // methods and out-of-scope fs paths get a JSON-RPC error
                         // instead of silence (silence hangs a strict peer) or an
                         // unrestricted filesystem read/write (the old behavior).
-                        let reply = match handle_client_request(
-                            method,
-                            value.get("params"),
-                            &cwd_for_reader,
-                        ) {
-                            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                            Err((code, message)) => json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": { "code": code, "message": message },
-                            }),
+                        //
+                        // Writes always go through the global approval UI so an
+                        // agent cannot overwrite project files without a click.
+                        let reply = if method == "fs/write_text_file" {
+                            match handle_write_with_approval(
+                                value.get("params"),
+                                &cwd_for_reader,
+                                &chat_for_reader,
+                                &id,
+                                &app_for_reader,
+                                &write_approvals_for_reader,
+                            ) {
+                                Ok(result) => {
+                                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                                }
+                                Err((code, message)) => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": { "code": code, "message": message },
+                                }),
+                            }
+                        } else {
+                            match handle_client_request(
+                                method,
+                                value.get("params"),
+                                &cwd_for_reader,
+                            ) {
+                                Ok(result) => {
+                                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                                }
+                                Err((code, message)) => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": { "code": code, "message": message },
+                                }),
+                            }
                         };
                         if let Ok(mut writer) = transport_for_reader.stdin.lock() {
                             let _ = writeln!(writer, "{}", reply);
@@ -302,9 +359,26 @@ impl AcpManager {
             if let Ok(mut pending) = transport_for_reader.responses.lock() {
                 pending.clear();
             }
+            // Deny any write approvals still waiting on this chat so the reader
+            // doesn't hang until WRITE_APPROVAL_TIMEOUT after the process dies.
+            reject_write_approvals_for_chat(&write_approvals_for_cleanup, &chat_for_cleanup);
+            // Drop the dead session from the map only if it is still *this*
+            // transport (a respawn may already own the chat_id slot).
+            if let Ok(mut guard) = sessions_for_cleanup.lock() {
+                let stale = guard
+                    .get(&chat_for_cleanup)
+                    .map(|s| Arc::ptr_eq(&s.transport, &transport_for_cleanup))
+                    .unwrap_or(false);
+                if stale {
+                    if let Some(mut active) = guard.remove(&chat_for_cleanup) {
+                        let _ = active.child.kill();
+                        let _ = active.child.wait();
+                    }
+                }
+            }
             let _ = app_for_reader.emit(
                 "chat-session-ended",
-                json!({ "chatId": chat_for_reader }),
+                json!({ "chatId": chat_for_cleanup }),
             );
         });
 
@@ -413,6 +487,17 @@ impl AcpManager {
         request_id: u64,
         option_id: &str,
     ) -> Result<(), String> {
+        // Client-side write approvals are parked in write_approvals (not as an
+        // agent permission RPC). Resolve those first so the reader can finish
+        // the fs/write_text_file reply.
+        if let Ok(mut map) = self.write_approvals.lock() {
+            if let Some(tx) = map.remove(&(chat_id.to_string(), request_id)) {
+                let allowed = option_id.starts_with("allow");
+                let _ = tx.send(allowed);
+                return Ok(());
+            }
+        }
+
         let transport = {
             let guard = self
                 .sessions
@@ -634,10 +719,8 @@ fn resolve_mcp_binary() -> Result<String, String> {
     Err("swervebuild-mcp binary not found. Rebuild the project.".to_string())
 }
 
-/// Handle an agent->client JSON-RPC request. Returns `Ok(result)` or
-/// `Err((code, message))` (a JSON-RPC error object). The two `fs/*` methods are
-/// confined to `cwd` (the chat's project directory) — an agent can no longer
-/// read or overwrite arbitrary files on disk. Everything else is method-not-found.
+/// Handle an agent→client JSON-RPC request (read-only path and unknown methods).
+/// Writes go through [`handle_write_with_approval`] instead — never auto-approved.
 fn handle_client_request(
     method: &str,
     params: Option<&Value>,
@@ -655,30 +738,126 @@ fn handle_client_request(
                 .map_err(|e| (-32000, format!("read failed: {e}")))?;
             Ok(json!({ "content": content }))
         }
-        "fs/write_text_file" => {
-            let path = params
-                .and_then(|p| p.get("path"))
-                .and_then(|p| p.as_str())
-                .ok_or((-32602, "missing path".to_string()))?;
-            let content = params
-                .and_then(|p| p.get("content"))
-                .and_then(|p| p.as_str())
-                .ok_or((-32602, "missing content".to_string()))?;
-            let target = confine_to_cwd(path, cwd)
-                .ok_or((-32001, format!("path outside project directory: {path}")))?;
-            if let Some(parent) = target.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            fs::write(&target, content).map_err(|e| (-32000, format!("write failed: {e}")))?;
-            Ok(Value::Null)
-        }
+        // Defensive: write must never land here. The reader routes writes to the
+        // approval path; if this is hit, refuse rather than auto-write.
+        "fs/write_text_file" => Err((
+            -32002,
+            "fs/write_text_file requires user approval (internal routing error)".to_string(),
+        )),
         other => Err((-32601, format!("method not supported: {other}"))),
     }
 }
 
-/// Resolve `requested` (absolute or relative to `cwd`) and return it only if it
-/// stays inside the canonicalized `cwd`. `..` is collapsed lexically and the
-/// prefix check is case-insensitive (Windows). Returns None on any escape.
+/// Gate `fs/write_text_file` behind the global permission modal, then write only
+/// if the user allows and the path is still confined (junction-safe).
+fn handle_write_with_approval(
+    params: Option<&Value>,
+    cwd: &str,
+    chat_id: &str,
+    request_id: &Value,
+    app: &AppHandle,
+    write_approvals: &Mutex<WriteApprovalMap>,
+) -> Result<Value, (i64, String)> {
+    let path = params
+        .and_then(|p| p.get("path"))
+        .and_then(|p| p.as_str())
+        .ok_or((-32602, "missing path".to_string()))?;
+    let content = params
+        .and_then(|p| p.get("content"))
+        .and_then(|p| p.as_str())
+        .ok_or((-32602, "missing content".to_string()))?;
+    let target = confine_to_cwd(path, cwd)
+        .ok_or((-32001, format!("path outside project directory: {path}")))?;
+
+    let id = request_id
+        .as_u64()
+        .or_else(|| request_id.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
+        .or_else(|| request_id.as_str().and_then(|s| s.parse().ok()))
+        .ok_or((-32602, "invalid request id".to_string()))?;
+
+    let (tx, rx) = mpsc::channel();
+    {
+        let mut map = write_approvals
+            .lock()
+            .map_err(|_| (-32000, "write approval lock poisoned".to_string()))?;
+        map.insert((chat_id.to_string(), id), tx);
+    }
+
+    // Reuse the same event + modal as session/request_permission so background
+    // chats still surface the prompt (global permissionStore).
+    let display_path = target.display().to_string();
+    let preview_len = content.chars().count();
+    let title = if preview_len == 0 {
+        format!("Write empty file: {display_path}")
+    } else {
+        format!("Write {preview_len} chars to: {display_path}")
+    };
+    let _ = app.emit(
+        "chat-permission-request",
+        json!({
+            "chatId": chat_id,
+            "requestId": id,
+            "params": {
+                "toolCall": {
+                    "title": title,
+                    "kind": "edit",
+                    "toolCallId": format!("fs-write-{id}")
+                },
+                "options": [
+                    { "optionId": "allow_once", "name": "Allow write", "kind": "allow_once" },
+                    { "optionId": "reject", "name": "Deny", "kind": "reject" }
+                ]
+            }
+        }),
+    );
+
+    let allowed = match rx.recv_timeout(Duration::from_secs(WRITE_APPROVAL_TIMEOUT_SECS)) {
+        Ok(v) => v,
+        Err(_) => {
+            // Timed out or sender dropped — drop our slot if still present.
+            if let Ok(mut map) = write_approvals.lock() {
+                map.remove(&(chat_id.to_string(), id));
+            }
+            return Err((-32003, "write approval timed out or cancelled".to_string()));
+        }
+    };
+
+    if !allowed {
+        return Err((-32003, format!("write denied by user: {display_path}")));
+    }
+
+    // Re-check confinement after approval (TOCTOU + junction safety).
+    let target = confine_to_cwd(path, cwd)
+        .ok_or((-32001, format!("path outside project directory: {path}")))?;
+    if let Some(parent) = target.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&target, content).map_err(|e| (-32000, format!("write failed: {e}")))?;
+    Ok(Value::Null)
+}
+
+fn reject_write_approvals_for_chat(
+    write_approvals: &Mutex<WriteApprovalMap>,
+    chat_id: &str,
+) {
+    if let Ok(mut map) = write_approvals.lock() {
+        let keys: Vec<_> = map
+            .keys()
+            .filter(|(c, _)| c == chat_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(tx) = map.remove(&key) {
+                let _ = tx.send(false);
+            }
+        }
+    }
+}
+
+/// Resolve `requested` (absolute or relative to `cwd`) and return it only if the
+/// final path, after resolving existing junctions/symlinks, stays inside the
+/// canonicalized project directory. Pure lexical `..` collapse is not enough on
+/// Windows: a directory junction inside the project can point outside.
 fn confine_to_cwd(requested: &str, cwd: &str) -> Option<PathBuf> {
     let root = strip_verbatim(&fs::canonicalize(cwd).ok()?);
     let req = Path::new(requested);
@@ -689,12 +868,44 @@ fn confine_to_cwd(requested: &str, cwd: &str) -> Option<PathBuf> {
     };
     let normalized = normalize_lexical(&abs);
 
-    let n = normalized.to_string_lossy().to_lowercase();
+    // Fast reject before any further filesystem work.
+    if !path_inside(&normalized, &root) {
+        return None;
+    }
+
+    // Existing path: canonicalize fully (resolves junctions/symlinks).
+    if normalized.exists() {
+        let real = strip_verbatim(&fs::canonicalize(&normalized).ok()?);
+        return path_inside(&real, &root).then_some(real);
+    }
+
+    // New path: walk up to the nearest existing ancestor, canonicalize that,
+    // then re-join the non-existing tail and re-check the prefix.
+    let mut ancestor = normalized.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if ancestor.exists() {
+            break;
+        }
+        let name = ancestor.file_name()?.to_os_string();
+        tail.push(name);
+        ancestor = ancestor.parent()?.to_path_buf();
+    }
+    let real_ancestor = strip_verbatim(&fs::canonicalize(&ancestor).ok()?);
+    if !path_inside(&real_ancestor, &root) {
+        return None;
+    }
+    let mut final_path = real_ancestor;
+    for part in tail.into_iter().rev() {
+        final_path.push(part);
+    }
+    path_inside(&final_path, &root).then_some(final_path)
+}
+
+fn path_inside(path: &Path, root: &Path) -> bool {
+    let n = path.to_string_lossy().to_lowercase();
     let r = root.to_string_lossy().to_lowercase();
-    let inside = n == r
-        || n.starts_with(&format!("{r}\\"))
-        || n.starts_with(&format!("{r}/"));
-    inside.then_some(normalized)
+    n == r || n.starts_with(&format!("{r}\\")) || n.starts_with(&format!("{r}/"))
 }
 
 /// Collapse `.` and `..` components without touching the filesystem.
@@ -720,6 +931,69 @@ fn strip_verbatim(p: &Path) -> PathBuf {
     match s.strip_prefix(r"\\?\") {
         Some(rest) => PathBuf::from(rest),
         None => p.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confine_rejects_parent_escape() {
+        let dir = tempfile_dir("confine-escape");
+        let outside = confine_to_cwd("../secrets.txt", dir.to_str().unwrap());
+        assert!(outside.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confine_allows_relative_inside() {
+        let dir = tempfile_dir("confine-ok");
+        let nested = dir.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        let target = confine_to_cwd("src/main.rs", dir.to_str().unwrap()).unwrap();
+        assert!(path_inside(
+            &target,
+            &strip_verbatim(&fs::canonicalize(&dir).unwrap())
+        ));
+        assert!(target.ends_with("main.rs") || target.file_name().unwrap() == "main.rs");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confine_allows_new_file_under_existing_dir() {
+        let dir = tempfile_dir("confine-new");
+        let target = confine_to_cwd("brand-new.txt", dir.to_str().unwrap()).unwrap();
+        assert_eq!(target.file_name().unwrap(), "brand-new.txt");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_client_request_never_auto_writes() {
+        let dir = tempfile_dir("no-auto-write");
+        let err = handle_client_request(
+            "fs/write_text_file",
+            Some(&json!({ "path": "x.txt", "content": "nope" })),
+            dir.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, -32002);
+        assert!(!dir.join("x.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "swerve-acp-{}-{}-{}",
+            label,
+            std::process::id(),
+            now_secs()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        // Touch so canonicalize works on empty dirs everywhere.
+        fs::write(path.join(".keep"), b"x").unwrap();
+        path
     }
 }
 
