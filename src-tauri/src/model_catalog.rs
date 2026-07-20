@@ -487,4 +487,16 @@ mod tests {
         assert!(d.ends_with("models"));
         assert!(d.to_string_lossy().contains(".swervebuild"));
     }
+
+    /// Live smoke: builds catalog views (touches providers.json + nvidia-smi).
+    #[test]
+    fn live_catalog_state_returns_three_rows() {
+        let state = catalog_state();
+        assert_eq!(state.entries.len(), 3);
+        assert!(!state.models_dir.is_empty());
+        for e in &state.entries {
+            assert!(!e.label.is_empty());
+            assert!(!e.dest_path.is_empty());
+        }
+    }
 }
