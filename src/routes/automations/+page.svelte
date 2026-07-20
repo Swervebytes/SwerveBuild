@@ -80,11 +80,11 @@
       }),
 
       subscribe<{ automationId: string; runId: string }>("automation-run-started", () => {
-        automationsStore.refresh();
+        refreshSoon();
       }),
 
       subscribe<RunFinished>("automation-run-finished", (e) => {
-        automationsStore.refresh();
+        refreshSoon();
         loadRuns(e.payload.automationId);
         if (inspector && e.payload.runId === inspector.runId) {
           inspectorStatus = e.payload.status;
@@ -93,11 +93,25 @@
       }),
     ];
 
-    return () => offs.forEach((o) => o());
+    return () => {
+      offs.forEach((o) => o());
+      if (refreshTimer) clearTimeout(refreshTimer);
+    };
   });
 
   async function loadRuns(automationId: string) {
     runsByAutomation[automationId] = await automationsStore.runs(automationId);
+  }
+
+  // Runs commonly start/finish together, and each refresh is several invokes.
+  // Coalesce them instead of issuing a burst per event.
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  function refreshSoon() {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      automationsStore.refresh();
+    }, 150);
   }
 
   function openNew() {
@@ -129,6 +143,11 @@
     const project = projects.find((p) => p.id === projectId);
     editing.project_id = projectId || null;
     editing.executor.cwd = project ? project.path : "";
+    // A file trigger's watch path was seeded from the previous project's folder;
+    // repoint it, or it silently keeps watching the old project.
+    if (editing.trigger.kind === "file") {
+      editing.trigger.path = editing.executor.cwd;
+    }
     editorError = null;
   }
 

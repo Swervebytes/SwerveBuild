@@ -146,8 +146,15 @@ function Send-Acp($obj) {
 function Read-AcpResponse([int]$id, [int]$timeoutMs = 45000) {
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
     while ((Get-Date) -lt $deadline) {
-        $line = $acp.StandardOutput.ReadLine()
-        if ($null -eq $line) { Start-Sleep -Milliseconds 100; continue }
+        # A bare ReadLine() blocks indefinitely when the agent goes quiet, so the
+        # deadline above never gets re-checked and the whole suite hangs. Wait on
+        # the async read instead, so the timeout is actually enforced.
+        $remainingMs = [int](($deadline - (Get-Date)).TotalMilliseconds)
+        if ($remainingMs -le 0) { break }
+        $read = $acp.StandardOutput.ReadLineAsync()
+        if (-not $read.Wait($remainingMs)) { return $null }
+        $line = $read.Result
+        if ($null -eq $line) { return $null }  # stream closed
         if ($line.Trim() -eq "") { continue }
         try {
             $msg = $line | ConvertFrom-Json
@@ -220,8 +227,13 @@ if ($sessionId -and $canLoad) {
     function Read-Acp2([int]$id, [int]$timeoutMs = 45000) {
         $deadline = (Get-Date).AddMilliseconds($timeoutMs)
         while ((Get-Date) -lt $deadline) {
-            $line = $acp2.StandardOutput.ReadLine()
-            if ($null -eq $line) { Start-Sleep -Milliseconds 100; continue }
+            # Same blocking-ReadLine hazard as Read-AcpResponse — enforce the deadline.
+            $remainingMs = [int](($deadline - (Get-Date)).TotalMilliseconds)
+            if ($remainingMs -le 0) { break }
+            $read = $acp2.StandardOutput.ReadLineAsync()
+            if (-not $read.Wait($remainingMs)) { return $null }
+            $line = $read.Result
+            if ($null -eq $line) { return $null }
             if ($line.Trim() -eq "") { continue }
             try { $msg = $line | ConvertFrom-Json } catch { continue }
             if ($msg.id -eq $id) { return $msg }

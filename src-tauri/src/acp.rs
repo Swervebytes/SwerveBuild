@@ -36,6 +36,9 @@ struct SessionTransport {
     /// the app already persists messages itself, so forwarding the replay would
     /// duplicate every saved message in the UI.
     suppress_updates: AtomicBool,
+    /// Id of the in-flight `session/prompt`, so the reader can recognise its
+    /// reply and announce end-of-turn in event order (see `chat-turn-end`).
+    prompt_id: Mutex<Option<u64>>,
 }
 
 struct ActiveSession {
@@ -186,6 +189,7 @@ impl AcpManager {
             request_id: AtomicU64::new(1),
             responses: Arc::new(Mutex::new(HashMap::new())),
             suppress_updates: AtomicBool::new(false),
+            prompt_id: Mutex::new(None),
         });
         let transport_for_reader = Arc::clone(&transport);
         let app_for_reader = app.clone();
@@ -265,6 +269,23 @@ impl AcpManager {
                 }
 
                 if let Some(id) = jsonrpc_id(&value) {
+                    // The reply to the in-flight session/prompt means the turn is
+                    // over, and every session/update for it has already been
+                    // emitted above. Announce it on the SAME event channel so the
+                    // UI finalizes after the last chunk, instead of racing the
+                    // command's return value and clipping the tail.
+                    let is_prompt_reply = match transport_for_reader.prompt_id.lock() {
+                        Ok(mut slot) if *slot == Some(id) => {
+                            *slot = None;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if is_prompt_reply {
+                        let _ = app_for_reader
+                            .emit("chat-turn-end", json!({ "chatId": chat_for_reader }));
+                    }
+
                     if let Ok(mut pending) = transport_for_reader.responses.lock() {
                         if let Some(sender) = pending.remove(&id) {
                             let _ = sender.send(value);
@@ -508,6 +529,13 @@ impl SessionTransport {
 
     fn rpc(&self, method: &str, params: Value, timeout_secs: u64) -> Result<Value, String> {
         let id = self.next_id();
+        // Remember the in-flight prompt so the reader can emit chat-turn-end when
+        // its reply arrives — after every session/update for that turn.
+        if method == "session/prompt" {
+            if let Ok(mut slot) = self.prompt_id.lock() {
+                *slot = Some(id);
+            }
+        }
         let (tx, rx) = mpsc::channel();
 
         {

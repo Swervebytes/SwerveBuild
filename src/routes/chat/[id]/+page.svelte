@@ -89,7 +89,22 @@
     }
   }
 
+  // Two paths can finalize a turn (the chat-turn-end event and the send's own
+  // return); this guard keeps them from both reading `streaming` and saving the
+  // same reply twice. Whichever arrives first wins, the other no-ops.
+  let finalizing = false;
+
   async function finalizeAssistantMessage(note?: string) {
+    if (finalizing) return false;
+    finalizing = true;
+    try {
+      return await doFinalize(note);
+    } finally {
+      finalizing = false;
+    }
+  }
+
+  async function doFinalize(note?: string) {
     let text = streaming
       .filter((item) => item.role === "assistant" && item.kind === "message")
       .map((item) => item.content)
@@ -276,6 +291,14 @@
           sessionReady = true;
         }
         refreshActiveSessions();
+      }),
+      subscribe<{ chatId: string }>("chat-turn-end", (event) => {
+        // Arrives after the turn's last chunk event, so the saved reply includes
+        // the tail that finalizing on the send's return could clip.
+        if (event.payload.chatId !== $page.params.id) return;
+        void finalizeAssistantMessage().then((saved) => {
+          if (saved) workspaceStore.refresh();
+        });
       }),
     ];
     return () => offs.forEach((o) => o());

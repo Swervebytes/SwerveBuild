@@ -256,9 +256,18 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
+/// A proper JSON-RPC error object. Callers previously got either a `result`
+/// containing an "error" key (non-standard, so clients couldn't detect failure)
+/// or no reply at all.
+fn error_response(id: &Value, code: i64, message: String) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
 fn handle(request: &RpcRequest) -> Option<Value> {
     let id = request.id.clone()?;
-    let method = request.method.as_deref()?;
+    let Some(method) = request.method.as_deref() else {
+        return Some(error_response(&id, -32600, "Invalid Request: missing method".into()));
+    };
 
     let result = match method {
         "initialize" => json!({
@@ -272,8 +281,19 @@ fn handle(request: &RpcRequest) -> Option<Value> {
         "notifications/initialized" => return None,
         "tools/list" => json!({ "tools": tools() }),
         "tools/call" => {
-            let params = request.params.as_ref()?;
-            let name = params.get("name")?.as_str()?;
+            // Every request carrying an id MUST get a reply. The old `?` returned
+            // None on malformed params, sending nothing at all — a strict client
+            // then waits on that id forever.
+            let Some(params) = request.params.as_ref() else {
+                return Some(error_response(&id, -32602, "Invalid params: missing params".into()));
+            };
+            let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
+                return Some(error_response(
+                    &id,
+                    -32602,
+                    "Invalid params: missing tool name".into(),
+                ));
+            };
             let empty_args = json!({});
             let args = params.get("arguments").unwrap_or(&empty_args);
             match call_tool(name, args) {
@@ -287,7 +307,15 @@ fn handle(request: &RpcRequest) -> Option<Value> {
                 }),
             }
         }
-        _ => json!({ "error": format!("unsupported method: {method}") }),
+        other => {
+            // JSON-RPC "method not found" — not a success result that happens to
+            // contain an "error" key, which clients have no way to detect.
+            return Some(error_response(
+                &id,
+                -32601,
+                format!("Method not found: {other}"),
+            ));
+        }
     };
 
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
