@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "id": "w-example-hello",
+  "name": "Hello workflow",
+  "enabled": true,
+  "settings": { "capture": "full" },
+  "permissions": {},
+  "nodes": [
+    { "id": "t1", "type": "trigger.manual", "name": "Start", "position": [60, 200], "params": {} },
+    { "id": "n1", "type": "transform.set", "name": "Prep", "position": [300, 200], "params": {
+      "ops": [
+        { "op": "set", "path": "n", "value": 2 },
+        { "op": "set", "path": "greeting", "value": "hello from {{ $run.workflow.name }}" }
+      ]
+    }},
+    { "id": "n2", "type": "flow.if", "name": "Even?", "position": [540, 200], "params": {
+      "combine": "and",
+      "conditions": [ { "left": "{{ $json.n % 2 }}", "op": "eq", "right": 0 } ]
+    }},
+    { "id": "n3", "type": "transform.set", "name": "Even path", "position": [780, 120], "params": {
+      "ops": [ { "op": "set", "path": "parity", "value": "even" } ]
+    }},
+    { "id": "n4", "type": "transform.set", "name": "Odd path", "position": [780, 280], "params": {
+      "ops": [ { "op": "set", "path": "parity", "value": "odd" } ]
+    }},
+    { "id": "n5", "type": "flow.merge", "name": "Join", "position": [1020, 200], "params": { "mode": "append" } }
+  ],
+  "connections": [
+    { "from": "t1", "out": "main", "to": "n1", "in": "main" },
+    { "from": "n1", "out": "main", "to": "n2", "in": "main" },
+    { "from": "n2", "out": "true", "to": "n3", "in": "main" },
+    { "from": "n2", "out": "false", "to": "n4", "in": "main" },
+    { "from": "n3", "out": "main", "to": "n5", "in": "a" },
+    { "from": "n4", "out": "main", "to": "n5", "in": "b" }
+  ]
+}
