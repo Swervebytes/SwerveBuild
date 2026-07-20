@@ -2,6 +2,7 @@
   import "../app.css";
   import { onMount } from "svelte";
   import { page } from "$app/stores";
+  import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import Titlebar from "$lib/components/Titlebar.svelte";
@@ -19,6 +20,26 @@
   // Hide the feedback button on the chat page, where its bottom-right corner
   // would compete with the message composer at narrow widths.
   const showFeedback = $derived(!$page.url.pathname.startsWith("/chat/"));
+
+  // Publish route/title for MCP app_ui_state (no CDP required).
+  $effect(() => {
+    const route = $page.url.pathname;
+    const title =
+      typeof document !== "undefined" && document.title
+        ? document.title
+        : "Swerve Build";
+    const permissionModalOpen = !!permissionStore.current;
+    void invoke("publish_app_ui_state", {
+      state: {
+        route,
+        title,
+        permissionModalOpen,
+        updatedAt: new Date().toISOString(),
+      },
+    }).catch(() => {
+      /* browser / pre-window */
+    });
+  });
 
   onMount(() => {
     theme.init();

@@ -47,6 +47,10 @@
   let epMessage = $state<string | null>(null);
   let epError = $state(false);
 
+  let appUiGranted = $state(false);
+  let appUiSaving = $state(false);
+  let appUiMessage = $state<string | null>(null);
+
   const themeOptions: { value: ThemePref; label: string; icon: IconName }[] = [
     { value: "system", label: "System", icon: "settings" },
     { value: "light", label: "Light", icon: "sun" },
@@ -74,7 +78,31 @@
     } catch {
       /* model list is optional here */
     }
+    try {
+      const grant = await invoke<{ granted: boolean }>("get_app_ui_grant");
+      appUiGranted = !!grant.granted;
+    } catch {
+      appUiGranted = false;
+    }
   });
+
+  async function setAppUiGrant(next: boolean) {
+    appUiSaving = true;
+    appUiMessage = null;
+    try {
+      const grant = await invoke<{ granted: boolean }>("set_app_ui_grant", {
+        granted: next,
+      });
+      appUiGranted = !!grant.granted;
+      appUiMessage = appUiGranted
+        ? "Agents in this app may use app_ui_* tools (read-only route/title today)."
+        : "App UI control revoked.";
+    } catch (e) {
+      appUiMessage = String(e);
+    } finally {
+      appUiSaving = false;
+    }
+  }
 
   async function saveCustomIds() {
     idsSaving = true;
@@ -338,6 +366,55 @@
       {/if}
     {:else}
       <p class="group-note">Grok Build is not installed. Use the home screen to install and sign in.</p>
+    {/if}
+  </section>
+
+  <section class="card">
+    <div class="group-head">
+      <h2 class="group-title">Agent UI control</h2>
+      <StatusPill
+        tone={appUiGranted ? "warning" : "muted"}
+        label={appUiGranted ? "Granted" : "Off"}
+      />
+    </div>
+    <p class="group-note">
+      Allow the in-app agent to call <code>app_ui_*</code> MCP tools against <strong>this</strong>
+      SwerveBuild window (route/title first; click/type/screenshot after CDP lands). Off by default.
+      Never enabled for automations. Revoke anytime.
+    </p>
+    <Field
+      label="Allow agent to control SwerveBuild UI"
+      hint="First step of the self-dev loop. Does not bypass file/shell permission prompts."
+      row
+    >
+      <div class="segmented" role="radiogroup" aria-label="App UI grant">
+        <button
+          class="seg"
+          class:active={!appUiGranted}
+          type="button"
+          role="radio"
+          aria-checked={!appUiGranted}
+          disabled={appUiSaving}
+          onclick={() => setAppUiGrant(false)}
+        >
+          Off
+        </button>
+        <button
+          class="seg"
+          class:active={appUiGranted}
+          type="button"
+          role="radio"
+          aria-checked={appUiGranted}
+          disabled={appUiSaving}
+          data-testid="app-ui-grant-on"
+          onclick={() => setAppUiGrant(true)}
+        >
+          On
+        </button>
+      </div>
+    </Field>
+    {#if appUiMessage}
+      <p class="ep-msg">{appUiMessage}</p>
     {/if}
   </section>
 
