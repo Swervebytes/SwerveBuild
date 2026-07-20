@@ -730,12 +730,13 @@ async fn start_chat_session(
 
     let session_id = tauri::async_runtime::spawn_blocking(move || {
         if let Some(model) = local_model.as_deref() {
-            if let Some(other) = local_model_conflict(&acp_for_task, model) {
-                return Err(format!(
-                    "One local model runs at a time — \"{other}\" is connected on another local model. Close that chat first."
-                ));
-            }
-            local_llm::manager().ensure_for_model(&app, model)?;
+            // Lease this chat on the local model so automations / other chats
+            // cannot swap VRAM out from under a live session.
+            local_llm::manager().acquire(
+                &app,
+                &local_llm::chat_holder(&chat_id_for_task),
+                model,
+            )?;
         }
         acp_for_task.ensure_session(
             app,
@@ -773,8 +774,10 @@ fn close_chat_session(
 ) -> Result<(), String> {
     if let Some(id) = chat_id {
         acp.close_chat(&id);
+        local_llm::manager().release(&local_llm::chat_holder(&id));
     } else {
         acp.close_all();
+        local_llm::manager().release_prefix("chat:");
     }
     Ok(())
 }
@@ -1023,10 +1026,10 @@ fn add_local_model(path: String) -> Result<LocalState, String> {
 
 #[tauri::command]
 fn remove_local_model(app: tauri::AppHandle, id: String) -> Result<LocalState, String> {
-    // If the server is currently serving this model, stop it first.
+    // If the server is currently serving this model, stop only when idle.
     let status = local_llm::manager().status();
     if status.model_id.as_deref() == Some(id.as_str()) {
-        local_llm::manager().stop(&app);
+        local_llm::manager().stop_if_idle(&app)?;
     }
     providers::remove_local_model(&id)?;
     Ok(LocalState::current())
@@ -1044,28 +1047,9 @@ async fn start_local_server(app: tauri::AppHandle, model_id: String) -> Result<L
 }
 
 #[tauri::command]
-fn stop_local_server(app: tauri::AppHandle) -> LocalState {
-    local_llm::manager().stop(&app);
-    LocalState::current()
-}
-
-/// One local model runs at a time; block a swap while another ACTIVE chat is
-/// pinned to a different local model (its next message would hit the wrong
-/// server). Idle chats are fine — they respawn on their own model later.
-fn local_model_conflict(acp: &AcpManager, want: &str) -> Option<String> {
-    let active = acp.list_active();
-    let store = Store::load();
-    store
-        .chats
-        .iter()
-        .filter(|c| active.contains(&c.id))
-        .find(|c| {
-            c.model_id
-                .as_deref()
-                .map(|m| m.starts_with(grok_config::LOCAL_PREFIX) && m != want)
-                .unwrap_or(false)
-        })
-        .map(|c| c.title.clone())
+fn stop_local_server(app: tauri::AppHandle) -> Result<LocalState, String> {
+    local_llm::manager().stop_if_idle(&app)?;
+    Ok(LocalState::current())
 }
 
 // -------------------------------------------------------------- automations

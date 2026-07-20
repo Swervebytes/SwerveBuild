@@ -7,12 +7,18 @@
 //! `grok_config::apply_local_models`) — so a local model is just another `-m`
 //! choice in chats and automations, and code never leaves the machine.
 //!
+//! **GPU arbitration (Step 4):** only one GGUF is loaded at a time. Chats and
+//! automations take named leases on that model. Same-model concurrent use is
+//! allowed (`--parallel 2`); switching models while any lease is held is
+//! refused with a clear error so a chat is never yanked out from under an
+//! automation (or the reverse).
+//!
 //! Downloads, hashing, and unzip shell out to OS tools (curl.exe,
 //! Get-FileHash, Expand-Archive) to keep the dependency footprint at zero.
 
 use serde::Serialize;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -35,9 +41,52 @@ const ENGINE_SIZE: u64 = 33_271_430;
 
 /// Model load can take minutes for big GGUFs on first read (cold disk cache).
 const HEALTH_TIMEOUT_SECS: u64 = 240;
-/// Total context tokens for the server (llama-server's single default slot).
+/// Total context tokens shared across parallel slots.
 /// Grok assembles large agentic prompts — small contexts break tool calling.
 const CTX_TOKENS: u32 = 32768;
+/// Concurrent OpenAI-compatible slots so a chat + an automation can share one
+/// loaded model without serializing into a single slot.
+const PARALLEL_SLOTS: u32 = 2;
+
+/// Lease holder for a chat session (`chat:<chat_id>`).
+pub fn chat_holder(chat_id: &str) -> String {
+    format!("chat:{chat_id}")
+}
+
+/// Lease holder for an automation run (`auto:<run_id>`).
+pub fn auto_holder(run_id: &str) -> String {
+    format!("auto:{run_id}")
+}
+
+/// Pure decision used by `acquire` / `ensure_for_model` (unit-tested).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnsureAction {
+    /// Already serving `want` — no process change.
+    Keep,
+    /// Idle or stopped — start/swap to `want` is allowed.
+    StartOrSwap,
+}
+
+/// Decide whether we may load/keep `want` given the currently loaded model and
+/// active lease holders. Leases always refer to the loaded model.
+pub(crate) fn decide_ensure(
+    loaded: Option<&str>,
+    ready: bool,
+    lease_holders: &[String],
+    want: &str,
+) -> Result<EnsureAction, String> {
+    if ready && loaded == Some(want) {
+        return Ok(EnsureAction::Keep);
+    }
+    if !lease_holders.is_empty() {
+        let who = lease_holders.join(", ");
+        let have = loaded.unwrap_or("(unknown)");
+        return Err(format!(
+            "Local model \"{have}\" is in use ({who}). Finish or close that work before switching to \"{want}\"."
+        ));
+    }
+    Ok(EnsureAction::StartOrSwap)
+}
 
 pub fn engine_dir() -> PathBuf {
     crate::paths::data_dir().join("engine").join(ENGINE_TAG)
@@ -206,6 +255,9 @@ struct Inner {
     model_id: Option<String>,
     port: Option<u16>,
     child: Option<Child>,
+    /// Active users of the loaded model (`chat:…`, `auto:…`). Non-empty blocks
+    /// model swaps and idle stops so concurrent paths can't yank VRAM.
+    leases: HashMap<String, ()>,
     /// Ring buffer of recent stderr lines for error reporting.
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
@@ -220,6 +272,8 @@ pub struct ServerStatus {
     pub model_id: Option<String>,
     pub port: Option<u16>,
     pub message: Option<String>,
+    /// Holders currently leasing the loaded model (empty when idle).
+    pub leases: Vec<String>,
 }
 
 static MANAGER: OnceLock<LlmManager> = OnceLock::new();
@@ -233,6 +287,7 @@ pub fn manager() -> &'static LlmManager {
             model_id: None,
             port: None,
             child: None,
+            leases: HashMap::new(),
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
         }),
     })
@@ -251,26 +306,94 @@ impl LlmManager {
             State::Ready => ("ready", None),
             State::Failed(e) => ("failed", Some(e.clone())),
         };
+        let mut leases: Vec<String> = inner.leases.keys().cloned().collect();
+        leases.sort();
         ServerStatus {
             state: state.to_string(),
             model_id: inner.model_id.clone(),
             port: inner.port,
             message,
+            leases,
         }
     }
 
-    /// Make sure the server is Ready and serving `model_id`. Swaps models by
-    /// stopping the old server first (callers enforce the in-use policy).
-    /// Blocking — call from a blocking task/thread. Emits `local-llm-status`.
+    fn lease_holders_locked(inner: &Inner) -> Vec<String> {
+        let mut h: Vec<String> = inner.leases.keys().cloned().collect();
+        h.sort();
+        h
+    }
+
+    /// Make sure the server is Ready and serving `model_id`. Swaps only when
+    /// no leases are held. Blocking — call from a blocking task/thread.
     pub fn ensure_for_model(&self, app: &AppHandle, model_id: &str) -> Result<(), String> {
+        let action = {
+            let inner = self.inner.lock().expect("llm lock");
+            decide_ensure(
+                inner.model_id.as_deref(),
+                inner.state == State::Ready,
+                &Self::lease_holders_locked(&inner),
+                model_id,
+            )?
+        };
+        match action {
+            EnsureAction::Keep => Ok(()),
+            EnsureAction::StartOrSwap => {
+                self.stop(app);
+                self.start(app, model_id)
+            }
+        }
+    }
+
+    /// Ensure `model_id` is loaded and record `holder` as using it until
+    /// [`release`]. Same-model concurrent holders share the server; different
+    /// models are blocked while any holder remains.
+    pub fn acquire(
+        &self,
+        app: &AppHandle,
+        holder: &str,
+        model_id: &str,
+    ) -> Result<(), String> {
+        self.ensure_for_model(app, model_id)?;
+        let mut inner = self.inner.lock().expect("llm lock");
+        // Re-check after start: another path may have raced (shouldn't with the
+        // process-wide mutex held across ensure's critical sections, but keep
+        // the lease book consistent with the loaded model).
+        if inner.state != State::Ready || inner.model_id.as_deref() != Some(model_id) {
+            return Err(format!(
+                "Local model \"{model_id}\" failed to stay ready for {holder}"
+            ));
+        }
+        inner.leases.insert(holder.to_string(), ());
+        drop(inner);
+        emit_status(app, &self.status());
+        Ok(())
+    }
+
+    /// Drop a holder lease. Does not stop the server (leave it warm).
+    pub fn release(&self, holder: &str) {
+        let mut inner = self.inner.lock().expect("llm lock");
+        inner.leases.remove(holder);
+    }
+
+    /// Release every lease whose holder starts with `prefix` (e.g. `chat:`).
+    pub fn release_prefix(&self, prefix: &str) {
+        let mut inner = self.inner.lock().expect("llm lock");
+        inner.leases.retain(|h, _| !h.starts_with(prefix));
+    }
+
+    /// Stop only when idle (no leases). Used by Settings stop / remove.
+    pub fn stop_if_idle(&self, app: &AppHandle) -> Result<(), String> {
         {
             let inner = self.inner.lock().expect("llm lock");
-            if inner.state == State::Ready && inner.model_id.as_deref() == Some(model_id) {
-                return Ok(());
+            if !inner.leases.is_empty() {
+                let who = Self::lease_holders_locked(&inner).join(", ");
+                return Err(format!(
+                    "Local model is in use ({who}). Close those chats/runs before stopping the server."
+                ));
             }
         }
         self.stop(app);
-        self.start(app, model_id)
+        Ok(())
     }
 
     fn start(&self, app: &AppHandle, model_id: &str) -> Result<(), String> {
@@ -321,6 +444,9 @@ impl LlmManager {
                 "-a", model_id,
                 "-ngl", "999",
                 "-c", &CTX_TOKENS.to_string(),
+                // Chat + automation may share one loaded GGUF (lease arbitration
+                // still forbids a different model while either holds a lease).
+                "--parallel", &PARALLEL_SLOTS.to_string(),
                 "--jinja",
                 "--no-webui",
             ])
@@ -432,6 +558,8 @@ impl LlmManager {
             }
             inner.state = State::Stopped;
             inner.model_id = None;
+            // Force-stop drops leases — process is gone; holders must re-acquire.
+            inner.leases.clear();
         }
         emit_status(app, &self.status());
     }
@@ -445,6 +573,57 @@ impl LlmManager {
         }
         inner.state = State::Stopped;
         inner.model_id = None;
+        inner.leases.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_model_keeps_server_even_with_leases() {
+        let action = decide_ensure(
+            Some("swerve-local-a"),
+            true,
+            &["chat:1".into(), "auto:run".into()],
+            "swerve-local-a",
+        );
+        assert_eq!(action, Ok(EnsureAction::Keep));
+    }
+
+    #[test]
+    fn idle_swap_allowed() {
+        let action = decide_ensure(Some("swerve-local-a"), true, &[], "swerve-local-b");
+        assert_eq!(action, Ok(EnsureAction::StartOrSwap));
+    }
+
+    #[test]
+    fn busy_swap_blocked() {
+        let err = decide_ensure(
+            Some("swerve-local-a"),
+            true,
+            &["chat:1".into()],
+            "swerve-local-b",
+        )
+        .expect_err("must block");
+        assert!(err.contains("in use"), "{err}");
+        assert!(err.contains("swerve-local-a"), "{err}");
+        assert!(err.contains("swerve-local-b"), "{err}");
+        assert!(err.contains("chat:1"), "{err}");
+    }
+
+    #[test]
+    fn stopped_starts_even_if_stale_holders_absent() {
+        // No leases → start from stopped.
+        let action = decide_ensure(None, false, &[], "swerve-local-a");
+        assert_eq!(action, Ok(EnsureAction::StartOrSwap));
+    }
+
+    #[test]
+    fn automation_and_chat_holders_format() {
+        assert_eq!(chat_holder("abc"), "chat:abc");
+        assert_eq!(auto_holder("run-1"), "auto:run-1");
     }
 }
 

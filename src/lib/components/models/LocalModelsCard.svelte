@@ -11,6 +11,8 @@
     model_id: string | null;
     port: number | null;
     message: string | null;
+    /** Active chat:/auto: leases (GPU arbitration). */
+    leases?: string[];
   };
   type LocalModel = {
     id: string;
@@ -146,7 +148,11 @@
     return "muted";
   }
   function serverLabel(server: ServerStatus): string {
-    if (server.state === "ready") return `Serving ${server.model_id ?? "?"}`;
+    if (server.state === "ready") {
+      const n = server.leases?.length ?? 0;
+      const base = `Serving ${server.model_id ?? "?"}`;
+      return n > 0 ? `${base} · ${n} in use` : base;
+    }
     if (server.state === "starting") return `Loading ${server.model_id ?? "…"}`;
     if (server.state === "failed") return "Failed";
     return "Stopped";
