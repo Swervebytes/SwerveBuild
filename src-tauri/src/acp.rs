@@ -89,6 +89,8 @@ impl AcpManager {
                 let _ = active.child.wait();
             }
         }
+        // Free any local-model VRAM lease held by this chat.
+        crate::local_llm::manager().release(&crate::local_llm::chat_holder(chat_id));
     }
 
     pub fn close_all(&self) {
@@ -103,6 +105,7 @@ impl AcpManager {
                 let _ = active.child.wait();
             }
         }
+        crate::local_llm::manager().release_prefix("chat:");
     }
 
     pub fn ensure_session(
@@ -379,6 +382,10 @@ impl AcpManager {
                         let _ = active.child.kill();
                         let _ = active.child.wait();
                     }
+                    // Session died — drop the local-model lease so automations
+                    // are not blocked by a ghost chat holder.
+                    crate::local_llm::manager()
+                        .release(&crate::local_llm::chat_holder(&chat_for_cleanup));
                 }
             }
             let _ = app_for_reader.emit(

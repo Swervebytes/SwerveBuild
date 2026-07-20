@@ -783,14 +783,16 @@ impl JobManager {
 
         let args = build_grok_args(&exec, &prompt_path.to_string_lossy());
 
-        // Local model? The app's llama-server must be serving it before grok
-        // launches — bring it up (or fail the run with a clear message).
-        if let Some(model) = exec
+        // Local model? Lease the app's llama-server so a chat (or another run)
+        // cannot swap the GGUF out from under us mid-run. Released when the
+        // waiter thread finishes (success, fail, cancel, timeout).
+        let local_lease = exec
             .model
             .as_deref()
             .filter(|m| m.starts_with(crate::grok_config::LOCAL_PREFIX))
-        {
-            if let Err(e) = crate::local_llm::manager().ensure_for_model(&app, model) {
+            .map(|m| (crate::local_llm::auto_holder(&run_id), m.to_string()));
+        if let Some((holder, model)) = local_lease.as_ref() {
+            if let Err(e) = crate::local_llm::manager().acquire(&app, holder, model) {
                 let msg = format!("local model unavailable: {e}");
                 let rec = self.launch_failed_record(&automation_id, &run_id, &trigger_reason, attempt, &automation.executor.mode, &msg);
                 let _ = write_run_record(&rec);
@@ -818,6 +820,9 @@ impl JobManager {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
+                if let Some((holder, _)) = local_lease.as_ref() {
+                    crate::local_llm::manager().release(holder);
+                }
                 let rec = self.launch_failed_record(&automation_id, &run_id, &trigger_reason, attempt, &automation.executor.mode, &e.to_string());
                 let _ = write_run_record(&rec);
                 let _ = app.emit(
@@ -947,7 +952,19 @@ impl JobManager {
         let timeout = exec.timeout_secs.max(10);
         let app_wait = app.clone();
         let run_id_w = run_id.clone();
+        let local_lease_holder = local_lease.map(|(h, _)| h);
         thread::spawn(move || {
+            // Always release the local-model lease when this run ends.
+            struct ReleaseOnDrop(Option<String>);
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) {
+                    if let Some(h) = self.0.take() {
+                        crate::local_llm::manager().release(&h);
+                    }
+                }
+            }
+            let _lease_guard = ReleaseOnDrop(local_lease_holder);
+
             let deadline = Instant::now() + Duration::from_secs(timeout);
             let mut cancelled = false;
             let mut timed_out = false;
