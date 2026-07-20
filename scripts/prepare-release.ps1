@@ -33,7 +33,16 @@ try {
     Pop-Location
 
     Write-Host "Running Tauri bundle (externalBin via overlay, conf untouched)..." -ForegroundColor Cyan
-    npm run tauri -- build --config $overlay
+    # Call the CLI binary directly. `npm run tauri -- build --config …` is unsafe:
+    # npm steals `--config` as its own flag and forwards the path to cargo.
+    $tauriCli = Join-Path $root "node_modules\.bin\tauri.cmd"
+    if (-not (Test-Path $tauriCli)) {
+        throw "Missing Tauri CLI: $tauriCli (run npm install)"
+    }
+    & $tauriCli build --config $overlay
+    if ($LASTEXITCODE -ne 0) {
+        throw "tauri build failed with exit code $LASTEXITCODE"
+    }
 
     Write-Host "`nRelease artifacts: src-tauri/target/release/bundle/" -ForegroundColor Green
     Write-Host "Tag path (after main is clean + CI green): git tag -a v0.2.1 -m 'v0.2.1'; git push origin main --tags" -ForegroundColor DarkGray
