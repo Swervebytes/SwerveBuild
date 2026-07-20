@@ -157,6 +157,9 @@ pub struct LocalConfig {
     pub api_token: Option<String>,
     #[serde(default)]
     pub models: Vec<LocalModel>,
+    /// Folder for catalog downloads (Phase 3). None → `~/.swervebuild/models/`.
+    #[serde(default)]
+    pub models_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

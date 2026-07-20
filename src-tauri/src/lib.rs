@@ -3,6 +3,7 @@ mod env_context;
 mod grok_config;
 mod jobs;
 mod local_llm;
+mod model_catalog;
 pub mod paths;
 mod providers;
 mod store;
@@ -1062,6 +1063,36 @@ fn stop_local_server(app: tauri::AppHandle) -> Result<LocalState, String> {
     Ok(LocalState::current())
 }
 
+// -------------------------------------------------------- model catalog (P3)
+
+#[tauri::command]
+fn get_model_catalog() -> model_catalog::CatalogState {
+    model_catalog::catalog_state()
+}
+
+#[tauri::command]
+fn set_models_dir(path: String) -> Result<model_catalog::CatalogState, String> {
+    model_catalog::set_models_dir(path)?;
+    Ok(model_catalog::catalog_state())
+}
+
+/// Download a curated catalog GGUF (resumable) and register it for pickers.
+#[tauri::command]
+async fn download_catalog_model(
+    app: tauri::AppHandle,
+    catalog_id: String,
+) -> Result<CommandResult, String> {
+    let message = tauri::async_runtime::spawn_blocking(move || {
+        model_catalog::download_catalog_model(&app, &catalog_id)
+    })
+    .await
+    .map_err(|e| format!("download task failed: {e}"))??;
+    Ok(CommandResult {
+        success: true,
+        message,
+    })
+}
+
 // -------------------------------------------------------------- automations
 
 #[tauri::command]
@@ -1214,6 +1245,9 @@ pub fn run() {
             remove_local_model,
             start_local_server,
             stop_local_server,
+            get_model_catalog,
+            set_models_dir,
+            download_catalog_model,
             list_automations,
             save_automation,
             delete_automation,

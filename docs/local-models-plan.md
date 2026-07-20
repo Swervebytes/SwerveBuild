@@ -133,6 +133,11 @@ The one-click flow from the vision:
 - On completion: auto-register → model appears in pickers. Delete/manage UI.
 - Acceptance: fresh machine → download → selected in a chat and a trigger with no
   manual steps beyond choosing the folder.
+- **Shipped S06 (v1):** `model_catalog.rs` — 3 Qwen2.5-Coder Q4_K_M rows
+  (1.5B / 7B / 14B, bartowski HF, non-gated); `nvidia-smi` fit tiers;
+  default `~/.swervebuild/models/` + folder picker; free-space gate; resumable
+  `curl -C -` download + auto-register; Settings catalog UI in
+  `LocalModelsCard`. Manage/remove remains the existing registry UI.
 
 ### Phase 4 — Polish
 - `--reasoning-effort` in the picker for hosted reasoning models (flag exists).
