@@ -1,0 +1,282 @@
+//! Minimal Chrome DevTools Protocol client for the main WebView2.
+//!
+//! Connects to the localhost remote-debugging port published by the running
+//! SwerveBuild process. Used by MCP `app_ui_*` drive tools (out-of-process).
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+const IO_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// One entry from `GET /json/list` (WebView2 / Chromium debugger).
+#[derive(Debug, Clone)]
+pub struct CdpTarget {
+    #[allow(dead_code)]
+    pub id: String,
+    #[allow(dead_code)]
+    pub title: String,
+    pub url: String,
+    pub web_socket_debugger_url: String,
+    pub target_type: String,
+}
+
+/// HTTP GET against the CDP discovery HTTP server (not the page WebSocket).
+pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
+    let mut stream = TcpStream::connect((host, port)).map_err(|e| {
+        format!("CDP HTTP connect {host}:{port} failed: {e}. Is SwerveBuild running with CDP enabled?")
+    })?;
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("CDP HTTP write: {e}"))?;
+
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("CDP HTTP read: {e}"))?;
+    let raw = String::from_utf8_lossy(&buf);
+    let body = split_http_body(&raw).ok_or_else(|| {
+        format!("CDP HTTP: no body in response ({} bytes)", buf.len())
+    })?;
+    Ok(body.to_string())
+}
+
+fn split_http_body(raw: &str) -> Option<&str> {
+    // Handle both CRLF and LF separators.
+    if let Some(i) = raw.find("\r\n\r\n") {
+        return Some(&raw[i + 4..]);
+    }
+    if let Some(i) = raw.find("\n\n") {
+        return Some(&raw[i + 2..]);
+    }
+    None
+}
+
+/// List debugger targets. Prefers page-type targets with a websocket URL.
+pub fn list_targets(host: &str, port: u16) -> Result<Vec<CdpTarget>, String> {
+    // WebView2 accepts both /json and /json/list.
+    let body = http_get(host, port, "/json/list")
+        .or_else(|_| http_get(host, port, "/json"))?;
+    let arr: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("CDP /json parse: {e}; body starts: {}", trunc(&body, 120)))?;
+    let list = arr
+        .as_array()
+        .ok_or_else(|| "CDP /json: expected array".to_string())?;
+    let mut out = Vec::new();
+    for item in list {
+        let ws = item
+            .get("webSocketDebuggerUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if ws.is_empty() {
+            continue;
+        }
+        out.push(CdpTarget {
+            id: item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            title: item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            url: item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            web_socket_debugger_url: ws,
+            target_type: item
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Pick the main app page target (prefer type=page, non-devtools URL).
+pub fn pick_main_target(targets: &[CdpTarget]) -> Result<&CdpTarget, String> {
+    let page = targets.iter().find(|t| {
+        t.target_type == "page"
+            && !t.url.starts_with("devtools://")
+            && !t.web_socket_debugger_url.is_empty()
+    });
+    if let Some(t) = page {
+        return Ok(t);
+    }
+    targets
+        .iter()
+        .find(|t| !t.web_socket_debugger_url.is_empty() && !t.url.starts_with("devtools://"))
+        .ok_or_else(|| {
+            "CDP: no page target found. Wait for the main window to finish loading.".into()
+        })
+}
+
+/// Send one CDP command and wait for the matching id response.
+pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value, String> {
+    cdp_call_id(ws_url, 1, method, params)
+}
+
+fn cdp_call_id(ws_url: &str, id: u64, method: &str, params: Value) -> Result<Value, String> {
+    let (mut socket, _resp) = tungstenite::connect(ws_url)
+        .map_err(|e| format!("CDP WebSocket connect failed: {e}"))?;
+
+    // Best-effort timeouts on the underlying TCP stream (plain localhost).
+    {
+        use tungstenite::stream::MaybeTlsStream;
+        if let MaybeTlsStream::Plain(tcp) = socket.get_mut() {
+            let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
+        }
+    }
+
+    let msg = json!({ "id": id, "method": method, "params": params });
+    let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
+    socket
+        .send(tungstenite::Message::Text(text.into()))
+        .map_err(|e| format!("CDP send {method}: {e}"))?;
+
+    let deadline = std::time::Instant::now() + IO_TIMEOUT;
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("CDP timeout waiting for {method} response"));
+        }
+        let msg = socket
+            .read()
+            .map_err(|e| format!("CDP read {method}: {e}"))?;
+        match msg {
+            tungstenite::Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t)
+                    .map_err(|e| format!("CDP response JSON: {e}"))?;
+                if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+                    if let Some(err) = v.get("error") {
+                        return Err(format!(
+                            "CDP {method} error: {}",
+                            err.get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or(&err.to_string())
+                        ));
+                    }
+                    return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                }
+                // Event — ignore and continue.
+            }
+            tungstenite::Message::Ping(p) => {
+                let _ = socket.send(tungstenite::Message::Pong(p));
+            }
+            tungstenite::Message::Close(_) => {
+                return Err(format!("CDP WebSocket closed while waiting for {method}"));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Capture a PNG of the page via `Page.captureScreenshot`.
+pub fn capture_screenshot_png(ws_url: &str) -> Result<Vec<u8>, String> {
+    let result = cdp_call(
+        ws_url,
+        "Page.captureScreenshot",
+        json!({ "format": "png", "fromSurface": true }),
+    )?;
+    let b64 = result
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "CDP Page.captureScreenshot: missing data".to_string())?;
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("CDP screenshot base64 decode: {e}"))
+}
+
+/// Run a JS expression and return the remote object value (Runtime.evaluate).
+pub fn evaluate(ws_url: &str, expression: &str) -> Result<Value, String> {
+    let result = cdp_call(
+        ws_url,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true,
+        }),
+    )?;
+    if result
+        .get("exceptionDetails")
+        .is_some()
+    {
+        let text = result
+            .pointer("/exceptionDetails/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("JS exception");
+        let desc = result
+            .pointer("/exceptionDetails/exception/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(format!("CDP evaluate exception: {text} {desc}").trim().into());
+    }
+    Ok(result
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// Probe whether the CDP HTTP endpoint answers (drive ready).
+pub fn probe(host: &str, port: u16) -> bool {
+    http_get(host, port, "/json/version")
+        .or_else(|_| http_get(host, port, "/json/list"))
+        .or_else(|_| http_get(host, port, "/json"))
+        .is_ok()
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_http_body_crlf() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+        assert_eq!(split_http_body(raw), Some("[]"));
+    }
+
+    #[test]
+    fn pick_main_prefers_page() {
+        let targets = vec![
+            CdpTarget {
+                id: "1".into(),
+                title: "DevTools".into(),
+                url: "devtools://x".into(),
+                web_socket_debugger_url: "ws://127.0.0.1/1".into(),
+                target_type: "page".into(),
+            },
+            CdpTarget {
+                id: "2".into(),
+                title: "Swerve".into(),
+                url: "http://localhost:1420/".into(),
+                web_socket_debugger_url: "ws://127.0.0.1/2".into(),
+                target_type: "page".into(),
+            },
+        ];
+        let t = pick_main_target(&targets).unwrap();
+        assert_eq!(t.id, "2");
+    }
+}

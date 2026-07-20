@@ -88,23 +88,23 @@ fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "app_ui_screenshot".into(),
-            description: "Capture the SwerveBuild window (CDP). Not implemented until drive lands; returns a clear error.".into(),
+            description: "Capture the main SwerveBuild WebView as PNG via CDP. Returns artifact id + path under ~/.swervebuild/app_ui_artifacts/. Requires Settings → Agent UI control grant and a running S08+ app with CDP.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
             name: "app_ui_click".into(),
-            description: "Click a control in the SwerveBuild UI. Not implemented until CDP drive lands.".into(),
+            description: "Click a control in the SwerveBuild UI via CDP. Pass a CSS selector or bare data-testid (e.g. app-ui-grant-on). Requires grant + running app with CDP.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "CSS selector or role+name hint" }
+                    "selector": { "type": "string", "description": "CSS selector or bare data-testid token" }
                 },
                 "required": ["selector"]
             }),
         },
         ToolDef {
             name: "app_ui_type".into(),
-            description: "Type into a SwerveBuild UI field. Not implemented until CDP drive lands.".into(),
+            description: "Type into a SwerveBuild UI field. Not implemented yet (screenshot + click ship first).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -116,7 +116,7 @@ fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "app_ui_press".into(),
-            description: "Send a key to the SwerveBuild UI. Not implemented until CDP drive lands.".into(),
+            description: "Send a key to the SwerveBuild UI. Not implemented yet.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -127,7 +127,7 @@ fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "app_ui_wait".into(),
-            description: "Wait for a UI condition. Not implemented until CDP drive lands.".into(),
+            description: "Wait for a UI condition. Not implemented yet.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -143,7 +143,7 @@ fn tools() -> Vec<ToolDef> {
 fn app_ui_not_implemented(tool: &str) -> Result<Value, String> {
     swerve_build_lib::app_ui::require_grant()?;
     Err(format!(
-        "{tool}: not_implemented — CDP attach to the main WebView is not shipped yet. Grant is active; use app_ui_state / app_ui_snapshot for read-only route/title."
+        "{tool}: not_implemented — use app_ui_screenshot / app_ui_click (CDP) for drive; type/press/wait come later."
     ))
 }
 
@@ -347,17 +347,27 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .get("permissionModalOpen")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let drive_ready = report
+                .get("driveReady")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let digest = format!(
-                "SwerveBuild UI digest (published state, not full DOM)\nroute: {route}\ntitle: {title}\npermission_modal_open: {modal}\ndrive_ready: false"
+                "SwerveBuild UI digest (published state, not full DOM)\nroute: {route}\ntitle: {title}\npermission_modal_open: {modal}\ndrive_ready: {drive_ready}"
             );
             // Soft cap — keep under agent context budgets.
             let capped: String = digest.chars().take(4_000).collect();
             Ok(json!({ "digest": capped, "chars": capped.chars().count() }))
         }
         "app_ui_screenshot" | "swervebuild_app_ui_screenshot" => {
-            app_ui_not_implemented("app_ui_screenshot")
+            swerve_build_lib::app_ui::screenshot()
         }
-        "app_ui_click" | "swervebuild_app_ui_click" => app_ui_not_implemented("app_ui_click"),
+        "app_ui_click" | "swervebuild_app_ui_click" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "selector required".to_string())?;
+            swerve_build_lib::app_ui::click(selector)
+        }
         "app_ui_type" | "swervebuild_app_ui_type" => app_ui_not_implemented("app_ui_type"),
         "app_ui_press" | "swervebuild_app_ui_press" => app_ui_not_implemented("app_ui_press"),
         "app_ui_wait" | "swervebuild_app_ui_wait" => app_ui_not_implemented("app_ui_wait"),

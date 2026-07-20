@@ -1,5 +1,6 @@
 mod acp;
 pub mod app_ui;
+mod app_ui_cdp;
 mod env_context;
 mod grok_config;
 mod jobs;
@@ -1193,6 +1194,12 @@ fn publish_app_ui_state(state: app_ui::AppUiPublishedState) -> Result<app_ui::Ap
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Enable WebView2 remote debugging *before* any webview is created so MCP
+    // app_ui_* tools can attach CDP on localhost (grant-gated).
+    if let Err(e) = app_ui::prepare_webview_cdp() {
+        eprintln!("[swervebuild] prepare_webview_cdp: {e}");
+    }
+
     let acp = Arc::new(AcpManager::default());
     let acp_exit = acp.clone();
     let job_mgr = Arc::new(JobManager::default());
