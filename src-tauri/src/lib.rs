@@ -13,7 +13,7 @@ use providers::{ProviderStatus, ProviderView};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use store::{AppStore, Chat, ChatMessage, MessagePart, Project, Store};
 use std::sync::Arc;
 use tauri::{Manager, State};
@@ -97,6 +97,24 @@ fn is_authenticated() -> bool {
     grok_home().join("auth.json").is_file()
 }
 
+// ---------------------------------------------------------------------------
+// Pinned Grok Build CLI install (A5)
+//
+// Never pipe a remote script to iex. Download the Windows binary at a fixed
+// version, SHA-256 verify, then place it under ~/.grok/bin. Bump all four
+// constants together via the DEPENDENCIES.md upgrade ritual.
+// Recorded 2026-07-20 from https://x.ai/cli/stable → 0.2.106.
+// ---------------------------------------------------------------------------
+/// Pinned Grok CLI release tag (semver without `v`).
+pub const GROK_CLI_VERSION: &str = "0.2.106";
+const GROK_CLI_URL: &str = "https://x.ai/cli/grok-0.2.106-windows-x86_64.exe";
+/// Fallback when the Cloudflare-fronted x.ai host is unreachable (same artifact
+/// layout as the official install.ps1).
+const GROK_CLI_URL_FALLBACK: &str =
+    "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-0.2.106-windows-x86_64.exe";
+const GROK_CLI_SHA256: &str = "A6A25D55DAADCA0C2458A5ACEB4C1873EB7C76964EF307647D079E344C53969A";
+const GROK_CLI_SIZE: u64 = 130_120_520;
+
 #[tauri::command]
 fn get_grok_status() -> GrokStatus {
     let path = resolve_grok_executable();
@@ -123,40 +141,184 @@ fn get_grok_status() -> GrokStatus {
 
 #[tauri::command]
 async fn install_grok() -> CommandResult {
-    // The installer takes minutes; running it synchronously on the main thread
-    // froze the entire UI until it finished. Do it on a blocking worker instead.
-    tauri::async_runtime::spawn_blocking(|| {
-        let script = "irm https://x.ai/cli/install.ps1 | iex";
-        let status = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                script,
-            ])
-            .status();
+    // Download + hash can take minutes; never block the UI thread.
+    tauri::async_runtime::spawn_blocking(install_grok_pinned)
+        .await
+        .unwrap_or_else(|e| CommandResult {
+            success: false,
+            message: format!("Install task failed: {e}"),
+        })
+}
 
-        match status {
-            Ok(result) if result.success() => CommandResult {
-                success: true,
-                message: "Grok Build installed successfully.".into(),
-            },
-            Ok(result) => CommandResult {
-                success: false,
-                message: format!("Installer exited with code {:?}", result.code()),
-            },
-            Err(error) => CommandResult {
-                success: false,
-                message: format!("Failed to run installer: {error}"),
-            },
+/// Download the pinned Grok CLI binary, verify SHA-256, install to `~/.grok/bin`.
+/// Blocking — call only from a worker thread (`spawn_blocking`).
+fn install_grok_pinned() -> CommandResult {
+    match install_grok_pinned_inner() {
+        Ok(message) => CommandResult {
+            success: true,
+            message,
+        },
+        Err(message) => CommandResult {
+            success: false,
+            message,
+        },
+    }
+}
+
+fn install_grok_pinned_inner() -> Result<String, String> {
+    // Already on the pin? Skip the ~124 MB download.
+    if let Some(path) = resolve_grok_executable() {
+        if let Some(ver) = grok_version_at(&path) {
+            if version_matches_pin(&ver, GROK_CLI_VERSION) {
+                return Ok(format!(
+                    "Grok Build v{GROK_CLI_VERSION} is already installed at {}.",
+                    path.display()
+                ));
+            }
         }
-    })
-    .await
-    .unwrap_or_else(|e| CommandResult {
-        success: false,
-        message: format!("Install task failed: {e}"),
-    })
+    }
+
+    let home = grok_home();
+    let download_dir = home.join("downloads");
+    let bin_dir = home.join("bin");
+    fs::create_dir_all(&download_dir).map_err(|e| format!("create downloads dir: {e}"))?;
+    fs::create_dir_all(&bin_dir).map_err(|e| format!("create bin dir: {e}"))?;
+
+    let staged = download_dir.join(format!("grok-{GROK_CLI_VERSION}-windows-x86_64.exe"));
+    // Fresh download each attempt so a partial/corrupt file can't pass if size
+    // happens to match later (checksum is the real gate either way).
+    let _ = fs::remove_file(&staged);
+
+    download_with_curl(GROK_CLI_URL, &staged)
+        .or_else(|primary_err| {
+            download_with_curl(GROK_CLI_URL_FALLBACK, &staged).map_err(|fallback_err| {
+                format!(
+                    "download failed (primary: {primary_err}; fallback: {fallback_err})"
+                )
+            })
+        })?;
+
+    let hash = file_sha256(&staged)?;
+    if !hash.eq_ignore_ascii_case(GROK_CLI_SHA256) {
+        let _ = fs::remove_file(&staged);
+        return Err(format!(
+            "Grok CLI checksum mismatch (got {hash}, expected {GROK_CLI_SHA256}); download removed — try again or re-pin via DEPENDENCIES ritual"
+        ));
+    }
+
+    // Official installer places both names; keep parity so either works.
+    for name in ["grok.exe", "agent.exe"] {
+        install_binary_locked(&staged, &bin_dir.join(name))?;
+    }
+
+    // Best-effort User PATH so shells outside SwerveBuild find the binary.
+    let _ = ensure_user_path_has(&bin_dir);
+
+    let installed = bin_dir.join("grok.exe");
+    let reported = grok_version_at(&installed).unwrap_or_else(|| GROK_CLI_VERSION.to_string());
+    Ok(format!(
+        "Grok Build {reported} installed to {} (pinned v{GROK_CLI_VERSION}).",
+        installed.display()
+    ))
+}
+
+fn version_matches_pin(reported: &str, pin: &str) -> bool {
+    // `grok --version` may print "grok 0.2.106", "v0.2.106", or just "0.2.106".
+    // Tokenize so "0.2.1060" does not match pin "0.2.106".
+    reported
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .map(|tok| tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-'))
+        .map(|tok| tok.trim_start_matches('v'))
+        .any(|tok| tok == pin)
+}
+
+fn download_with_curl(url: &str, dest: &Path) -> Result<(), String> {
+    let status = util::hidden_command("curl.exe")
+        .args([
+            "-L",
+            "--fail",
+            "--retry",
+            "3",
+            "-o",
+            &dest.display().to_string(),
+            url,
+        ])
+        .status()
+        .map_err(|e| format!("could not run curl.exe: {e}"))?;
+    if !status.success() {
+        let _ = fs::remove_file(dest);
+        return Err(format!("curl exit {:?}", status.code()));
+    }
+    let size = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        let _ = fs::remove_file(dest);
+        return Err("download was empty".into());
+    }
+    // Soft size check — warn via error if wildly wrong (checksum still authoritative).
+    if size != GROK_CLI_SIZE && !(size > GROK_CLI_SIZE / 2 && size < GROK_CLI_SIZE * 2) {
+        // still allow if hash matches later; only reject absurd sizes
+        if size < 1_000_000 {
+            let _ = fs::remove_file(dest);
+            return Err(format!("download too small ({size} bytes)"));
+        }
+    }
+    Ok(())
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let output = util::hidden_command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash",
+                path.display().to_string().replace('\'', "''")
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("hash: {e}"))?;
+    if !output.status.success() {
+        return Err("hashing the download failed".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Copy `src` onto `dest`, renaming a locked existing file to `.old` when needed
+/// (mirrors official install.ps1 locked-file handling).
+fn install_binary_locked(src: &Path, dest: &Path) -> Result<(), String> {
+    let old = dest.with_extension("exe.old");
+    let _ = fs::remove_file(&old);
+    match fs::copy(src, dest) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            if dest.exists() {
+                let _ = fs::rename(dest, &old);
+            }
+            fs::copy(src, dest).map_err(|e| format!("install {}: {e}", dest.display()))?;
+            Ok(())
+        }
+    }
+}
+
+/// Append `dir` to the user's PATH if missing. Best-effort — install still
+/// succeeds if PATH update fails (we resolve `~/.grok/bin` directly).
+fn ensure_user_path_has(dir: &Path) -> Result<(), String> {
+    let dir_s = dir.display().to_string();
+    let output = util::hidden_command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$d = '{}'; $p = [Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p = '' }}; $parts = $p -split ';' | Where-Object {{ $_ -ne '' }}; if ($parts -notcontains $d) {{ $new = (@($d) + $parts) -join ';'; [Environment]::SetEnvironmentVariable('Path', $new, 'User') }}",
+                dir_s.replace('\'', "''")
+            ),
+        ])
+        .status()
+        .map_err(|e| format!("PATH update: {e}"))?;
+    if !output.success() {
+        return Err("PATH update failed".into());
+    }
+    Ok(())
 }
 
 fn spawn_hidden_grok_login(grok: &Path) -> std::io::Result<()> {
@@ -1073,4 +1235,41 @@ pub fn run() {
                 local_llm::manager().shutdown();
             }
         });
+}
+
+#[cfg(test)]
+mod grok_install_tests {
+    use super::*;
+
+    #[test]
+    fn pin_constants_agree() {
+        assert!(
+            GROK_CLI_URL.contains(GROK_CLI_VERSION),
+            "primary URL must embed the pin version"
+        );
+        assert!(
+            GROK_CLI_URL_FALLBACK.contains(GROK_CLI_VERSION),
+            "fallback URL must embed the pin version"
+        );
+        assert_eq!(
+            GROK_CLI_SHA256.len(),
+            64,
+            "SHA-256 hex should be 64 chars"
+        );
+        assert!(GROK_CLI_SIZE > 10_000_000, "binary should be multi-MB");
+        // A5 regression: never ship the unpinned remote-script pipe.
+        assert!(
+            !GROK_CLI_URL.contains("install.ps1") && !GROK_CLI_URL.contains("install.sh"),
+            "must pin the binary artifact, not the install script"
+        );
+    }
+
+    #[test]
+    fn version_match_accepts_common_grok_output() {
+        assert!(version_matches_pin("0.2.106", "0.2.106"));
+        assert!(version_matches_pin("grok 0.2.106", "0.2.106"));
+        assert!(version_matches_pin("grok-cli v0.2.106", "0.2.106"));
+        assert!(!version_matches_pin("0.2.93", "0.2.106"));
+        assert!(!version_matches_pin("0.2.1060", "0.2.106"));
+    }
 }
