@@ -23,6 +23,10 @@ pub struct CdpTarget {
 }
 
 /// HTTP GET against the CDP discovery HTTP server (not the page WebSocket).
+///
+/// WebView2's debugger often keeps the socket open after the response (ignores
+/// `Connection: close`). Do **not** `read_to_end` — parse `Content-Length` and
+/// stop once the body is complete (otherwise probes hang until read timeout).
 pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect((host, port)).map_err(|e| {
         format!("CDP HTTP connect {host}:{port} failed: {e}. Is SwerveBuild running with CDP enabled?")
@@ -41,19 +45,70 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
         .write_all(req.as_bytes())
         .map_err(|e| format!("CDP HTTP write: {e}"))?;
 
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("CDP HTTP read: {e}"))?;
-    let raw = String::from_utf8_lossy(&buf);
-    let body = split_http_body(&raw).ok_or_else(|| {
-        format!("CDP HTTP: no body in response ({} bytes)", buf.len())
-    })?;
-    Ok(body.to_string())
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                // Peer closed — accept whatever body we have after headers.
+                return take_http_body(&buf, true).ok_or_else(|| {
+                    format!("CDP HTTP: incomplete response ({} bytes)", buf.len())
+                });
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(body) = take_http_body(&buf, false) {
+                    return Ok(body);
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Timed out — only succeed if Content-Length body is already complete.
+                if let Some(body) = take_http_body(&buf, false) {
+                    return Ok(body);
+                }
+                return Err(format!("CDP HTTP read: {e}"));
+            }
+            Err(e) => return Err(format!("CDP HTTP read: {e}")),
+        }
+        if buf.len() > 8 * 1024 * 1024 {
+            return Err("CDP HTTP response too large".into());
+        }
+    }
+}
+
+/// If `buf` contains a full HTTP response, return the body as a String.
+/// When `peer_closed` is false, only complete `Content-Length` responses return.
+fn take_http_body(buf: &[u8], peer_closed: bool) -> Option<String> {
+    let raw = String::from_utf8_lossy(buf);
+    let header_end = raw
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.find("\n\n").map(|i| i + 2))?;
+    let headers = &raw[..header_end];
+    let body_bytes = &buf[header_end..];
+    let content_len = headers.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("content-length:")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    });
+    if let Some(len) = content_len {
+        if body_bytes.len() >= len {
+            return Some(String::from_utf8_lossy(&body_bytes[..len]).into_owned());
+        }
+        return None;
+    }
+    if peer_closed {
+        return Some(String::from_utf8_lossy(body_bytes).into_owned());
+    }
+    None
 }
 
 fn split_http_body(raw: &str) -> Option<&str> {
-    // Handle both CRLF and LF separators.
+    // Handle both CRLF and LF separators (unit tests + callers).
     if let Some(i) = raw.find("\r\n\r\n") {
         return Some(&raw[i + 4..]);
     }
