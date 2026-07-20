@@ -4,7 +4,7 @@ use super::{Needs, Node, NodeSpec, MAIN_IN, MAIN_OUT};
 use crate::engine::NodeCtx;
 use crate::error::NodeError;
 use crate::items::{Item, NodeInput, NodeOutput};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 pub struct SetFields;
 
@@ -26,18 +26,35 @@ impl Node for SetFields {
     }
 
     fn run(&self, ctx: &mut NodeCtx, input: NodeInput) -> Result<NodeOutput, NodeError> {
-        let mut out = Vec::with_capacity(input.main().len());
+        let mut out = NodeOutput::default();
+        out.set_port("main", Vec::new());
         for (i, item) in input.main().iter().enumerate() {
             ctx.check_cancel()?;
             let params = ctx.params(i)?;
             let mut json = item.json.clone();
             let empty = Vec::new();
+            let mut failed: Option<NodeError> = None;
             for op in params.get("ops").and_then(|v| v.as_array()).unwrap_or(&empty) {
-                apply_op(&mut json, op).map_err(|e| NodeError::params(e).at_item(i))?;
+                if let Err(e) = apply_op(&mut json, op) {
+                    failed = Some(NodeError::params(e).at_item(i));
+                    break;
+                }
             }
-            out.push(Item::new(json));
+            match failed {
+                None => out.push("main", Item::new(json)),
+                // Per-item failure with branch policy: route this item to `error`,
+                // keep the ones that succeeded flowing on `main` (matches http/file).
+                Some(err) if ctx.branch_errors() => out.push(
+                    "error",
+                    Item::new(json!({
+                        "error": { "kind": err.kind, "message": err.message },
+                        "item": item.json.clone(),
+                    })),
+                ),
+                Some(err) => return Err(err),
+            }
         }
-        Ok(NodeOutput::main(out))
+        Ok(out)
     }
 }
 

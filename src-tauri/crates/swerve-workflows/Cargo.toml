@@ -12,4 +12,5 @@ uuid = { version = "1", features = ["v4"] }
 rquickjs = "0.12"
 ureq = { version = "2", features = ["json"] }
 url = "2"
+regex = "1"
 

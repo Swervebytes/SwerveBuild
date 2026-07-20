@@ -3,8 +3,8 @@
 use super::{Needs, Node, NodeSpec, PortSpec, MAIN_IN};
 use crate::engine::NodeCtx;
 use crate::error::NodeError;
-use crate::items::{NodeInput, NodeOutput};
-use serde_json::Value;
+use crate::items::{Item, NodeInput, NodeOutput};
+use serde_json::{json, Value};
 
 pub struct IfNode;
 
@@ -42,11 +42,18 @@ impl Node for IfNode {
             let conditions = params.get("conditions").and_then(|v| v.as_array()).unwrap_or(&empty);
 
             let mut verdict = combine != "or"; // and starts true, or starts false
+            let mut failed: Option<NodeError> = None;
             for cond in conditions {
                 let left = cond.get("left").cloned().unwrap_or(Value::Null);
                 let op = cond.get("op").and_then(|v| v.as_str()).unwrap_or("eq");
                 let right = cond.get("right").cloned().unwrap_or(Value::Null);
-                let hit = compare(ctx, &left, op, &right).map_err(|e| NodeError::params(e).at_item(i))?;
+                let hit = match compare(ctx, &left, op, &right) {
+                    Ok(hit) => hit,
+                    Err(e) => {
+                        failed = Some(NodeError::params(e).at_item(i));
+                        break;
+                    }
+                };
                 if combine == "or" {
                     verdict = verdict || hit;
                     if verdict {
@@ -59,7 +66,17 @@ impl Node for IfNode {
                     }
                 }
             }
-            out.push(if verdict { "true" } else { "false" }, item.clone());
+            match failed {
+                None => out.push(if verdict { "true" } else { "false" }, item.clone()),
+                Some(err) if ctx.branch_errors() => out.push(
+                    "error",
+                    Item::new(json!({
+                        "error": { "kind": err.kind, "message": err.message },
+                        "item": item.json.clone(),
+                    })),
+                ),
+                Some(err) => return Err(err),
+            }
         }
         Ok(out)
     }

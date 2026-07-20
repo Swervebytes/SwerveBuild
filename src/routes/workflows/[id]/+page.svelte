@@ -51,6 +51,9 @@
   let runs = $state<WfRunRecord[]>([]);
   let selectedRun = $state<WfRunRecord | null>(null);
   let activeRunId = $state<string | null>(null);
+  // The engine can emit the trigger + first node's events before runNow's IPC
+  // reply sets activeRunId; this lets those early events adopt the run id.
+  let awaitingRun = $state(false);
   let toast = $state<string | null>(null);
   let colorMode = $state<"dark" | "light">("dark");
 
@@ -133,13 +136,17 @@
   async function save(): Promise<boolean> {
     if (!doc) return false;
     saving = true;
+    // Snapshot and clear dirty now, before the awaits, so an edit made while the
+    // save is in flight re-marks dirty instead of being masked as "Saved".
+    const snapshot = $state.snapshot(toDoc()) as WorkflowDoc;
+    dirty = false;
     try {
-      const saved = await wfApi.save($state.snapshot(toDoc()) as WorkflowDoc);
+      const saved = await wfApi.save(snapshot);
       doc = { ...doc, ...saved, nodes: doc.nodes, connections: doc.connections };
-      validation = await wfApi.validate($state.snapshot(toDoc()) as WorkflowDoc);
-      dirty = false;
+      validation = await wfApi.validate(snapshot);
       return true;
     } catch (e) {
+      dirty = true;
       flash(`Save failed: ${e}`);
       return false;
     } finally {
@@ -157,12 +164,26 @@
     }
     try {
       clearRunOverlay();
-      activeRunId = await wfApi.runNow(doc.id);
+      awaitingRun = true;
       edges = edges.map((e) => ({ ...e, animated: true, label: undefined }));
       rightTab = "runs";
+      activeRunId = await wfApi.runNow(doc.id);
     } catch (e) {
+      awaitingRun = false;
       flash(String(e));
     }
+  }
+
+  /** Accept a run event for this editor, adopting the run id from the first
+   *  event when we're still awaiting runNow's reply. */
+  function acceptRunEvent(workflowId: string, runId: string): boolean {
+    if (!doc || workflowId !== doc.id) return false;
+    if (activeRunId) return runId === activeRunId;
+    if (awaitingRun) {
+      activeRunId = runId;
+      return true;
+    }
+    return false;
   }
 
   async function cancelActive() {
@@ -255,11 +276,11 @@
 
     const offs = [
       subscribe<WfNodeStarted>("workflow-node-started", (e) => {
-        if (e.payload.run_id !== activeRunId) return;
+        if (!acceptRunEvent(e.payload.workflow_id, e.payload.run_id)) return;
         setNodeRun(e.payload.node_id, "running");
       }),
       subscribe<WfNodeFinished>("workflow-node-finished", (e) => {
-        if (e.payload.run_id !== activeRunId) return;
+        if (!acceptRunEvent(e.payload.workflow_id, e.payload.run_id)) return;
         setNodeRun(e.payload.node_id, {
           node_id: e.payload.node_id,
           name: e.payload.name,
@@ -276,6 +297,7 @@
           await refreshRuns();
           if (e.payload.run_id === activeRunId) {
             activeRunId = null;
+            awaitingRun = false;
             const detail = await wfApi.runDetail(doc.id, e.payload.run_id).catch(() => null);
             if (detail) {
               applyRunOverlay(detail);
@@ -304,8 +326,9 @@
     if (!doc) return;
     const detail = await wfApi.runDetail(doc.id, run.id).catch(() => null);
     if (detail) {
-      selectedRun = detail;
+      // clearRunOverlay() nulls selectedRun, so set it AFTER clearing.
       clearRunOverlay();
+      selectedRun = detail;
       applyRunOverlay(detail);
     }
   }

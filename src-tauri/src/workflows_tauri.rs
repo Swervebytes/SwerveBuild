@@ -32,6 +32,28 @@ fn wf_guard() -> std::sync::MutexGuard<'static, ()> {
     WF_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Live grok child PIDs spawned by workflow Agent nodes. App-exit tree-kills
+/// these synchronously — setting the run's cancel flag alone races the runner's
+/// 400 ms poll against process teardown, orphaning `grok.exe` trees on Windows.
+static ACTIVE_AGENT_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn register_agent_pid(pid: u32) {
+    if let Ok(mut g) = ACTIVE_AGENT_PIDS.lock() {
+        g.push(pid);
+    }
+}
+
+/// Unregisters a pid on every runner return path via RAII.
+struct PidGuard(u32);
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = ACTIVE_AGENT_PIDS.lock() {
+            g.retain(|p| *p != self.0);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ store
 
 pub struct WorkflowFiles;
@@ -224,10 +246,20 @@ impl AgentRunner for GrokAgentRunner {
                 format!("failed to launch grok: {e}")
             })?;
         let pid = child.id();
+        // Track the pid so app-exit can tree-kill it; the guard unregisters on
+        // every return path.
+        register_agent_pid(pid);
+        let _pid_guard = PidGuard(pid);
 
-        // Reader thread parses streaming-json; result comes over a channel so
-        // the waiter can never block on an inherited pipe.
+        // Reader threads parse streaming-json (stdout) and drain stderr — a
+        // chatty grok stderr would otherwise fill its pipe and block the child.
         let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        thread::spawn(move || {
+            if let Some(stderr) = stderr {
+                for _line in BufReader::new(stderr).lines().map_while(Result::ok) {}
+            }
+        });
         let (tx, rx) = mpsc::channel::<AgentResult>();
         thread::spawn(move || {
             let mut result = AgentResult::default();
@@ -344,18 +376,6 @@ impl WorkflowManager {
         self.paused.load(Ordering::SeqCst)
     }
 
-    fn running_count(&self) -> usize {
-        self.running.lock().map(|g| g.len()).unwrap_or(0)
-    }
-
-    fn running_for(&self, workflow_id: &str) -> Option<String> {
-        self.running.lock().ok().and_then(|g| {
-            g.iter()
-                .find(|(_, h)| h.workflow_id == workflow_id)
-                .map(|(run_id, _)| run_id.clone())
-        })
-    }
-
     fn services(app: &AppHandle) -> EngineServices {
         EngineServices {
             agent: Some(Arc::new(GrokAgentRunner)),
@@ -364,7 +384,10 @@ impl WorkflowManager {
         }
     }
 
-    /// The single seam every trigger funnels through.
+    /// The single seam every trigger funnels through. The overlap + capacity
+    /// decision and the slot reservation happen under one `running` lock so two
+    /// concurrent triggers (the scheduler and a manual Run) can't both slip past
+    /// the checks and double-spawn or exceed the cap.
     pub fn start_run(
         self: &Arc<Self>,
         app: AppHandle,
@@ -374,51 +397,90 @@ impl WorkflowManager {
         if self.is_paused() && fire.reason != "manual" {
             return Err("Workflows are paused".into());
         }
-        if let Some(existing) = self.running_for(&workflow.id) {
-            match workflow.settings.overlap {
-                OverlapPolicy::Skip => return Ok(existing),
-                OverlapPolicy::Replace => {
-                    let _ = self.cancel_run(&existing);
-                }
-            }
-        }
         let run_id = format!("r-{}", crate::store::Store::new_id());
         fire.run_id = Some(run_id.clone());
 
-        if self.running_count() >= MAX_CONCURRENT_RUNS {
-            let store = RunStore::new(crate::paths::workflow_runs_dir());
-            let _ = store.write_record(&RunRecord {
-                id: run_id.clone(),
-                workflow_id: workflow.id.clone(),
-                workflow_name: workflow.name.clone(),
-                trigger: swerve_workflows::runs::TriggerInfo {
-                    kind: fire.kind.clone(),
-                    reason: fire.reason.clone(),
-                    node_id: fire.node_id.clone(),
-                },
-                status: RunStatus::Queued,
-                started_at: crate::store::Store::now(),
-                finished_at: None,
-                error: None,
-                nodes: Vec::new(),
-                data: serde_json::Map::new(),
-                seen: false,
-            });
-            if let Ok(mut q) = self.queue.lock() {
-                q.push_back(QueuedFire { run_id: run_id.clone(), workflow, fire });
-            }
-            self.drain_queue(&app);
-            return Ok(run_id);
+        enum Admit {
+            Existing(String),
+            Queue,
+            Go(Arc<CancelFlag>),
         }
-        self.spawn(app, workflow, fire, run_id.clone());
-        Ok(run_id)
+        let decision = {
+            let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            let existing = running
+                .iter()
+                .find(|(_, h)| h.workflow_id == workflow.id)
+                .map(|(id, _)| id.clone());
+            let reserve = |running: &mut HashMap<String, RunHandle>| {
+                let cancel = Arc::new(CancelFlag::new());
+                running.insert(
+                    run_id.clone(),
+                    RunHandle { workflow_id: workflow.id.clone(), cancel: Arc::clone(&cancel) },
+                );
+                cancel
+            };
+            match (existing, workflow.settings.overlap) {
+                (Some(id), OverlapPolicy::Skip) => Admit::Existing(id),
+                (Some(id), OverlapPolicy::Replace) => {
+                    if let Some(h) = running.get(&id) {
+                        h.cancel.cancel();
+                    }
+                    // The cancelled run still holds its slot until it exits, so a
+                    // replacement at capacity queues and drains when it frees.
+                    if running.len() >= MAX_CONCURRENT_RUNS {
+                        Admit::Queue
+                    } else {
+                        Admit::Go(reserve(&mut running))
+                    }
+                }
+                (None, _) if running.len() >= MAX_CONCURRENT_RUNS => Admit::Queue,
+                (None, _) => Admit::Go(reserve(&mut running)),
+            }
+        };
+
+        match decision {
+            Admit::Existing(id) => Ok(id),
+            Admit::Queue => {
+                let store = RunStore::new(crate::paths::workflow_runs_dir());
+                let _ = store.write_record(&RunRecord {
+                    id: run_id.clone(),
+                    workflow_id: workflow.id.clone(),
+                    workflow_name: workflow.name.clone(),
+                    trigger: swerve_workflows::runs::TriggerInfo {
+                        kind: fire.kind.clone(),
+                        reason: fire.reason.clone(),
+                        node_id: fire.node_id.clone(),
+                    },
+                    status: RunStatus::Queued,
+                    started_at: crate::store::Store::now(),
+                    finished_at: None,
+                    error: None,
+                    nodes: Vec::new(),
+                    data: serde_json::Map::new(),
+                    seen: false,
+                });
+                if let Ok(mut q) = self.queue.lock() {
+                    q.push_back(QueuedFire { run_id: run_id.clone(), workflow, fire });
+                }
+                self.drain_queue(&app);
+                Ok(run_id)
+            }
+            Admit::Go(cancel) => {
+                self.spawn_reserved(app, workflow, fire, run_id.clone(), cancel);
+                Ok(run_id)
+            }
+        }
     }
 
-    fn spawn(self: &Arc<Self>, app: AppHandle, workflow: Workflow, fire: TriggerFire, run_id: String) {
-        let cancel = Arc::new(CancelFlag::new());
-        if let Ok(mut g) = self.running.lock() {
-            g.insert(run_id.clone(), RunHandle { workflow_id: workflow.id.clone(), cancel: Arc::clone(&cancel) });
-        }
+    /// Spawn a run whose slot is already reserved in `running` under key `run_id`.
+    fn spawn_reserved(
+        self: &Arc<Self>,
+        app: AppHandle,
+        workflow: Workflow,
+        fire: TriggerFire,
+        run_id: String,
+        cancel: Arc<CancelFlag>,
+    ) {
         let manager = Arc::clone(self);
         thread::spawn(move || {
             let cfg = EngineConfig {
@@ -430,8 +492,10 @@ impl WorkflowManager {
                 w.state.last_run_id = Some(record.id.clone());
                 w.state.last_status = Some(status_str(record.status).to_string());
             });
+            // Remove by the reserved key, which always frees the slot even if a
+            // future change made the engine's run id diverge from the reservation.
             if let Ok(mut g) = manager.running.lock() {
-                g.remove(&record.id);
+                g.remove(&run_id);
             }
             manager.drain_queue(&app);
         });
@@ -439,12 +503,34 @@ impl WorkflowManager {
 
     fn drain_queue(self: &Arc<Self>, app: &AppHandle) {
         loop {
-            if self.running_count() >= MAX_CONCURRENT_RUNS {
-                return;
-            }
-            let next = self.queue.lock().ok().and_then(|mut q| q.pop_front());
+            // Reserve the slot and pop atomically so two concurrent drains (from
+            // two runs finishing at once) can't both spawn past the cap.
+            let next = {
+                let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                if running.len() >= MAX_CONCURRENT_RUNS {
+                    return;
+                }
+                let popped = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front();
+                match popped {
+                    Some(q) => {
+                        let cancel = Arc::new(CancelFlag::new());
+                        running.insert(
+                            q.run_id.clone(),
+                            RunHandle { workflow_id: q.workflow.id.clone(), cancel: Arc::clone(&cancel) },
+                        );
+                        Some((q, cancel))
+                    }
+                    None => None,
+                }
+            };
             match next {
-                Some(q) => self.spawn(app.clone(), q.workflow, q.fire, q.run_id),
+                Some((q, cancel)) => {
+                    self.spawn_reserved(app.clone(), q.workflow, q.fire, q.run_id, cancel)
+                }
                 None => return,
             }
         }
@@ -473,12 +559,18 @@ impl WorkflowManager {
         Ok(())
     }
 
-    /// Flag every running workflow — called on app exit so agent processes die
-    /// with the app (engine threads are daemonized by process exit).
+    /// Flag every running workflow AND tree-kill any in-flight Agent grok trees —
+    /// called on app exit. The run threads are detached and would not observe the
+    /// cancel flag before the process tears down, so the kill must be synchronous.
     pub fn cancel_all(&self) {
         if let Ok(g) = self.running.lock() {
             for handle in g.values() {
                 handle.cancel.cancel();
+            }
+        }
+        if let Ok(pids) = ACTIVE_AGENT_PIDS.lock() {
+            for pid in pids.iter() {
+                crate::jobs::tree_kill(*pid);
             }
         }
     }
@@ -711,10 +803,23 @@ pub fn workflow_get(id: String) -> Option<Workflow> {
 
 #[tauri::command]
 pub fn workflow_save(
-    workflow: Workflow,
+    mut workflow: Workflow,
     manager: tauri::State<'_, Arc<WorkflowManager>>,
 ) -> Result<Workflow, String> {
     let _g = wf_guard();
+    // `state` — last_fired_at plus the per-trigger bookkeeping (git last-seen
+    // commit, file snapshot) — is scheduler-owned. The editor loads it once at
+    // page open and it goes stale as the scheduler fires; writing the editor's
+    // copy back would reset an interval schedule (making it re-fire) and drop a
+    // git/file trigger's baseline. Always keep the on-disk state on save.
+    if !workflow.id.is_empty() {
+        if let Some(existing) = WorkflowFiles::get(&workflow.id) {
+            workflow.state = existing.state;
+            if workflow.created_at.is_empty() {
+                workflow.created_at = existing.created_at;
+            }
+        }
+    }
     let saved = WorkflowFiles::save(workflow)?;
     manager.wake();
     Ok(saved)

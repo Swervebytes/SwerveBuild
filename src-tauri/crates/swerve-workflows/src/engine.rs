@@ -3,7 +3,7 @@
 //! sequentially in a stable order (among ready nodes, lowest id first).
 
 use crate::error::{ErrorKind, NodeError};
-use crate::expr::{js_string_literal, ExprEngine, ExprScope};
+use crate::expr::{ExprEngine, ExprScope};
 use crate::items::{Item, NodeInput, NodeOutput};
 use crate::model::{NodeDef, OnError, Permissions, Workflow};
 use crate::nodes;
@@ -314,18 +314,20 @@ impl<'r> NodeCtx<'r> {
         Ok(scope)
     }
 
-    /// Regex support for the IF node, evaluated in the sandbox.
+    /// Regex support for the IF node's `matches` operator. Uses the Rust `regex`
+    /// crate (finite-automaton, linear time) rather than QuickJS `RegExp`: a
+    /// native `RegExp.test` call does not poll the interrupt watchdog, so a
+    /// catastrophic-backtracking pattern could otherwise wedge the run thread
+    /// unbounded. Rust regex cannot backtrack, and the size limit caps compile
+    /// cost. Syntax is Rust-flavored (no lookaround/backrefs) — acceptable for a
+    /// "does this match" convenience.
     pub fn regex_test(&mut self, pattern: &str, value: &str) -> Result<bool, String> {
-        let expr = format!(
-            "new RegExp(JSON.parse({})).test(JSON.parse({}))",
-            js_string_literal(&Value::String(pattern.to_string())),
-            js_string_literal(&Value::String(value.to_string()))
-        );
-        Ok(self
-            .scope
-            .eval_expr(&expr, Duration::from_secs(1))?
-            .as_bool()
-            .unwrap_or(false))
+        let re = regex::RegexBuilder::new(pattern)
+            .size_limit(1 << 20)
+            .dfa_size_limit(1 << 20)
+            .build()
+            .map_err(|e| format!("invalid regex: {e}"))?;
+        Ok(re.is_match(value))
     }
 
     /// The seed payload — only meaningful while the fired trigger node runs.
@@ -494,7 +496,6 @@ pub fn run_workflow(
     };
     let deadline = Instant::now() + Duration::from_secs(workflow.settings.timeout_secs.max(10));
     let mut node_outputs_json: BTreeMap<String, Value> = BTreeMap::new();
-    let mut executed: BTreeSet<String> = BTreeSet::new();
     let mut abort: Option<(String, String, NodeError)> = None;
 
     while let Some(node_id) = ready.pop_first() {
@@ -529,8 +530,8 @@ pub fn run_workflow(
         let t0 = Instant::now();
         let payload = if node.id == fire_node.id { Some(fire_payload.clone()) } else { None };
 
-        let result: Result<NodeOutput, NodeError> = if node.disabled {
-            Ok(passthrough(node, &input))
+        let (result, attempts): (Result<NodeOutput, NodeError>, u32) = if node.disabled {
+            (Ok(passthrough(node, &input)), 1)
         } else {
             execute_with_retry(
                 node,
@@ -547,7 +548,6 @@ pub fn run_workflow(
             )
         };
         let duration_ms = t0.elapsed().as_millis() as u64;
-        let attempts = 1 + node.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
 
         // A node-level error under `branch` policy becomes one error item.
         let result = match result {
@@ -601,7 +601,6 @@ pub fn run_workflow(
                 }
 
                 capture_output(&mut record, &workflow.settings.capture, &node.id, &output);
-                executed.insert(node.id.clone());
                 let ports_json: Map<String, Value> = output
                     .ports
                     .iter()
@@ -650,14 +649,15 @@ pub fn run_workflow(
             Err(err) => {
                 let stopping = node.on_error == OnError::Stop
                     || matches!(err.kind, ErrorKind::Cancelled | ErrorKind::Timeout);
+                let node_status = if matches!(err.kind, ErrorKind::Cancelled) {
+                    NodeRunStatus::Cancelled
+                } else {
+                    NodeRunStatus::Error
+                };
                 record.nodes.push(NodeRunSummary {
                     node_id: node.id.clone(),
                     name: node.name.clone(),
-                    status: if matches!(err.kind, ErrorKind::Cancelled) {
-                        NodeRunStatus::Cancelled
-                    } else {
-                        NodeRunStatus::Error
-                    },
+                    status: node_status,
                     items_in,
                     items_out: 0,
                     duration_ms,
@@ -670,7 +670,7 @@ pub fn run_workflow(
                     run_id: run_id.clone(),
                     node_id: node.id.clone(),
                     name: node.name.clone(),
-                    status: NodeRunStatus::Error,
+                    status: node_status,
                     items_in,
                     items_out: 0,
                     duration_ms,
@@ -685,7 +685,6 @@ pub fn run_workflow(
                     break;
                 }
                 // on_error: skip — deliver empty everywhere and continue.
-                executed.insert(node.id.clone());
                 for (idx, c) in workflow.connections.iter().enumerate() {
                     if c.from == node.id && live_edge(idx) {
                         edge_items[idx] = Some(Vec::new());
@@ -701,10 +700,11 @@ pub fn run_workflow(
         let _ = store.write_record(&record);
     }
 
-    // Reachable nodes that never ran (after an abort/cancel) → skipped.
-    for id in &reachable {
-        if !executed.contains(*id) && !record.nodes.iter().any(|n| n.node_id == **id) {
-            let node = workflow.node(id).expect("reachable node exists");
+    // Every node that didn't execute → skipped. Covers both reachable nodes cut
+    // off by an abort/cancel and nodes in other triggers' subgraphs that this
+    // firing never reaches (design §7.3.1).
+    for node in &workflow.nodes {
+        if !record.nodes.iter().any(|n| n.node_id == node.id) {
             record.nodes.push(NodeRunSummary {
                 node_id: node.id.clone(),
                 name: node.name.clone(),
@@ -741,6 +741,8 @@ pub fn run_workflow(
     record
 }
 
+/// Run a node with its retry policy. Returns the result plus the number of
+/// attempts actually made (so the run record reports the real count, not the max).
 #[allow(clippy::too_many_arguments)]
 fn execute_with_retry(
     node: &NodeDef,
@@ -754,9 +756,16 @@ fn execute_with_retry(
     input: &NodeInput,
     fire_payload: Option<Value>,
     node_outputs_json: &BTreeMap<String, Value>,
-) -> Result<NodeOutput, NodeError> {
-    let node_impl = nodes::get(&node.node_type)
-        .ok_or_else(|| NodeError::params(format!("unknown node type {}", node.node_type)))?;
+) -> (Result<NodeOutput, NodeError>, u32) {
+    let node_impl = match nodes::get(&node.node_type) {
+        Some(n) => n,
+        None => {
+            return (
+                Err(NodeError::params(format!("unknown node type {}", node.node_type))),
+                1,
+            )
+        }
+    };
     let max_attempts = 1 + node.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
     let backoff = node.retry.as_ref().map(|r| r.backoff_secs.clone()).unwrap_or_default();
     let mut last_err: Option<NodeError> = None;
@@ -766,13 +775,23 @@ fn execute_with_retry(
             let wait = backoff.get(attempt as usize - 1).copied().unwrap_or(5);
             let until = Instant::now() + Duration::from_secs(wait);
             while Instant::now() < until {
-                if cancel.is_set() || Instant::now() >= deadline {
-                    return Err(last_err.unwrap_or_else(|| NodeError::new(ErrorKind::Cancelled, "run was stopped")));
+                // A stop or the run deadline during a backoff must surface AS a
+                // cancel/timeout — not the prior attempt's error — so the run
+                // finalizes with the right status instead of a spurious abort.
+                if Instant::now() >= deadline {
+                    cancel.timeout();
+                }
+                if cancel.is_set() {
+                    let (kind, msg) = match cancel.reason() {
+                        CancelReason::Timeout => (ErrorKind::Timeout, "run hit its time limit"),
+                        _ => (ErrorKind::Cancelled, "run was stopped"),
+                    };
+                    return (Err(NodeError::new(kind, msg)), attempt);
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
-        let mut ctx = NodeCtx::new(
+        let mut ctx = match NodeCtx::new(
             node,
             run_info,
             cancel,
@@ -784,18 +803,24 @@ fn execute_with_retry(
             input,
             fire_payload.clone(),
             node_outputs_json,
-        )?;
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => return (Err(e), attempt + 1),
+        };
         match node_impl.run(&mut ctx, input.clone()) {
-            Ok(output) => return Ok(output),
+            Ok(output) => return (Ok(output), attempt + 1),
             Err(err) => {
                 if matches!(err.kind, ErrorKind::Cancelled | ErrorKind::Timeout) {
-                    return Err(err);
+                    return (Err(err), attempt + 1);
                 }
                 last_err = Some(err);
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| NodeError::internal("node produced no result")))
+    (
+        Err(last_err.unwrap_or_else(|| NodeError::internal("node produced no result"))),
+        max_attempts,
+    )
 }
 
 /// A disabled node forwards its first input port to its first declared output.

@@ -3291,6 +3291,7 @@ dependencies = [
 name = "swerve-workflows"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "rquickjs",
  "serde",
  "serde_json",

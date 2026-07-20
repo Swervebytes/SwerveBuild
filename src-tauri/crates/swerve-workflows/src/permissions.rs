@@ -8,7 +8,7 @@ use crate::error::{ErrorKind, NodeError};
 use crate::model::{FsPermission, NetworkPermission};
 use serde_json::Value;
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -39,6 +39,14 @@ pub fn host_allowed(host: &str, allow: &[String]) -> bool {
     })
 }
 
+/// Credential-bearing headers that must not survive a cross-origin redirect.
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "proxy-authorization"
+    )
+}
+
 /// Reject non-public addresses unless the workflow opted in.
 fn ip_allowed(ip: &IpAddr, private_ok: bool) -> bool {
     if private_ok {
@@ -56,10 +64,30 @@ fn ip_allowed(ip: &IpAddr, private_ok: bool) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64))
         }
         IpAddr::V6(v6) => {
+            // Any address that embeds an IPv4 gets the v4 policy applied to the
+            // embedded address — otherwise a private target could be smuggled
+            // through a transitional form.
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return ip_allowed(&IpAddr::V4(mapped), private_ok);
             }
-            let seg0 = v6.segments()[0];
+            let segs = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+            };
+            // 6to4 2002::/16 (v4 in segs 1-2)
+            if segs[0] == 0x2002 {
+                return ip_allowed(&IpAddr::V4(embedded(segs[1], segs[2])), private_ok);
+            }
+            // NAT64 well-known 64:ff9b::/96 (v4 in the low 32 bits)
+            if segs[0] == 0x0064 && segs[1] == 0xff9b {
+                return ip_allowed(&IpAddr::V4(embedded(segs[6], segs[7])), private_ok);
+            }
+            // Deprecated IPv4-compatible ::a.b.c.d (upper 96 bits zero), excluding
+            // :: and ::1 which the specials below already cover.
+            if segs[..6].iter().all(|s| *s == 0) && !(segs[6] == 0 && segs[7] <= 1) {
+                return ip_allowed(&IpAddr::V4(embedded(segs[6], segs[7])), private_ok);
+            }
+            let seg0 = segs[0];
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 // ULA fc00::/7
@@ -130,6 +158,8 @@ pub fn http_request(policy: &NetworkPermission, spec: &HttpRequestSpec) -> Resul
         current.query_pairs_mut().append_pair(k, v);
     }
     let mut send_body = true;
+    // Working copy so cross-origin redirects can drop credential headers.
+    let mut headers = spec.headers.clone();
 
     for _hop in 0..=MAX_REDIRECTS {
         if current.scheme() != "http" && current.scheme() != "https" {
@@ -164,7 +194,7 @@ pub fn http_request(policy: &NetworkPermission, spec: &HttpRequestSpec) -> Resul
             .build();
 
         let mut req = agent.request(&method, current.as_str());
-        for (name, value) in &spec.headers {
+        for (name, value) in &headers {
             req = req.set(name, value);
         }
 
@@ -214,6 +244,12 @@ pub fn http_request(policy: &NetworkPermission, spec: &HttpRequestSpec) -> Resul
                 let next = current
                     .join(location)
                     .map_err(|e| NodeError::new(ErrorKind::Http, format!("bad redirect target: {e}")))?;
+                // Crossing to a different origin drops credential headers so a
+                // Bearer token / Cookie isn't replayed to the redirect target
+                // (the leak curl and reqwest defend against).
+                if next.origin() != current.origin() {
+                    headers.retain(|(name, _)| !is_sensitive_header(name));
+                }
                 // 303 always becomes GET; 301/302 drop the body like browsers do.
                 if status == 303 || ((status == 301 || status == 302) && method != "GET" && method != "HEAD") {
                     method = "GET".to_string();
@@ -284,7 +320,19 @@ fn check_path(path: &str, allow: &[String], for_write: bool) -> Result<PathBuf, 
         let parent = parent
             .canonicalize()
             .map_err(|e| NodeError::new(ErrorKind::Fs, format!("parent folder of {path}: {e}")))?;
-        parent.join(file_name)
+        let candidate = parent.join(file_name);
+        // If the target already exists, canonicalize it fully so a symlink at the
+        // final component is resolved to its real target and THAT is what the
+        // containment check sees — otherwise a planted link could escape the
+        // granted folder on write. New files (no symlink to follow) use the
+        // parent-relative path.
+        if candidate.symlink_metadata().is_ok() {
+            candidate
+                .canonicalize()
+                .map_err(|e| NodeError::new(ErrorKind::Fs, format!("{path}: {e}")))?
+        } else {
+            candidate
+        }
     } else {
         target
             .canonicalize()
@@ -355,6 +403,42 @@ mod tests {
         assert!(!ip_allowed(&mapped, false), "v4-mapped v6 must be unwrapped and blocked");
         let ok: IpAddr = "93.184.216.34".parse().unwrap();
         assert!(ip_allowed(&ok, false));
+    }
+
+    #[test]
+    fn ipv6_embedded_private_v4_is_blocked() {
+        // Transitional forms that embed a private/loopback IPv4 must be caught:
+        // 6to4 (10.0.0.1), NAT64 (192.168.0.1), deprecated ::a.b.c.d (127.0.0.1).
+        for bad in ["2002:0a00:0001::", "64:ff9b::c0a8:1", "::7f00:1"] {
+            let ip: IpAddr = bad.parse().unwrap();
+            assert!(!ip_allowed(&ip, false), "{bad} must be blocked");
+            assert!(ip_allowed(&ip, true), "{bad} must pass with the opt-in");
+        }
+        // A public v4 embedded in 6to4 (93.184.216.34) stays allowed.
+        let ok: IpAddr = "2002:5db8:d822::".parse().unwrap();
+        assert!(ip_allowed(&ok, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fs_write_rejects_symlink_escaping_the_grant() {
+        use std::os::windows::fs::symlink_file;
+        let base = std::env::temp_dir().join(format!("swf-symlink-{}", std::process::id()));
+        let grant = base.join("grant");
+        std::fs::create_dir_all(&grant).unwrap();
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, b"secret").unwrap();
+        let link = grant.join("out.txt");
+        // Needs Developer Mode / admin; if the OS refuses the symlink, skip.
+        if symlink_file(&secret, &link).is_err() {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let policy = FsPermission { read: vec![], write: vec![grant.to_string_lossy().to_string()] };
+        let out = fs_write(&policy, link.to_str().unwrap(), b"evil", false);
+        assert!(out.is_err(), "a write through a symlink out of the grant must be refused");
+        assert_eq!(std::fs::read(&secret).unwrap(), b"secret", "the escape target must be untouched");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

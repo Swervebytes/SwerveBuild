@@ -510,6 +510,87 @@ fn http_node_blocks_private_targets_without_the_optin() {
     assert!(msg.contains("private"), "got: {msg}");
 }
 
+// ---------------------------------------------------------------- retry / cancel
+
+#[test]
+fn cancel_during_retry_backoff_reports_cancelled_not_error() {
+    // A node that fails then sits in a long backoff must, when cancelled, finalize
+    // the run as Cancelled — not as a spurious node error from the prior attempt.
+    let mut w = workflow_with(
+        json!([
+            node("t1", "trigger.manual", "Start", json!({})),
+            node("n1", "code.js", "Flaky", json!({ "mode": "all_items", "code": "throw new Error('nope');" })),
+        ]),
+        json!([ { "from": "t1", "out": "main", "to": "n1", "in": "main" } ]),
+        json!({ "code": true }),
+        json!({}),
+    );
+    if let Some(n1) = w.nodes.iter_mut().find(|n| n.id == "n1") {
+        n1.retry = Some(serde_json::from_value(json!({ "attempts": 1, "backoff_secs": [30] })).unwrap());
+    }
+    let cfg = EngineConfig { runs_dir: temp_runs_dir("retry-cancel"), services: EngineServices::default() };
+    let cancel = Arc::new(CancelFlag::new());
+    let canceller = Arc::clone(&cancel);
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+    let record = run_workflow(&w, manual_fire(), &cfg, &cancel);
+    t.join().unwrap();
+    assert_eq!(record.status, RunStatus::Cancelled, "error: {:?}", record.error);
+    assert!(record.error.is_none(), "cancel must not record a node abort");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "must not wait out the 30s backoff");
+}
+
+#[test]
+fn attempts_records_actual_count_not_the_maximum() {
+    let mut w = workflow(
+        json!([
+            node("t1", "trigger.manual", "Start", json!({})),
+            node("n1", "transform.set", "Ok", json!({ "ops": [] })),
+        ]),
+        json!([ { "from": "t1", "out": "main", "to": "n1", "in": "main" } ]),
+    );
+    if let Some(n1) = w.nodes.iter_mut().find(|n| n.id == "n1") {
+        n1.retry = Some(serde_json::from_value(json!({ "attempts": 3, "backoff_secs": [1] })).unwrap());
+    }
+    let record = run(&w, "attempts");
+    let n1 = record.nodes.iter().find(|n| n.node_id == "n1").unwrap();
+    assert_eq!(n1.attempts, 1, "succeeded first try → one attempt, not max");
+}
+
+#[test]
+fn set_node_branch_keeps_successes_and_routes_the_failure() {
+    // Per-item failure under branch policy routes that item to `error` while the
+    // items that succeeded keep flowing on `main` (was: whole node failed).
+    let mut w = workflow_with(
+        json!([
+            node("t1", "trigger.manual", "Start", json!({})),
+            node("n0", "code.js", "Seed", json!({ "mode": "all_items",
+                "code": "return [{key:'a'}, {nope:1}, {key:'c'}];" })),
+            node("n1", "transform.set", "Edit", json!({ "ops": [
+                { "op": "set", "path": "{{ $json.key }}", "value": 1 }
+            ]})),
+        ]),
+        json!([
+            { "from": "t1", "out": "main", "to": "n0", "in": "main" },
+            { "from": "n0", "out": "main", "to": "n1", "in": "main" },
+        ]),
+        json!({ "code": true }),
+        json!({}),
+    );
+    if let Some(n1) = w.nodes.iter_mut().find(|n| n.id == "n1") {
+        n1.on_error = serde_json::from_value(json!("branch")).unwrap();
+    }
+    let record = run(&w, "set-branch");
+    assert_eq!(record.status, RunStatus::Success, "error: {:?}", record.error);
+    assert_eq!(data_items(&record, "n1", "main").len(), 2, "two items succeed");
+    let errs = data_items(&record, "n1", "error");
+    assert_eq!(errs.len(), 1, "one item routed to error");
+    assert!(errs[0]["error"]["message"].as_str().unwrap().contains("path"));
+}
+
 #[test]
 fn http_node_enforces_the_host_allowlist() {
     let (host, _handle) = spawn_http_fixture();

@@ -668,3 +668,16 @@ M0 through M3 shipped in one pass. Verification: engine crate 37 tests, app crat
 - Param forms are a TS-side registry (`src/lib/workflows/model.ts`) mirroring the Rust specs; ports/needs/labels still come from the Rust catalog command.
 
 **Left for later:** editor niceties (copy/paste, undo, drag-from-palette), webhook trigger, loops, binary items, sub-workflows, keyring secrets, M4 convergence.
+
+### Post-review hardening (same day)
+
+A three-pass adversarial review (security, engine correctness, concurrency/frontend) ran over the whole branch before merge. Fixes applied, all covered by tests (engine crate now 42):
+
+- **Editor save no longer clobbers scheduler-owned `state`** (was HIGH): `workflow_save` re-reads and preserves on-disk `state` (last-fired, git commit, file snapshot), so editing-and-saving a scheduled workflow can't make it re-fire or lose a trigger baseline.
+- **HTTP drops `Authorization`/`Cookie`/`Proxy-Authorization` on a cross-origin redirect** — no credential replay to a redirect target.
+- **The IF `matches` operator uses the Rust `regex` crate** (linear-time) instead of QuickJS `RegExp`, closing a ReDoS that could wedge a run thread past the watchdog. Regex syntax is now Rust-flavored.
+- **`fs_write` canonicalizes an existing target** so a symlink at the final path component can't escape the granted folder (reads already did this).
+- **IPv6 SSRF filter unwraps 6to4, NAT64, and IPv4-compatible embeddings** and applies the private-IP policy to the embedded v4.
+- **App-exit tree-kills in-flight Agent grok trees** (a pid registry), not just sets the cancel flag — no orphaned `grok.exe` on Windows.
+- **Admission (overlap + capacity) reserves the run slot under one lock**, closing the check-then-act double-spawn / cap-overrun window between the scheduler and a manual Run.
+- Retry backoff interrupted by cancel/timeout now reports `cancelled`/`timeout` (not the prior attempt's error); run records carry the real attempt count and consistent node status; non-fired trigger subgraphs record as `skipped`; per-item failures in Set/IF honor `on_error: branch`; the Agent runner drains stderr; the editor's run-detail selection, dirty-flag timing, and early run-overlay events were fixed.
