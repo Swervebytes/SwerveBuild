@@ -18,15 +18,22 @@ struct ToolDef {
     input_schema: Value,
 }
 
+// Tool names are intentionally UN-prefixed. grok namespaces every MCP tool as
+// `<server>__<tool>`, and this server is registered as "swervebuild", so a name
+// like "swervebuild_list_projects" surfaced to the model as the double-prefixed
+// "swervebuild__swervebuild_list_projects" — which the model fumbles (it reaches
+// for "swervebuild__list_projects" first and gets "tool not found"). Short names
+// give the clean "swervebuild__list_projects". call_tool still accepts the old
+// prefixed names (and the legacy swervegrok_ ones) as aliases.
 fn tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
-            name: "swervebuild_list_projects".into(),
+            name: "list_projects".into(),
             description: "List all Swerve Build projects (folders) with paths and chat counts.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "swervebuild_list_chats".into(),
+            name: "list_chats".into(),
             description: "List chats for a project. Optional project_id; omit for all projects.".into(),
             input_schema: json!({
                 "type": "object",
@@ -36,12 +43,12 @@ fn tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "swervebuild_get_app_status".into(),
+            name: "get_app_status".into(),
             description: "Get Swerve Build app status: projects, chats, data file path.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "swervebuild_get_chat_summary".into(),
+            name: "get_chat_summary".into(),
             description: "Get summary for a chat: title, message count, session id, last updated.".into(),
             input_schema: json!({
                 "type": "object",
@@ -52,12 +59,12 @@ fn tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "swervebuild_list_automations".into(),
+            name: "list_automations".into(),
             description: "List Swerve Build automations (triggered agents): id, name, whether enabled, trigger, execution mode, and last run status.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "swervebuild_list_automation_runs".into(),
+            name: "list_automation_runs".into(),
             description: "List recent runs for an automation: run id, status, what triggered it, timestamps, and final output.".into(),
             input_schema: json!({
                 "type": "object",
@@ -111,7 +118,7 @@ fn load_store() -> Value {
 fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
     let store = load_store();
     match name {
-        "swervebuild_list_projects" | "swervegrok_list_projects" => {
+        "list_projects" | "swervebuild_list_projects" | "swervegrok_list_projects" => {
             let projects = store.get("projects").cloned().unwrap_or_else(|| json!([]));
             let chats = store.get("chats").cloned().unwrap_or_else(|| json!([]));
             let mut out = Vec::new();
@@ -137,7 +144,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
             }
             Ok(json!({ "projects": out }))
         }
-        "swervebuild_list_chats" | "swervegrok_list_chats" => {
+        "list_chats" | "swervebuild_list_chats" | "swervegrok_list_chats" => {
             let project_id = args.get("project_id").and_then(|v| v.as_str());
             let chats = store.get("chats").cloned().unwrap_or_else(|| json!([]));
             let filtered: Vec<Value> = chats
@@ -162,7 +169,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .collect();
             Ok(json!({ "chats": filtered }))
         }
-        "swervebuild_get_app_status" | "swervegrok_get_app_status" => {
+        "get_app_status" | "swervebuild_get_app_status" | "swervegrok_get_app_status" => {
             let autos = load_json(swerve_build_lib::paths::automations_file());
             Ok(json!({
                 "data_path": data_path().display().to_string(),
@@ -172,7 +179,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 "automations_paused": autos.get("paused").and_then(|v| v.as_bool()).unwrap_or(false),
             }))
         }
-        "swervebuild_list_automations" | "swervegrok_list_automations" => {
+        "list_automations" | "swervebuild_list_automations" | "swervegrok_list_automations" => {
             let autos = load_json(swerve_build_lib::paths::automations_file());
             let paused = autos.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
             let list = autos.get("automations").and_then(|a| a.as_array()).cloned().unwrap_or_default();
@@ -193,7 +200,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .collect();
             Ok(json!({ "paused": paused, "automations": out }))
         }
-        "swervebuild_list_automation_runs" | "swervegrok_list_automation_runs" => {
+        "list_automation_runs" | "swervebuild_list_automation_runs" | "swervegrok_list_automation_runs" => {
             let automation_id = args
                 .get("automation_id")
                 .and_then(|v| v.as_str())
@@ -233,7 +240,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
             runs.truncate(limit);
             Ok(json!({ "runs": runs }))
         }
-        "swervebuild_get_chat_summary" | "swervegrok_get_chat_summary" => {
+        "get_chat_summary" | "swervebuild_get_chat_summary" | "swervegrok_get_chat_summary" => {
             let chat_id = args
                 .get("chat_id")
                 .and_then(|v| v.as_str())

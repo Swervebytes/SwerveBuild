@@ -74,21 +74,25 @@ Assert-True ($init.result.serverInfo.name -eq "swervebuild-mcp") "MCP initialize
 $tools = Invoke-McpRpc "tools/list" 2
 Assert-True ($tools.result.tools.Count -ge 4) "MCP tools/list count" "got $($tools.result.tools.Count)"
 
-$status = Invoke-McpRpc "tools/call" 3 @{ name = "swervebuild_get_app_status"; arguments = @{} }
-Assert-True ($null -ne $status -and -not $status.result.isError) "MCP swervebuild_get_app_status"
+$status = Invoke-McpRpc "tools/call" 3 @{ name = "get_app_status"; arguments = @{} }
+Assert-True ($null -ne $status -and -not $status.result.isError) "MCP get_app_status"
 Assert-True ($null -ne $status -and $null -ne $status.result.content -and $null -ne $status.result.content[0].text) "MCP app status returns text"
 
-$projects = Invoke-McpRpc "tools/call" 4 @{ name = "swervebuild_list_projects"; arguments = @{} }
-Assert-True ($projects.result.content[0].text -match "projects") "MCP swervebuild_list_projects"
+$projects = Invoke-McpRpc "tools/call" 4 @{ name = "list_projects"; arguments = @{} }
+Assert-True ($projects.result.content[0].text -match "projects") "MCP list_projects"
 
-# Automation tools are exposed to agents
+# Tools are exposed with short (un-prefixed) names so grok's own swervebuild__
+# namespace doesn't double up.
 $toolNames = $tools.result.tools | ForEach-Object { $_.name }
-Assert-True ($toolNames -contains "swervebuild_list_automations") "MCP exposes swervebuild_list_automations"
-Assert-True ($toolNames -contains "swervebuild_list_automation_runs") "MCP exposes swervebuild_list_automation_runs"
-$autos = Invoke-McpRpc "tools/call" 6 @{ name = "swervebuild_list_automations"; arguments = @{} }
-Assert-True (-not $autos.result.isError -and $autos.result.content[0].text -match "automations") "MCP swervebuild_list_automations"
+Assert-True ($toolNames -contains "list_automations") "MCP exposes list_automations"
+Assert-True ($toolNames -contains "list_automation_runs") "MCP exposes list_automation_runs"
+Assert-True (-not ($toolNames | Where-Object { $_ -like "swervebuild_*" -or $_ -like "swervegrok_*" })) "MCP exposes no prefixed tool names"
+$autos = Invoke-McpRpc "tools/call" 6 @{ name = "list_automations"; arguments = @{} }
+Assert-True (-not $autos.result.isError -and $autos.result.content[0].text -match "automations") "MCP list_automations"
 
-# Legacy tool aliases still work
+# Old prefixed names still accepted as aliases (back-compat with cached sessions)
+$aliasBuild = Invoke-McpRpc "tools/call" 7 @{ name = "swervebuild_get_app_status"; arguments = @{} }
+Assert-True (-not $aliasBuild.result.isError) "MCP legacy swervebuild_get_app_status alias"
 $legacyStatus = Invoke-McpRpc "tools/call" 5 @{ name = "swervegrok_get_app_status"; arguments = @{} }
 Assert-True (-not $legacyStatus.result.isError) "MCP legacy swervegrok_get_app_status alias"
 
@@ -204,7 +208,7 @@ Send-Acp @{
     jsonrpc = "2.0"; id = 3; method = "session/prompt"
     params = @{
         sessionId = $sessionId
-        prompt = @(@{ type = "text"; text = "Use swervebuild_list_projects MCP tool. Reply with project names only." })
+        prompt = @(@{ type = "text"; text = "Use the list_projects MCP tool. Reply with project names only." })
     }
 }
 $promptResp = Read-AcpResponse 3 120000
