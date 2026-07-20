@@ -6,6 +6,7 @@ pub mod paths;
 mod providers;
 mod store;
 mod util;
+pub mod workflows_tauri;
 
 use acp::AcpManager;
 use jobs::JobManager;
@@ -992,6 +993,9 @@ pub fn run() {
     let job_mgr = Arc::new(JobManager::default());
     let jobs_exit = job_mgr.clone();
     let jobs_sched = job_mgr.clone();
+    let wf_mgr = Arc::new(workflows_tauri::WorkflowManager::default());
+    let wf_exit = wf_mgr.clone();
+    let wf_sched = wf_mgr.clone();
 
     tauri::Builder::default()
         // Must be the FIRST plugin: a second launch focuses the existing window
@@ -1008,8 +1012,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(acp)
         .manage(job_mgr)
+        .manage(wf_mgr)
         .setup(move |app| {
             jobs::spawn_scheduler(app.handle().clone(), jobs_sched);
+            workflows_tauri::spawn_scheduler(app.handle().clone(), wf_sched);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1062,7 +1068,22 @@ pub fn run() {
             list_automation_runs,
             read_run_log,
             mark_runs_seen,
-            automation_failure_count
+            automation_failure_count,
+            workflows_tauri::workflows_list,
+            workflows_tauri::workflow_get,
+            workflows_tauri::workflow_save,
+            workflows_tauri::workflow_delete,
+            workflows_tauri::workflow_validate,
+            workflows_tauri::workflow_node_catalog,
+            workflows_tauri::workflow_run_now,
+            workflows_tauri::workflow_cancel_run,
+            workflows_tauri::workflow_runs,
+            workflows_tauri::workflow_run_detail,
+            workflows_tauri::workflows_set_paused,
+            workflows_tauri::workflows_get_paused,
+            workflows_tauri::workflow_secret_names,
+            workflows_tauri::workflow_secret_set,
+            workflows_tauri::workflow_secret_delete
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -1070,6 +1091,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 acp_exit.close_all();
                 jobs_exit.cancel_all();
+                wf_exit.cancel_all();
                 local_llm::manager().shutdown();
             }
         });
