@@ -16,6 +16,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "swervebuild-mcp"
 path = "src/bin/swervebuild_mcp.rs"
 
+[[bin]]
+name = "swervebuild-workflow"
+path = "src/bin/swervebuild_workflow.rs"
+
+[workspace]
+members = ["crates/swerve-workflows"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -30,3 +37,4 @@ base64 = "0.22"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 toml_edit = "0.22"
+swerve-workflows = { path = "crates/swerve-workflows" }
