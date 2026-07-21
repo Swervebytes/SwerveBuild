@@ -7,8 +7,10 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import Titlebar from "$lib/components/Titlebar.svelte";
   import BrowserPane from "$lib/components/BrowserPane.svelte";
+  import PaneDivider from "$lib/components/PaneDivider.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
   import { browserPane } from "$lib/stores/browserPane.svelte";
+  import { layout } from "$lib/stores/layout.svelte";
   import { theme } from "$lib/stores/theme.svelte";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
@@ -49,6 +51,8 @@
 
   onMount(() => {
     theme.init();
+    layout.init();
+    browserPane.initWidth();
     workspaceStore.refresh();
     providerStore.load();
     // App-level tool-approval listener, so a background chat's permission
@@ -70,10 +74,22 @@
   <Titlebar />
   <div class="body">
     <Sidebar />
+    <PaneDivider
+      ariaLabel="Resize sidebar"
+      onbegin={() => browserPane.beginResize()}
+      onmove={(x) => layout.setSidebarWidth(x)}
+      onend={() => browserPane.endResize()}
+    />
     <main class="content">
       {@render children()}
     </main>
     {#if browserPane.open && isChatRoute}
+      <PaneDivider
+        ariaLabel="Resize browser pane"
+        onbegin={() => browserPane.beginResize()}
+        onmove={(x) => browserPane.setWidth(window.innerWidth - x)}
+        onend={() => browserPane.endResize()}
+      />
       <BrowserPane />
     {/if}
   </div>
@@ -118,9 +134,18 @@
 
   .content {
     flex: 1;
+    min-width: 0;
     overflow: auto;
     padding: 1.5rem 2rem;
     background: var(--bg-app);
+  }
+
+  /* While a divider is being dragged, keep the col-resize cursor everywhere and
+     suppress text selection (set on <body> by PaneDivider). */
+  :global(body.resizing-col),
+  :global(body.resizing-col *) {
+    cursor: col-resize !important;
+    user-select: none !important;
   }
 
   .feedback-fab {

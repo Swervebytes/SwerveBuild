@@ -15,7 +15,10 @@
   });
 
   function pushBounds() {
-    if (!viewport) return;
+    // While a divider is being dragged the webview stays parked — otherwise the
+    // ResizeObserver would un-park it mid-drag (it resizes with the pane) and it
+    // would swallow the pointer. endResize() re-pushes once the drag settles.
+    if (!viewport || browserPane.dragging) return;
     const r = viewport.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) return;
     // A native child webview is positioned in DEVICE pixels; getBoundingClientRect
@@ -30,11 +33,15 @@
     );
   }
 
-  // A native webview always paints ABOVE the HTML, so while a modal is up we
-  // park it offscreen, then realign once the modal closes.
+  // A native webview always paints ABOVE the HTML, so we park it offscreen while
+  // a modal is up OR a divider is being dragged, then realign afterwards.
+  // Re-runs on width / realignTick changes too (drag end bumps the tick).
   $effect(() => {
     const modalOpen = !!permissionStore.current;
-    if (modalOpen) browserPane.park();
+    const isDragging = browserPane.dragging;
+    void browserPane.width;
+    void browserPane.realignTick;
+    if (modalOpen || isDragging) browserPane.park();
     else pushBounds();
   });
 
@@ -61,7 +68,7 @@
   }
 </script>
 
-<section class="browser-pane" aria-label="Local preview browser">
+<section class="browser-pane" aria-label="Local preview browser" style="width: {browserPane.width}px">
   <div class="toolbar">
     <button
       class="tb-btn"
@@ -141,8 +148,9 @@
   .browser-pane {
     display: flex;
     flex-direction: column;
-    width: clamp(420px, 44%, 960px);
-    min-width: 380px;
+    /* width is set inline from the resizable store (S13f); don't flex-grow. */
+    flex: 0 0 auto;
+    min-width: 340px;
     height: 100%;
     border-left: 1px solid var(--border);
     background: var(--bg-app);

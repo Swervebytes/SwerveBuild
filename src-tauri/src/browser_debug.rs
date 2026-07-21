@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use crate::app_ui_cdp::{self, CdpTarget};
@@ -847,6 +847,7 @@ fn navigate_impl(action: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
 
     #[test]
     fn default_grant_is_denied_and_gate_messages() {
