@@ -2,6 +2,7 @@ mod acp;
 pub mod app_ui;
 mod app_ui_cdp;
 pub mod browser_debug;
+mod chat_media;
 mod env_context;
 mod grok_config;
 mod jobs;
@@ -651,6 +652,7 @@ fn append_chat_message(
     role: String,
     content: String,
     images: Vec<String>,
+    videos: Option<Vec<String>>,
     parts: Option<Vec<MessagePart>>,
 ) -> Result<ChatMessage, String> {
     let _guard = Store::lock();
@@ -666,6 +668,7 @@ fn append_chat_message(
         role,
         content,
         images,
+        videos: videos.unwrap_or_default(),
         parts: parts.unwrap_or_default(),
         created_at: Store::now(),
     };
@@ -683,6 +686,30 @@ fn append_chat_message(
 #[tauri::command]
 fn save_pasted_image(data_url: String) -> Result<String, String> {
     acp::save_image_base64(&data_url)
+}
+
+/// Scan an agent turn's text for image/video artifact paths (chat_media.rs),
+/// verify them on disk (relative → the chat's project folder), copy survivors
+/// into the attachments dir, and return the stored paths for persistence.
+#[tauri::command]
+fn detect_chat_media(chat_id: String, text: String) -> Result<serde_json::Value, String> {
+    let store = Store::load();
+    let chat = store
+        .chats
+        .iter()
+        .find(|c| c.id == chat_id)
+        .ok_or_else(|| "Chat not found".to_string())?;
+    let cwd = store
+        .projects
+        .iter()
+        .find(|p| p.id == chat.project_id)
+        .map(|p| std::path::PathBuf::from(&p.path))
+        .filter(|p| p.is_dir())
+        // No/gone project folder: relative candidates simply won't resolve;
+        // absolute paths still verify.
+        .unwrap_or_else(std::env::temp_dir);
+    let (images, videos) = chat_media::detect_for_turn(&text, &cwd);
+    Ok(serde_json::json!({ "images": images, "videos": videos }))
 }
 
 #[tauri::command]
@@ -1320,6 +1347,7 @@ pub fn run() {
             get_chat,
             append_chat_message,
             save_pasted_image,
+            detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,
             close_chat_session,

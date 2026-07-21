@@ -58,6 +58,7 @@
         role={m.role === "user" ? "user" : "assistant"}
         content={m.content}
         images={m.images}
+        videos={m.videos ?? []}
         {imageSrc}
       />
     {/each}
