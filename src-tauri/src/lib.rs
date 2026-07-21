@@ -1328,6 +1328,9 @@ pub fn run() {
                 }
                 Err(e) => eprintln!("[swervebuild] debug pane url: {e}"),
             }
+            // S13c: hold a persistent CDP session to the pane so the console/
+            // network hooks + the browser toolbar survive every navigation.
+            browser_debug::spawn_pane_supervisor();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

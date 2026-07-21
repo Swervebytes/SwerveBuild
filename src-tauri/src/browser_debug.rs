@@ -271,11 +271,76 @@ const HOOK_JS: &str = r#"(function () {
 
 // NOTE on hook lifetime: `Page.addScriptToEvaluateOnNewDocument` registrations
 // are SESSION-scoped — they vanish when the registering DevTools session
-// detaches. So `open()` registers and navigates on ONE held `CdpSession`; the
-// navigated document runs the hook at document-start, and the buffers then live
-// in the page itself (surviving session close). Consequence: page-internal
-// navigations/reloads produce un-hooked documents until the next
-// `browser_open`. Recorded in design/browser-debug.md.
+// detaches. `open()` registers on its own held session for the navigation it
+// drives; the app-side SUPERVISOR (below, S13c) holds a permanent session so the
+// hook + toolbar survive EVERY navigation (human or agent), not just the one
+// `open()` drove.
+
+/// A shadow-DOM browser toolbar injected at document-start (URL bar +
+/// back/forward/reload). Shadow-isolated so it stays out of the app's
+/// `body.innerText` / `querySelector` (agent reads stay clean); pushes the body
+/// down 40px so nothing is hidden. Self-driving (history / location.href), with
+/// the same loopback-only policy the agent's `browser_open` enforces.
+const TOOLBAR_JS: &str = r##"(function(){
+  if (window.__swerveToolbar) return;
+  window.__swerveToolbar = true;
+  function isLoopback(h){ h=(h||'').toLowerCase(); return h==='localhost'||h==='[::1]'||h==='::1'||/^127\./.test(h); }
+  function build(){
+    if (!document.body) { return setTimeout(build, 30); }
+    var host = document.createElement('div');
+    host.id='__swerve_tb';
+    host.style.cssText='position:fixed;top:0;left:0;right:0;height:40px;z-index:2147483647;';
+    var root = host.attachShadow ? host.attachShadow({mode:'open'}) : host;
+    root.innerHTML='<style>*{box-sizing:border-box;font-family:system-ui,sans-serif}.bar{display:flex;align-items:center;gap:6px;height:40px;padding:0 8px;background:#1b1b1f;border-bottom:1px solid #333}button{background:#2a2a30;color:#ddd;border:1px solid #3a3a42;border-radius:6px;height:26px;min-width:30px;cursor:pointer;font-size:14px}button:hover{background:#33333b}input{flex:1;height:28px;background:#111;color:#eee;border:1px solid #3a3a42;border-radius:6px;padding:0 10px;font-size:13px}.msg{color:#e8452c;font-size:11px;white-space:nowrap}</style><div class="bar"><button id="b" title="Back">&#9664;</button><button id="f" title="Forward">&#9654;</button><button id="r" title="Reload">&#8635;</button><input id="u" spellcheck="false" placeholder="localhost URL" /><span class="msg" id="m"></span></div>';
+    document.documentElement.appendChild(host);
+    var pad=document.createElement('style'); pad.setAttribute('data-swerve-tb','1'); pad.textContent='body{margin-top:40px !important}'; (document.head||document.documentElement).appendChild(pad);
+    var q=function(s){return root.querySelector(s)};
+    q('#b').onclick=function(){history.back()};
+    q('#f').onclick=function(){history.forward()};
+    q('#r').onclick=function(){location.reload()};
+    var u=q('#u'), m=q('#m'); u.value=location.href;
+    u.addEventListener('keydown',function(e){ if(e.key!=='Enter')return; var v=u.value.trim(); if(!v)return; if(!/^https?:\/\//i.test(v)) v='http://'+v; var hn; try{hn=new URL(v).hostname}catch(_){m.textContent='bad url';return} if(!isLoopback(hn)){m.textContent='localhost only';return} m.textContent=''; location.href=v; });
+  }
+  build();
+})();"##;
+
+/// The full page-init script the persistent supervisor keeps registered: the
+/// console/network capture hook plus the browser toolbar. Both are idempotent
+/// per document.
+fn pane_init_js() -> String {
+    format!("{HOOK_JS}\n{TOOLBAR_JS}")
+}
+
+/// Establish and HOLD one CDP session to the pane with the init script
+/// registered for document-start, so it survives every navigation. Returns Err
+/// when the pane isn't ready or the session drops (the supervisor loop retries).
+fn supervise_once() -> Result<(), String> {
+    let ep = require_endpoint()?;
+    let pane = find_pane(&ep)?;
+    let mut session = app_ui_cdp::CdpSession::connect(&pane.web_socket_debugger_url)?;
+    session.call("Page.enable", json!({}))?;
+    session.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": pane_init_js() }))?;
+    let _ = session.evaluate(&pane_init_js()); // seed the CURRENT document too
+    // Hold the session open — the registration lives exactly as long as this
+    // websocket does. A cheap probe detects a dropped/recreated webview so the
+    // supervisor can reconnect and re-register.
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        if session.evaluate("1").is_err() {
+            return Err("pane CDP session dropped".into());
+        }
+    }
+}
+
+/// Start the app-side pane supervisor (call once from `run()`'s `setup`). Keeps
+/// hooks + toolbar alive across all navigations; reconnects if the pane's webview
+/// is recreated. No-op-safe if CDP never comes up (it just keeps retrying).
+pub fn spawn_pane_supervisor() {
+    std::thread::spawn(|| loop {
+        let _ = supervise_once();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    });
+}
 
 // --------------------------------------------------------------------- tools
 
@@ -461,6 +526,7 @@ pub fn state_report() -> Value {
         "paneTitle": title,
         "hooksInstalled": hooks,
         "policy": "read + interact; http/https to loopback hosts only; navigations logged",
+        "humanToolbar": "injected URL bar + back/forward/reload (Settings → Show pane to use); hooks persist across navigations",
         "tools": {
             "browser_state": "available",
             "browser_open": tool_status,
@@ -641,9 +707,9 @@ pub fn type_text(selector: &str, text: &str, clear: bool) -> Result<Value, Strin
     Ok(json!({ "ok": true, "selector": sel, "result": value, "via": "cdp" }))
 }
 
-/// History navigation in the pane: back | forward | reload. A reload/back yields
-/// an un-hooked document (hooks are document-start-registered per browser_open),
-/// so console/network capture resumes only after the next `browser_open`.
+/// History navigation in the pane: back | forward | reload. With the S13c
+/// persistent supervisor, hooks + toolbar survive these navigations, so
+/// console/network keep capturing.
 pub fn navigate(action: &str) -> Result<Value, String> {
     require_grant()?;
     let js = nav_js(action)?;
@@ -655,12 +721,7 @@ pub fn navigate(action: &str) -> Result<Value, String> {
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     append_nav_log(&url, true, action);
-    Ok(json!({
-        "ok": true,
-        "action": action,
-        "url": url,
-        "note": "console/network capture resumes after the next browser_open",
-    }))
+    Ok(json!({ "ok": true, "action": action, "url": url }))
 }
 
 #[cfg(test)]
