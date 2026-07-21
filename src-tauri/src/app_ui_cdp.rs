@@ -107,17 +107,6 @@ fn take_http_body(buf: &[u8], peer_closed: bool) -> Option<String> {
     None
 }
 
-fn split_http_body(raw: &str) -> Option<&str> {
-    // Handle both CRLF and LF separators (unit tests + callers).
-    if let Some(i) = raw.find("\r\n\r\n") {
-        return Some(&raw[i + 4..]);
-    }
-    if let Some(i) = raw.find("\n\n") {
-        return Some(&raw[i + 2..]);
-    }
-    None
-}
-
 /// List debugger targets. Prefers page-type targets with a websocket URL.
 pub fn list_targets(host: &str, port: u16) -> Result<Vec<CdpTarget>, String> {
     // WebView2 accepts both /json and /json/list.
@@ -335,9 +324,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_http_body_crlf() {
-        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
-        assert_eq!(split_http_body(raw), Some("[]"));
+    fn take_http_body_content_length_complete() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+        assert_eq!(take_http_body(raw, false).as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn take_http_body_waits_for_full_content_length() {
+        // Body shorter than Content-Length is incomplete — even on close
+        // (a truncated response must error, not silently return a prefix).
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n[]";
+        assert_eq!(take_http_body(raw, false), None);
+        assert_eq!(take_http_body(raw, true), None);
+    }
+
+    #[test]
+    fn take_http_body_no_content_length_needs_close() {
+        let raw = b"HTTP/1.1 200 OK\r\n\r\n{\"a\":1}";
+        assert_eq!(take_http_body(raw, false), None);
+        assert_eq!(take_http_body(raw, true).as_deref(), Some("{\"a\":1}"));
     }
 
     #[test]
