@@ -259,6 +259,46 @@ fn tools() -> Vec<ToolDef> {
                 }
             }),
         },
+        ToolDef {
+            name: "browser_screenshot".into(),
+            description: "Capture the debug browser page as a PNG (visual preview of the local app). Returns an artifact id + path under ~/.swervebuild/browser_debug_artifacts/. Requires the browser debug grant.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "browser_click".into(),
+            description: "Click an element in the debug browser page (to test a local app). Pass a CSS selector or a bare data-testid token. Requires the browser debug grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector or bare data-testid token" }
+                },
+                "required": ["selector"]
+            }),
+        },
+        ToolDef {
+            name: "browser_type".into(),
+            description: "Type into an input / textarea / contenteditable in the debug browser page. Fires real input/change events so the app's bindings react. Pass a CSS selector or bare data-testid. Requires the browser debug grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector or bare data-testid token" },
+                    "text": { "type": "string", "description": "Text to set (max 8000 chars)" },
+                    "clear": { "type": "boolean", "description": "Replace existing value (default true); false appends" }
+                },
+                "required": ["selector", "text"]
+            }),
+        },
+        ToolDef {
+            name: "browser_navigate".into(),
+            description: "History navigation in the debug browser page: back | forward | reload. Note: console/network capture resumes after the next browser_open. Requires the browser debug grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "back | forward | reload" }
+                },
+                "required": ["action"]
+            }),
+        },
     ]
 }
 
@@ -577,6 +617,35 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
         "browser_network" | "swervebuild_browser_network" => {
             let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
             swerve_build_lib::browser_debug::network(clear)
+        }
+        "browser_screenshot" | "swervebuild_browser_screenshot" => {
+            swerve_build_lib::browser_debug::screenshot()
+        }
+        "browser_click" | "swervebuild_browser_click" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "selector required".to_string())?;
+            swerve_build_lib::browser_debug::click(selector)
+        }
+        "browser_type" | "swervebuild_browser_type" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "selector required".to_string())?;
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "text required".to_string())?;
+            let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(true);
+            swerve_build_lib::browser_debug::type_text(selector, text, clear)
+        }
+        "browser_navigate" | "swervebuild_browser_navigate" => {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "action required".to_string())?;
+            swerve_build_lib::browser_debug::navigate(action)
         }
         _ => Err(format!("Unknown tool: {name}")),
     }
