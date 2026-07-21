@@ -159,6 +159,58 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["command"]
             }),
         },
+        // --- Persistent terminal sessions (S11). Hosted in the app process,
+        // --- proxied over the loopback control server. Same Agent terminal grant. ---
+        ToolDef {
+            name: "term_start".into(),
+            description: "Open a PERSISTENT PowerShell session inside the open SwerveBuild project (state — working directory, variables — survives across term_exec calls). Returns a sessionId. cwd (optional) is confined to the project. Requires the app to be running and Settings → Agent terminal grant. Close it with term_close when done.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Optional sub-folder of the project to start in" },
+                    "shell": { "type": "string", "description": "powershell only in v1" }
+                }
+            }),
+        },
+        ToolDef {
+            name: "term_exec".into(),
+            description: "Run a command in an existing persistent session (from term_start) and return the output captured for THIS command plus its exit code. State persists to the next call. Output is size-capped (truncated flagged); a timeout kills the session (timedOut:true). Non-zero exit is a normal result (ok:false).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "sessionId from term_start" },
+                    "command": { "type": "string", "description": "Command to run in the session" },
+                    "timeout_secs": { "type": "number", "description": "Max seconds for this command (default 30, cap 300)" }
+                },
+                "required": ["session_id", "command"]
+            }),
+        },
+        ToolDef {
+            name: "term_read".into(),
+            description: "Page the cumulative output buffer of a persistent session from an optional byte offset (for long-running commands). Returns chunk, nextOffset, base (earliest retained offset), and atEnd (session ended).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "offset": { "type": "number", "description": "Logical byte offset to read from; defaults to the earliest retained" }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDef {
+            name: "term_close".into(),
+            description: "Close a persistent session and kill its shell.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "session_id": { "type": "string" } },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDef {
+            name: "term_list".into(),
+            description: "List open persistent terminal sessions (id, cwd, shell, alive, bytes buffered).".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
     ]
 }
 
@@ -422,6 +474,39 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
             let shell = args.get("shell").and_then(|v| v.as_str());
             swerve_build_lib::terminal::run_command(command, project_id, cwd, timeout_secs, shell)
         }
+        "term_start" | "swervebuild_term_start" => {
+            let cwd = args.get("cwd").and_then(|v| v.as_str());
+            let shell = args.get("shell").and_then(|v| v.as_str());
+            swerve_build_lib::terminal::session_start(cwd, shell)
+        }
+        "term_exec" | "swervebuild_term_exec" => {
+            let session_id = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "session_id required".to_string())?;
+            let command = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "command required".to_string())?;
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+            swerve_build_lib::terminal::session_exec(session_id, command, timeout_secs)
+        }
+        "term_read" | "swervebuild_term_read" => {
+            let session_id = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "session_id required".to_string())?;
+            let offset = args.get("offset").and_then(|v| v.as_u64());
+            swerve_build_lib::terminal::session_read(session_id, offset)
+        }
+        "term_close" | "swervebuild_term_close" => {
+            let session_id = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "session_id required".to_string())?;
+            swerve_build_lib::terminal::session_close(session_id)
+        }
+        "term_list" | "swervebuild_term_list" => swerve_build_lib::terminal::session_list(),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }

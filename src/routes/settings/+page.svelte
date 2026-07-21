@@ -455,13 +455,14 @@
       />
     </div>
     <p class="group-note">
-      Allow the in-app agent to run <strong>one-shot</strong> shell commands via the
-      <code>term_run</code> MCP tool, confined to the open project folder. Output is size-capped and
-      each run is logged. Off by default. Never enabled for automations. Revoke anytime.
+      Allow the in-app agent to run shell commands — <strong>one-shot</strong> (<code>term_run</code>)
+      and <strong>persistent sessions</strong> (<code>term_start</code>/<code>term_exec</code>, which
+      keep a live PowerShell where state persists across commands). Sessions start inside the open
+      project and die with the app. Off by default. Never enabled for automations. Revoke anytime.
     </p>
     <Field
       label="Allow agent to run terminal commands"
-      hint="PowerShell by default; cwd cannot escape the project. Does not grant persistent shells."
+      hint="PowerShell. One-shot runs are cwd-confined; a persistent session can cd anywhere you can — the grant is the gate."
       row
     >
       <div class="segmented" role="radiogroup" aria-label="Agent terminal grant">
