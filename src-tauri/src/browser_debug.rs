@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use crate::app_ui_cdp::{self, CdpTarget};
@@ -47,13 +48,19 @@ const LOAD_POLL_MS: u64 = 250;
 #[serde(rename_all = "camelCase")]
 pub struct BrowserDebugGrant {
     pub granted: bool,
+    /// S13e: allow the browser to open PUBLIC (non-loopback) URLs. Off by
+    /// default — the pane is a local-app preview tool unless the human opts in.
+    /// Independent of `granted`; applies to human + agent navigation alike, and
+    /// the SSRF guard (private/link-local/metadata blocked) holds even when on.
+    #[serde(default)]
+    pub allow_public: bool,
     #[serde(default)]
     pub updated_at: String,
 }
 
 impl Default for BrowserDebugGrant {
     fn default() -> Self {
-        Self { granted: false, updated_at: String::new() }
+        Self { granted: false, allow_public: false, updated_at: String::new() }
     }
 }
 
@@ -72,14 +79,29 @@ pub fn load_grant() -> BrowserDebugGrant {
         .unwrap_or_default()
 }
 
-pub fn set_granted(granted: bool) -> Result<BrowserDebugGrant, String> {
-    let grant = BrowserDebugGrant { granted, updated_at: crate::store::Store::now() };
+fn save_grant(grant: &BrowserDebugGrant) -> Result<(), String> {
     let path = grant_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let raw = serde_json::to_string_pretty(&grant).map_err(|e| e.to_string())?;
-    crate::paths::write_atomic(&path, raw.as_bytes()).map_err(|e| e.to_string())?;
+    let raw = serde_json::to_string_pretty(grant).map_err(|e| e.to_string())?;
+    crate::paths::write_atomic(&path, raw.as_bytes()).map_err(|e| e.to_string())
+}
+
+pub fn set_granted(granted: bool) -> Result<BrowserDebugGrant, String> {
+    // Preserve allow_public — it is an independent axis from the agent grant.
+    let mut grant = load_grant();
+    grant.granted = granted;
+    grant.updated_at = crate::store::Store::now();
+    save_grant(&grant)?;
+    Ok(grant)
+}
+
+pub fn set_allow_public(allow_public: bool) -> Result<BrowserDebugGrant, String> {
+    let mut grant = load_grant();
+    grant.allow_public = allow_public;
+    grant.updated_at = crate::store::Store::now();
+    save_grant(&grant)?;
     Ok(grant)
 }
 
@@ -98,9 +120,50 @@ pub fn require_grant() -> Result<(), String> {
 
 // ----------------------------------------------------------------- URL policy
 
-/// v1 navigation policy: http/https to loopback only (localhost, 127.0.0.0/8,
-/// [::1]). The pane debugs LOCAL web apps; general browsing is refused.
-fn validate_debug_url(raw: &str) -> Result<url::Url, String> {
+pub fn load_allow_public() -> bool {
+    load_grant().allow_public
+}
+
+/// True only for a globally-routable address. Everything private, loopback,
+/// link-local (incl. the 169.254.169.254 cloud-metadata IP), CGNAT, ULA, etc.
+/// is rejected — the SSRF guard that keeps "public browsing" from reaching the
+/// user's LAN or cloud metadata even when they've opted into public URLs.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => {
+            // v4-mapped (::ffff:a.b.c.d) — judge by the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_v4(v4);
+            }
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80) // link-local fe80::/10
+        }
+    }
+}
+
+fn is_public_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    !(v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local() // 169.254/16, includes cloud metadata 169.254.169.254
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+        || o[0] == 0 // 0.0.0.0/8
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)) // CGNAT 100.64.0.0/10
+}
+
+/// Navigation policy. Loopback (localhost / 127.0.0.0/8 / [::1]) is always
+/// allowed — the pane's core job is previewing LOCAL apps. Non-loopback hosts
+/// are refused unless `allow_public` is on; even then the SSRF guard blocks any
+/// host that IS or RESOLVES TO a private/link-local/metadata address.
+/// `allow_public` is passed in so the policy stays pure + unit-testable.
+fn validate_url_with_policy(raw: &str, allow_public: bool) -> Result<url::Url, String> {
     let s = raw.trim();
     if s.is_empty() {
         return Err("url required".into());
@@ -109,23 +172,68 @@ fn validate_debug_url(raw: &str) -> Result<url::Url, String> {
         return Err("url too long (max 2000)".into());
     }
     let parsed = url::Url::parse(s).map_err(|e| format!("bad url: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
+    let port = match parsed.scheme() {
+        "http" => parsed.port().unwrap_or(80),
+        "https" => parsed.port().unwrap_or(443),
         other => return Err(format!("scheme {other}: only http/https are allowed")),
-    }
-    let loopback = match parsed.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
     };
-    if !loopback {
+
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => {
+            if d.eq_ignore_ascii_case("localhost") {
+                return Ok(parsed);
+            }
+            if !allow_public {
+                return Err(public_disabled_msg(d));
+            }
+            // SSRF: resolve and require EVERY address be globally routable, so a
+            // public name that (re)binds to a LAN/metadata IP is refused.
+            let addrs: Vec<IpAddr> = (d, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("could not resolve host {d}: {e}"))?
+                .map(|sa| sa.ip())
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("could not resolve host {d}"));
+            }
+            for ip in addrs {
+                if !is_public_ip(ip) {
+                    return Err(format!(
+                        "blocked: {d} resolves to a non-public address ({ip}) — refused by the SSRF guard"
+                    ));
+                }
+            }
+            Ok(parsed)
+        }
+        Some(url::Host::Ipv4(ip)) => check_literal_ip(&parsed, IpAddr::V4(ip), allow_public),
+        Some(url::Host::Ipv6(ip)) => check_literal_ip(&parsed, IpAddr::V6(ip), allow_public),
+        None => Err("url has no host".into()),
+    }
+}
+
+fn check_literal_ip(parsed: &url::Url, ip: IpAddr, allow_public: bool) -> Result<url::Url, String> {
+    if ip.is_loopback() {
+        return Ok(parsed.clone());
+    }
+    if !allow_public {
+        return Err(public_disabled_msg(&ip.to_string()));
+    }
+    if !is_public_ip(ip) {
         return Err(format!(
-            "host not allowed: {} — the debug browser is for LOCAL web apps (localhost / 127.0.0.1 / [::1] only)",
-            parsed.host_str().unwrap_or("?")
+            "blocked: {ip} is a private/link-local address — refused by the SSRF guard"
         ));
     }
-    Ok(parsed)
+    Ok(parsed.clone())
+}
+
+fn public_disabled_msg(host: &str) -> String {
+    format!(
+        "host not allowed: {host} — enable \"Allow public websites\" in Settings → Agent browser debug to open non-localhost URLs (localhost is always allowed)"
+    )
+}
+
+fn validate_debug_url(raw: &str) -> Result<url::Url, String> {
+    validate_url_with_policy(raw, load_allow_public())
 }
 
 // ------------------------------------------------------------- target finding
@@ -288,7 +396,8 @@ fn pane_init_js() -> String {
 /// Establish and HOLD one CDP session to the pane with the init script
 /// registered for document-start, so it survives every navigation. Returns Err
 /// when the pane isn't ready or the session drops (the supervisor loop retries).
-fn supervise_once() -> Result<(), String> {
+fn supervise_once(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Emitter;
     let ep = require_endpoint()?;
     let pane = find_pane(&ep)?;
     let mut session = app_ui_cdp::CdpSession::connect(&pane.web_socket_debugger_url)?;
@@ -296,22 +405,34 @@ fn supervise_once() -> Result<(), String> {
     session.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": pane_init_js() }))?;
     let _ = session.evaluate(&pane_init_js()); // seed the CURRENT document too
     // Hold the session open — the registration lives exactly as long as this
-    // websocket does. A cheap probe detects a dropped/recreated webview so the
-    // supervisor can reconnect and re-register.
+    // websocket does. The same poll that detects a dropped/recreated webview also
+    // watches location.href: when the pane navigates to a real page (agent OR
+    // human), emit `browser-pane-activity` so the chat can auto-open the dock.
+    let mut last_url = String::new();
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        if session.evaluate("1").is_err() {
-            return Err("pane CDP session dropped".into());
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        match session.evaluate("location.href") {
+            Ok(v) => {
+                let url = v.as_str().unwrap_or_default().to_string();
+                if url != last_url {
+                    last_url = url.clone();
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        let _ = app.emit("browser-pane-activity", json!({ "url": url }));
+                    }
+                }
+            }
+            Err(_) => return Err("pane CDP session dropped".into()),
         }
     }
 }
 
 /// Start the app-side pane supervisor (call once from `run()`'s `setup`). Keeps
-/// hooks + toolbar alive across all navigations; reconnects if the pane's webview
-/// is recreated. No-op-safe if CDP never comes up (it just keeps retrying).
-pub fn spawn_pane_supervisor() {
-    std::thread::spawn(|| loop {
-        let _ = supervise_once();
+/// hooks alive across all navigations, reconnects if the pane's webview is
+/// recreated, and emits `browser-pane-activity` on navigation. No-op-safe if CDP
+/// never comes up (it just keeps retrying).
+pub fn spawn_pane_supervisor(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        let _ = supervise_once(&app);
         std::thread::sleep(std::time::Duration::from_secs(3));
     });
 }
@@ -504,14 +625,19 @@ pub fn state_report() -> Value {
     };
     json!({
         "granted": grant.granted,
+        "allowPublic": grant.allow_public,
         "grantUpdatedAt": grant.updated_at,
         "cdpReady": ready,
         "paneFound": pane_found,
         "paneUrl": url,
         "paneTitle": title,
         "hooksInstalled": hooks,
-        "policy": "read + interact; http/https to loopback hosts only; navigations logged",
-        "humanToolbar": "docked pane in the app window with a real toolbar (URL bar + back/forward/reload); toggle from the titlebar globe or Settings → Show pane; hooks persist across navigations",
+        "policy": if grant.allow_public {
+            "read + interact; http/https; loopback + PUBLIC hosts (private/link-local/metadata blocked by SSRF guard); navigations logged"
+        } else {
+            "read + interact; http/https to loopback hosts only (enable Allow public websites for the internet); navigations logged"
+        },
+        "humanToolbar": "docked pane in the chat with a real toolbar (URL bar + back/forward/reload); toggle from the chat header globe or Settings → Show pane; auto-opens when the agent navigates; hooks persist across navigations",
         "tools": {
             "browser_state": "available",
             "browser_open": tool_status,
@@ -732,33 +858,89 @@ mod tests {
     }
 
     #[test]
-    fn url_policy_allows_loopback_http() {
-        assert!(validate_debug_url("http://localhost:5500/index.html").is_ok());
-        assert!(validate_debug_url("http://127.0.0.1:3000").is_ok());
-        assert!(validate_debug_url("http://127.5.4.3:3000/x").is_ok()); // 127/8 loopback
-        assert!(validate_debug_url("https://LOCALHOST:8443/app").is_ok());
-        assert!(validate_debug_url("http://[::1]:8080/dev").is_ok());
+    fn url_policy_allows_loopback_regardless_of_public() {
+        for allow in [false, true] {
+            assert!(validate_url_with_policy("http://localhost:5500/index.html", allow).is_ok());
+            assert!(validate_url_with_policy("http://127.0.0.1:3000", allow).is_ok());
+            assert!(validate_url_with_policy("http://127.5.4.3:3000/x", allow).is_ok()); // 127/8
+            assert!(validate_url_with_policy("https://LOCALHOST:8443/app", allow).is_ok());
+            assert!(validate_url_with_policy("http://[::1]:8080/dev", allow).is_ok());
+        }
     }
 
     #[test]
-    fn url_policy_refuses_everything_else() {
-        for bad in [
-            "",
-            "   ",
+    fn url_policy_refuses_bad_scheme_and_garbage() {
+        for allow in [false, true] {
+            for bad in [
+                "",
+                "   ",
+                "file:///C:/secrets.txt",
+                "javascript:alert(1)",
+                "ftp://localhost/x",
+                "tauri://localhost",
+                "not a url",
+            ] {
+                assert!(
+                    validate_url_with_policy(bad, allow).is_err(),
+                    "should refuse: {bad} (allow={allow})"
+                );
+            }
+            let long = format!("http://localhost/{}", "x".repeat(2100));
+            assert!(validate_url_with_policy(&long, allow).is_err());
+        }
+    }
+
+    #[test]
+    fn url_policy_public_off_refuses_remote() {
+        // Default posture: only loopback; every non-loopback host refused.
+        for host in [
             "http://example.com",
             "https://google.com/",
             "http://192.168.1.10:8080",
             "http://10.0.0.5",
-            "file:///C:/secrets.txt",
-            "javascript:alert(1)",
-            "ftp://localhost/x",
-            "tauri://localhost",
-            "not a url",
+            "http://8.8.8.8",
         ] {
-            assert!(validate_debug_url(bad).is_err(), "should refuse: {bad}");
+            assert!(
+                validate_url_with_policy(host, false).is_err(),
+                "public off should refuse {host}"
+            );
         }
-        let long = format!("http://localhost/{}", "x".repeat(2100));
-        assert!(validate_debug_url(&long).is_err());
+    }
+
+    #[test]
+    fn url_policy_public_on_allows_public_ip_but_ssrf_guard_blocks_private() {
+        // Public literal IPs allowed once opted in (no DNS in the test).
+        assert!(validate_url_with_policy("http://8.8.8.8", true).is_ok());
+        assert!(validate_url_with_policy("https://1.1.1.1/", true).is_ok());
+        // SSRF guard still blocks private / link-local / metadata / ULA / CGNAT.
+        for bad in [
+            "http://192.168.1.10:8080",
+            "http://10.0.0.5",
+            "http://172.16.0.1",
+            "http://169.254.169.254/latest/meta-data/", // cloud metadata
+            "http://100.64.0.1",                        // CGNAT
+            "http://[fd00::1]/",                         // ULA
+        ] {
+            assert!(
+                validate_url_with_policy(bad, true).is_err(),
+                "SSRF guard should block {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_ip_classification() {
+        assert!(is_public_v4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_public_v4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_public_v4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!is_public_v4(Ipv4Addr::new(10, 1, 2, 3)));
+        assert!(!is_public_v4(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(!is_public_v4(Ipv4Addr::new(169, 254, 169, 254))); // metadata
+        assert!(!is_public_v4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_public_v4(Ipv4Addr::new(100, 64, 0, 1))); // CGNAT
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // v4-mapped private is judged by the embedded v4.
+        assert!(!is_public_ip("::ffff:192.168.0.1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]

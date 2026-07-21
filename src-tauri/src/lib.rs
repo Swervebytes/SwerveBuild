@@ -1234,6 +1234,13 @@ fn set_browser_debug_grant(granted: bool) -> Result<browser_debug::BrowserDebugG
     browser_debug::set_granted(granted)
 }
 
+/// S13e: toggle whether the browser may open PUBLIC (non-loopback) URLs. Off by
+/// default; the SSRF guard (private/link-local/metadata) holds even when on.
+#[tauri::command]
+fn set_browser_public(allow: bool) -> Result<browser_debug::BrowserDebugGrant, String> {
+    browser_debug::set_allow_public(allow)
+}
+
 /// Offscreen Y (logical px) where the docked debug pane is parked when the
 /// human dock is closed. Far below any real window height so the child webview
 /// is clipped out of view, yet still alive — the agent's browser_* tools and
@@ -1384,7 +1391,7 @@ pub fn run() {
             });
             // S13c: hold a persistent CDP session to the pane so the console/
             // network capture hooks survive every navigation (human or agent).
-            browser_debug::spawn_pane_supervisor();
+            browser_debug::spawn_pane_supervisor(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1448,6 +1455,7 @@ pub fn run() {
             set_term_grant,
             get_browser_debug_grant,
             set_browser_debug_grant,
+            set_browser_public,
             browser_pane_set_bounds,
             browser_pane_park,
             browser_pane_open,

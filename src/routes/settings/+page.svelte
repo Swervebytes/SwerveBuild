@@ -8,7 +8,6 @@
   import ProviderList from "$lib/components/providers/ProviderList.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import LocalModelsCard from "$lib/components/models/LocalModelsCard.svelte";
-  import { browserPane } from "$lib/stores/browserPane.svelte";
   import { APP_VERSION } from "$lib/version";
 
   type GrokStatus = {
@@ -56,6 +55,7 @@
   let termSaving = $state(false);
   let termMessage = $state<string | null>(null);
   let browserGranted = $state(false);
+  let browserAllowPublic = $state(false);
   let browserSaving = $state(false);
   let browserMessage = $state<string | null>(null);
 
@@ -99,10 +99,14 @@
       termGranted = false;
     }
     try {
-      const grant = await invoke<{ granted: boolean }>("get_browser_debug_grant");
+      const grant = await invoke<{ granted: boolean; allowPublic?: boolean }>(
+        "get_browser_debug_grant",
+      );
       browserGranted = !!grant.granted;
+      browserAllowPublic = !!grant.allowPublic;
     } catch {
       browserGranted = false;
+      browserAllowPublic = false;
     }
   });
 
@@ -151,8 +155,26 @@
       });
       browserGranted = !!grant.granted;
       browserMessage = browserGranted
-        ? "Agents may drive the debug browser (read-only, localhost apps only)."
-        : "Debug browser access revoked.";
+        ? "Agents may drive the preview browser in a chat."
+        : "Agent browser access revoked.";
+    } catch (e) {
+      browserMessage = String(e);
+    } finally {
+      browserSaving = false;
+    }
+  }
+
+  async function setBrowserPublic(next: boolean) {
+    browserSaving = true;
+    browserMessage = null;
+    try {
+      const grant = await invoke<{ allowPublic?: boolean }>("set_browser_public", {
+        allow: next,
+      });
+      browserAllowPublic = !!grant.allowPublic;
+      browserMessage = browserAllowPublic
+        ? "Public websites allowed. Private/LAN/cloud-metadata addresses stay blocked (SSRF guard)."
+        : "Public browsing off — localhost only.";
     } catch (e) {
       browserMessage = String(e);
     } finally {
@@ -533,15 +555,14 @@
       />
     </div>
     <p class="group-note">
-      Allow the in-app agent to drive the <strong>preview browser</strong> via
-      <code>browser_*</code> MCP tools — navigate to a <strong>localhost</strong> app, read the page,
-      console, and fetch/XHR activity. Agent navigations are logged. Off by default; revoke anytime.
-      The browser is a docked pane in this window — toggle it from the titlebar globe or
-      <strong>Show pane</strong> below to watch (and drive) the same webview the agent sees.
+      A <strong>preview browser</strong> docked in the chat — open it from the globe in a chat's
+      header. The in-app agent can drive it via <code>browser_*</code> MCP tools (navigate, read the
+      page, console, fetch/XHR, click, screenshot), and the pane <strong>auto-opens</strong> when the
+      agent navigates. Agent access is off by default; every navigation is logged.
     </p>
     <Field
-      label="Allow agent to use the debug browser"
-      hint="http/https to localhost only. Toggle the pane from the titlebar globe."
+      label="Allow agent to use the browser"
+      hint="Lets the in-app agent drive the preview browser. You can always open it yourself from a chat."
       row
     >
       <div class="segmented" role="radiogroup" aria-label="Browser debug grant">
@@ -570,10 +591,37 @@
         </button>
       </div>
     </Field>
-    <div class="pane-row">
-      <button class="btn btn-sm" onclick={() => browserPane.openPane()}>Show pane</button>
-      <button class="btn btn-sm" onclick={() => browserPane.closePane()}>Hide pane</button>
-    </div>
+    <Field
+      label="Allow public websites"
+      hint="Off = localhost only (safe default). On = the open web too — but private, LAN, and cloud-metadata addresses stay blocked (SSRF guard), and navigations are logged."
+      row
+    >
+      <div class="segmented" role="radiogroup" aria-label="Public websites">
+        <button
+          class="seg"
+          class:active={!browserAllowPublic}
+          type="button"
+          role="radio"
+          aria-checked={!browserAllowPublic}
+          disabled={browserSaving}
+          onclick={() => setBrowserPublic(false)}
+        >
+          Localhost only
+        </button>
+        <button
+          class="seg"
+          class:active={browserAllowPublic}
+          type="button"
+          role="radio"
+          aria-checked={browserAllowPublic}
+          disabled={browserSaving}
+          data-testid="browser-public-on"
+          onclick={() => setBrowserPublic(true)}
+        >
+          Public + localhost
+        </button>
+      </div>
+    </Field>
     {#if browserMessage}
       <p class="ep-msg">{browserMessage}</p>
     {/if}
@@ -738,11 +786,6 @@
     color: var(--text-secondary);
     margin-top: 0.6rem;
     word-break: break-word;
-  }
-  .pane-row {
-    display: flex;
-    gap: 0.5rem;
-    margin-top: 0.6rem;
   }
   .ep-msg.error {
     color: var(--danger, #ff6b6b);

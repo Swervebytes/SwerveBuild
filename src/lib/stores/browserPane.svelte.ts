@@ -78,6 +78,16 @@ export const browserPane = {
     persistPark();
   },
 
+  /**
+   * The pane navigated (agent drove `browser_open`, or a human nav) — surfaced
+   * by the Rust `browser-pane-activity` event. Auto-open the dock so the human
+   * sees what the agent is doing, and reflect the landed URL.
+   */
+  onActivity(nextUrl?: string) {
+    if (nextUrl) url = nextUrl;
+    open = true;
+  },
+
   /** Navigate the pane to a localhost URL (loopback-only, enforced in Rust). */
   async navigate(next: string) {
     const target = next.trim();

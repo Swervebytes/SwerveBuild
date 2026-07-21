@@ -2,6 +2,7 @@
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import ProviderPicker from "$lib/components/providers/ProviderPicker.svelte";
   import ModelPicker from "$lib/components/models/ModelPicker.svelte";
+  import { browserPane } from "$lib/stores/browserPane.svelte";
 
   let {
     title,
@@ -53,6 +54,20 @@
       <ModelPicker value={modelId} disabled={modelSwitching} onchange={onmodelchange} />
     {/if}
     <ProviderPicker />
+    <button
+      class="browser-toggle"
+      class:active={browserPane.open}
+      type="button"
+      onclick={() => browserPane.toggle()}
+      aria-label="Toggle preview browser"
+      aria-pressed={browserPane.open}
+      title="Preview browser — open a localhost or web page here"
+    >
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.25" />
+        <path d="M1.75 8h12.5M8 1.75c1.9 2 1.9 10.5 0 12.5M8 1.75c-1.9 2-1.9 10.5 0 12.5" />
+      </svg>
+    </button>
     <a class="btn btn-ghost btn-sm" href="/projects">All chats</a>
   </div>
 </header>
@@ -101,5 +116,36 @@
     align-items: center;
     gap: 0.5rem;
     flex-shrink: 0;
+  }
+  .browser-toggle {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 6px);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition:
+      background var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease),
+      border-color var(--dur-fast) var(--ease);
+  }
+  .browser-toggle svg {
+    stroke: currentColor;
+    stroke-width: 1.3;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .browser-toggle:hover {
+    color: var(--text-primary);
+    border-color: var(--sc-accent);
+  }
+  .browser-toggle.active {
+    color: var(--sc-accent);
+    border-color: var(--sc-accent);
+    background: var(--sc-accent-tint);
   }
 </style>
