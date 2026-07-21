@@ -1219,6 +1219,11 @@ pub fn run() {
     let wf_mgr = Arc::new(workflows_tauri::WorkflowManager::default());
     let wf_exit = wf_mgr.clone();
     let wf_sched = wf_mgr.clone();
+    // Persistent terminal sessions live in this (app) process; the sidecar
+    // proxies to them over a loopback control server started in setup().
+    let term_mgr = Arc::new(terminal::SessionManager::default());
+    let term_exit = term_mgr.clone();
+    let term_serve = term_mgr.clone();
 
     tauri::Builder::default()
         // Must be the FIRST plugin: a second launch focuses the existing window
@@ -1236,9 +1241,13 @@ pub fn run() {
         .manage(acp)
         .manage(job_mgr)
         .manage(wf_mgr)
+        .manage(term_mgr)
         .setup(move |app| {
             jobs::spawn_scheduler(app.handle().clone(), jobs_sched);
             workflows_tauri::spawn_scheduler(app.handle().clone(), wf_sched);
+            if let Err(e) = terminal::serve(term_serve) {
+                eprintln!("[swervebuild] terminal control server: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1323,6 +1332,7 @@ pub fn run() {
                 acp_exit.close_all();
                 jobs_exit.cancel_all();
                 wf_exit.cancel_all();
+                term_exit.kill_all();
                 local_llm::manager().shutdown();
             }
         });

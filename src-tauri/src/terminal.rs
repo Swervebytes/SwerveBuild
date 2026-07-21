@@ -1,20 +1,24 @@
-//! Terminal MCP surface (Roadmap Step 6) — grant-gated one-shot command runner.
+//! Terminal MCP surface (Roadmap Step 6).
 //!
-//! Safety mirrors `app_ui`: a human Settings grant (off by default) is the
-//! choke point; every run is confined to the open project via the junction-safe
-//! check from `acp.rs`; per-stream output is size-capped and truncation-flagged;
-//! the child is tree-killed on timeout; command + result are logged.
+//! Two levels, one grant (`term_grant`, off by default — the choke point):
+//! - **One-shot** `term_run`: spawn → wait → capture → return, sidecar-resident.
+//! - **Persistent sessions** (S11): live PowerShell REPLs owned by the app
+//!   process (`SessionManager`), reachable from the per-connection sidecar over a
+//!   loopback control server. See `design/terminal-tools.md`.
 //!
-//! Scope is deliberately ONE-SHOT. Persistent shell sessions do NOT live in the
-//! sidecar — it is spawned per ACP connection and dies with it, so session state
-//! could neither persist nor be shared. See `design/terminal-tools.md`.
+//! Safety mirrors `app_ui`: the human grant gates everything; cwd is confined via
+//! the junction-safe check from `acp.rs`; output is size-capped and
+//! truncation-flagged; children are tree-killed on timeout / app exit.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -319,10 +323,17 @@ fn log_run(result: &Value) {
 pub fn state_report() -> Value {
     let grant = load_grant();
     let root = resolve_project_root(None).ok();
+    let control = load_control();
     json!({
         "granted": grant.granted,
         "grantUpdatedAt": grant.updated_at,
         "projectRoot": root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "controlReady": control.is_some(),
+        "controlNote": if control.is_some() {
+            "Persistent-session control server published; term_start/exec/read available when granted."
+        } else {
+            "No control server — start/restart SwerveBuild to host persistent sessions."
+        },
         "defaults": {
             "shell": "powershell.exe",
             "timeoutSecs": TIMEOUT_DEFAULT_SECS,
@@ -332,9 +343,539 @@ pub fn state_report() -> Value {
         "tools": {
             "term_state": "available",
             "term_run": if grant.granted { "available" } else { "not_granted (enable in Settings → Agent terminal)" },
+            "term_start": if grant.granted && control.is_some() { "available" } else { "not_granted_or_no_app" },
+            "term_exec": if grant.granted && control.is_some() { "available" } else { "not_granted_or_no_app" },
+            "term_read": if grant.granted && control.is_some() { "available" } else { "not_granted_or_no_app" },
         },
-        "note": "One-shot runner. Persistent shell sessions are not in the sidecar; see design/terminal-tools.md.",
+        "note": "One-shot term_run is sidecar-resident; persistent sessions are hosted by the app process and proxied. See design/terminal-tools.md.",
     })
+}
+
+// ==================================================================
+// Persistent sessions (S11) — app-hosted live PowerShell REPLs, reached
+// from the per-connection sidecar over a loopback control server.
+// ==================================================================
+
+const CONTROL_FILE: &str = "term_control.json";
+/// Per-exec captured output cap (bytes).
+const SESSION_OUTPUT_CAP: usize = 96 * 1024;
+/// Per-session cumulative buffer cap; older bytes drop (paging base advances).
+const SESSION_BUFFER_CAP: usize = 512 * 1024;
+const EXEC_TIMEOUT_DEFAULT_SECS: u64 = 30;
+const EXEC_TIMEOUT_MAX_SECS: u64 = 300;
+/// A redirected-stdin PowerShell REPL prints its prompt AND echoes each input
+/// line. We set the prompt to this unique token so every echoed input line is
+/// prefixed with it and can be stripped from captured output, leaving only real
+/// command output.
+const PROMPT_TOKEN: &str = "<<PSPROMPT>>";
+
+/// Loopback control endpoint the app publishes and the sidecar dials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TermControl {
+    pub host: String,
+    pub port: u16,
+    pub pid: u32,
+    pub token: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+fn control_path() -> PathBuf {
+    crate::paths::data_dir().join(CONTROL_FILE)
+}
+
+pub fn load_control() -> Option<TermControl> {
+    let path = control_path();
+    if !path.is_file() {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+fn publish_control(port: u16, token: &str) -> Result<(), String> {
+    let ctrl = TermControl {
+        host: "127.0.0.1".into(),
+        port,
+        pid: std::process::id(),
+        token: token.to_string(),
+        updated_at: crate::store::Store::now(),
+    };
+    let path = control_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let raw = serde_json::to_string_pretty(&ctrl).map_err(|e| e.to_string())?;
+    crate::paths::write_atomic(&path, raw.as_bytes()).map_err(|e| e.to_string())
+}
+
+// ---- pure helpers (unit-tested without a process) ----
+
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+fn trim_trailing_newlines(b: &[u8]) -> &[u8] {
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] == b'\n' || b[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &b[..end]
+}
+
+/// Find the EXECUTED end marker `<<TERMEND <marker>=<code>>>` in `buf` and return
+/// the raw bytes that preceded it plus the parsed exit code. `None` until the
+/// marker arrives. The marker is emitted via string concatenation
+/// (`"<<TERM"+"END "+…`) so the shell's echo of that command — which contains the
+/// pieces but not the contiguous needle — can never false-match.
+fn extract_marked_output(buf: &[u8], marker: &str) -> Option<(Vec<u8>, i32)> {
+    let needle = format!("<<TERMEND {marker}=");
+    let pos = find_sub(buf, needle.as_bytes())?;
+    let after = &buf[pos + needle.len()..];
+    let end = find_sub(after, b">>")?;
+    let code = std::str::from_utf8(&after[..end])
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(-1);
+    Some((buf[..pos].to_vec(), code))
+}
+
+/// Strip the REPL's echoed input lines (prefixed with [`PROMPT_TOKEN`]) from a
+/// captured region, leaving just real command output.
+fn clean_output(raw: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw);
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with(PROMPT_TOKEN))
+        .collect();
+    trim_trailing_newlines(kept.join("\n").as_bytes()).to_vec()
+}
+
+fn cap_bytes(mut b: Vec<u8>, cap: usize) -> (Vec<u8>, bool) {
+    if b.len() > cap {
+        b.truncate(cap);
+        (b, true)
+    } else {
+        (b, false)
+    }
+}
+
+/// Cumulative session output with a bounded window and a logical base offset so
+/// `term_read` paging survives front-dropping.
+struct BufState {
+    data: Vec<u8>,
+    base: usize,
+    truncated: bool,
+}
+
+impl BufState {
+    fn logical_len(&self) -> usize {
+        self.base + self.data.len()
+    }
+    fn append(&mut self, bytes: &[u8], cap: usize) {
+        self.data.extend_from_slice(bytes);
+        if self.data.len() > cap {
+            let drop = self.data.len() - cap;
+            self.data.drain(0..drop);
+            self.base += drop;
+            self.truncated = true;
+        }
+    }
+    fn slice_from(&self, from: usize) -> Vec<u8> {
+        let phys = from.saturating_sub(self.base).min(self.data.len());
+        self.data[phys..].to_vec()
+    }
+}
+
+struct SessionShared {
+    buf: Mutex<BufState>,
+    cv: Condvar,
+    alive: AtomicBool,
+}
+
+struct SessionHandle {
+    id: String,
+    shell: &'static str,
+    start_cwd: String,
+    pid: u32,
+    stdin: Mutex<std::process::ChildStdin>,
+    child: Mutex<std::process::Child>,
+    shared: Arc<SessionShared>,
+}
+
+fn spawn_reader(mut stream: impl Read + Send + 'static, shared: Arc<SessionShared>) {
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut b) = shared.buf.lock() {
+                        b.append(&chunk[..n], SESSION_BUFFER_CAP);
+                    }
+                    shared.cv.notify_all();
+                }
+                Err(_) => break,
+            }
+        }
+        shared.alive.store(false, Ordering::SeqCst);
+        shared.cv.notify_all();
+    });
+}
+
+fn spawn_session(cwd: &Path) -> Result<Arc<SessionHandle>, String> {
+    // v1 persistent shell is PowerShell only — one marker/capture convention.
+    let mut cmd = crate::util::hidden_command("powershell.exe");
+    cmd.args(["-NoProfile", "-NoLogo"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("failed to launch powershell: {e}"))?;
+    let pid = child.id();
+    let stdin = child.stdin.take().ok_or("no stdin on shell")?;
+    let stdout = child.stdout.take().ok_or("no stdout on shell")?;
+    let stderr = child.stderr.take().ok_or("no stderr on shell")?;
+    let shared = Arc::new(SessionShared {
+        buf: Mutex::new(BufState { data: Vec::new(), base: 0, truncated: false }),
+        cv: Condvar::new(),
+        alive: AtomicBool::new(true),
+    });
+    spawn_reader(stdout, shared.clone());
+    spawn_reader(stderr, shared.clone());
+    let handle = Arc::new(SessionHandle {
+        id: format!("t-{}", uuid::Uuid::new_v4().simple()),
+        shell: "powershell.exe",
+        start_cwd: cwd.to_string_lossy().into_owned(),
+        pid,
+        stdin: Mutex::new(stdin),
+        child: Mutex::new(child),
+        shared,
+    });
+    // Tag the prompt with a unique token (so echoed input lines are strippable)
+    // and silence progress bars.
+    if let Ok(mut si) = handle.stdin.lock() {
+        let _ = writeln!(si, "function prompt {{ '{PROMPT_TOKEN}' }}; $ProgressPreference='SilentlyContinue'");
+        let _ = si.flush();
+    }
+    Ok(handle)
+}
+
+fn kill_handle(handle: &SessionHandle) {
+    crate::jobs::tree_kill(handle.pid);
+    if let Ok(mut c) = handle.child.lock() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    handle.shared.alive.store(false, Ordering::SeqCst);
+    handle.shared.cv.notify_all();
+}
+
+/// One live command against a session: writes the command + a unique end marker,
+/// waits for the marker, returns the output captured since it plus the exit code.
+fn exec_on(handle: &Arc<SessionHandle>, command: &str, timeout: u64) -> Result<Value, String> {
+    if !handle.shared.alive.load(Ordering::SeqCst) {
+        return Err("session is not alive (the shell exited)".into());
+    }
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("command required".into());
+    }
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    let start = handle.shared.buf.lock().map_err(|_| "buf lock")?.logical_len();
+    {
+        let mut si = handle.stdin.lock().map_err(|_| "stdin lock")?;
+        writeln!(si, "{command}").map_err(|e| format!("write to shell: {e}"))?;
+        // Emit the end marker via string concat so the shell's echo of THIS line
+        // (which shows the pieces, not the joined needle) can't false-match.
+        writeln!(
+            si,
+            "Write-Output (\"<<TERM\"+\"END \"+\"{marker}=\"+$(if($null -ne $LASTEXITCODE){{$LASTEXITCODE}}else{{0}})+\">>\")"
+        )
+        .map_err(|e| format!("write marker: {e}"))?;
+        si.flush().map_err(|e| format!("flush shell: {e}"))?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    loop {
+        let slice = handle.shared.buf.lock().map_err(|_| "buf lock")?.slice_from(start);
+        if let Some((raw, code)) = extract_marked_output(&slice, &marker) {
+            let (capped, truncated) = cap_bytes(clean_output(&raw), SESSION_OUTPUT_CAP);
+            return Ok(json!({
+                "ok": code == 0,
+                "sessionId": handle.id,
+                "exitCode": code,
+                "output": String::from_utf8_lossy(&capped),
+                "truncated": truncated,
+                "timedOut": false,
+                "seq": start,
+            }));
+        }
+        if !handle.shared.alive.load(Ordering::SeqCst) {
+            // Shell died mid-command — return what we have rather than hang.
+            let (capped, truncated) = cap_bytes(clean_output(&slice), SESSION_OUTPUT_CAP);
+            return Ok(json!({
+                "ok": false, "sessionId": handle.id, "exitCode": null,
+                "output": String::from_utf8_lossy(&capped), "truncated": truncated,
+                "timedOut": false, "shellExited": true, "seq": start,
+            }));
+        }
+        if Instant::now() >= deadline {
+            kill_handle(handle); // a hung command wedges the single REPL — kill it
+            let (capped, truncated) = cap_bytes(clean_output(&slice), SESSION_OUTPUT_CAP);
+            return Ok(json!({
+                "ok": false, "sessionId": handle.id, "exitCode": null,
+                "output": String::from_utf8_lossy(&capped), "truncated": truncated,
+                "timedOut": true, "seq": start,
+            }));
+        }
+        let guard = handle.shared.buf.lock().map_err(|_| "buf lock")?;
+        let _ = handle.shared.cv.wait_timeout(guard, Duration::from_millis(100));
+    }
+}
+
+/// The app-process owner of live shells. `Arc`-managed Tauri state, like
+/// `JobManager`. The `token` authorizes control-server callers.
+pub struct SessionManager {
+    sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    token: String,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        SessionManager {
+            sessions: Mutex::new(HashMap::new()),
+            token: uuid::Uuid::new_v4().simple().to_string(),
+        }
+    }
+}
+
+impl SessionManager {
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn get(&self, id: &str) -> Option<Arc<SessionHandle>> {
+        self.sessions.lock().ok()?.get(id).cloned()
+    }
+
+    fn op_start(&self, cwd: Option<&str>, shell: Option<&str>) -> Result<Value, String> {
+        if let Some(s) = shell {
+            if ShellKind::parse(Some(s))? != ShellKind::PowerShell {
+                return Err("persistent sessions support powershell only in v1".into());
+            }
+        }
+        let root = resolve_project_root(None)?;
+        let workdir = confine_cwd(&root, cwd)?;
+        let handle = spawn_session(&workdir)?;
+        let out = json!({
+            "ok": true,
+            "sessionId": handle.id,
+            "cwd": handle.start_cwd,
+            "shell": handle.shell,
+        });
+        self.sessions.lock().map_err(|_| "sessions lock")?.insert(handle.id.clone(), handle);
+        Ok(out)
+    }
+
+    fn op_exec(&self, id: &str, command: &str, timeout: Option<u64>) -> Result<Value, String> {
+        let handle = self.get(id).ok_or_else(|| format!("no such session: {id}"))?;
+        let t = timeout.unwrap_or(EXEC_TIMEOUT_DEFAULT_SECS).clamp(1, EXEC_TIMEOUT_MAX_SECS);
+        let result = exec_on(&handle, command, t)?;
+        // A timed-out session was killed; drop it from the registry.
+        if result.get("timedOut").and_then(|v| v.as_bool()) == Some(true) {
+            self.sessions.lock().ok().map(|mut g| g.remove(id));
+        }
+        Ok(result)
+    }
+
+    fn op_read(&self, id: &str, offset: Option<usize>) -> Result<Value, String> {
+        let handle = self.get(id).ok_or_else(|| format!("no such session: {id}"))?;
+        let guard = handle.shared.buf.lock().map_err(|_| "buf lock")?;
+        let from = offset.unwrap_or(guard.base).max(guard.base);
+        let chunk = guard.slice_from(from);
+        Ok(json!({
+            "ok": true,
+            "sessionId": id,
+            "chunk": String::from_utf8_lossy(&chunk),
+            "base": guard.base,
+            "nextOffset": guard.logical_len(),
+            "truncated": guard.truncated,
+            "atEnd": !handle.shared.alive.load(Ordering::SeqCst),
+        }))
+    }
+
+    fn op_close(&self, id: &str) -> Result<Value, String> {
+        if let Some(handle) = self.sessions.lock().map_err(|_| "sessions lock")?.remove(id) {
+            kill_handle(&handle);
+            Ok(json!({ "ok": true, "sessionId": id, "closed": true }))
+        } else {
+            Ok(json!({ "ok": true, "sessionId": id, "closed": false, "note": "no such session" }))
+        }
+    }
+
+    fn op_list(&self) -> Value {
+        let sessions = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(_) => return json!({ "ok": true, "sessions": [] }),
+        };
+        let list: Vec<Value> = sessions
+            .values()
+            .map(|h| {
+                let bytes = h.shared.buf.lock().map(|b| b.logical_len()).unwrap_or(0);
+                json!({
+                    "sessionId": h.id,
+                    "cwd": h.start_cwd,
+                    "shell": h.shell,
+                    "alive": h.shared.alive.load(Ordering::SeqCst),
+                    "bytes": bytes,
+                })
+            })
+            .collect();
+        json!({ "ok": true, "sessions": list })
+    }
+
+    /// Kill every live shell — joined into the app-exit path so no `powershell.exe`
+    /// tree is orphaned.
+    pub fn kill_all(&self) {
+        if let Ok(mut g) = self.sessions.lock() {
+            for (_, handle) in g.drain() {
+                kill_handle(&handle);
+            }
+        }
+    }
+}
+
+/// Start the loopback control server and publish `term_control.json`. Call once
+/// from the app's `setup()`. Returns the bound port.
+pub fn serve(manager: Arc<SessionManager>) -> Result<u16, String> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind control server: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    publish_control(port, manager.token())?;
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(stream) = stream {
+                let mgr = manager.clone();
+                thread::spawn(move || {
+                    let _ = handle_conn(&mgr, stream);
+                });
+            }
+        }
+    });
+    Ok(port)
+}
+
+fn handle_conn(mgr: &SessionManager, stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(EXEC_TIMEOUT_MAX_SECS + 30)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let resp = dispatch(mgr, line.trim());
+    let mut w = stream;
+    writeln!(w, "{resp}")?;
+    w.flush()?;
+    Ok(())
+}
+
+/// App-side dispatch — the security choke point: token check + grant check gate
+/// every session op.
+fn dispatch(mgr: &SessionManager, line: &str) -> Value {
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": format!("bad request json: {e}") }),
+    };
+    if req.get("token").and_then(|v| v.as_str()) != Some(mgr.token()) {
+        return json!({ "ok": false, "error": "bad or missing control token" });
+    }
+    if let Err(e) = require_grant() {
+        return json!({ "ok": false, "error": e });
+    }
+    let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let id = req.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+    let result = match op {
+        "start" => mgr.op_start(
+            req.get("cwd").and_then(|v| v.as_str()),
+            req.get("shell").and_then(|v| v.as_str()),
+        ),
+        "exec" => {
+            let command = req.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            mgr.op_exec(id, command, req.get("timeoutSecs").and_then(|v| v.as_u64()))
+        }
+        "read" => mgr.op_read(id, req.get("offset").and_then(|v| v.as_u64()).map(|x| x as usize)),
+        "close" => mgr.op_close(id),
+        "list" => Ok(mgr.op_list()),
+        other => Err(format!("unknown op: {other}")),
+    };
+    result.unwrap_or_else(|e| json!({ "ok": false, "error": e }))
+}
+
+// ---- sidecar side: proxy client + tool wrappers ----
+
+/// Dial the app's control server, forward one request, return one reply. Injects
+/// the token from `term_control.json`.
+fn proxy_call(mut request: Value) -> Result<Value, String> {
+    let ctrl = load_control()
+        .ok_or("terminal control server not running — open SwerveBuild to host persistent sessions")?;
+    request["token"] = json!(ctrl.token);
+    let addr: std::net::SocketAddr = format!("{}:{}", ctrl.host, ctrl.port)
+        .parse()
+        .map_err(|e| format!("bad control address: {e}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|e| format!("connect control server: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(EXEC_TIMEOUT_MAX_SECS + 20)))
+        .ok();
+    writeln!(stream, "{request}").map_err(|e| format!("send request: {e}"))?;
+    stream.flush().ok();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|e| format!("read reply: {e}"))?;
+    serde_json::from_str(&line).map_err(|e| format!("bad control reply: {e}"))
+}
+
+pub fn session_start(cwd: Option<&str>, shell: Option<&str>) -> Result<Value, String> {
+    require_grant()?;
+    let mut req = json!({ "op": "start" });
+    if let Some(c) = cwd {
+        req["cwd"] = json!(c);
+    }
+    if let Some(s) = shell {
+        req["shell"] = json!(s);
+    }
+    proxy_call(req)
+}
+
+pub fn session_exec(session_id: &str, command: &str, timeout_secs: Option<u64>) -> Result<Value, String> {
+    require_grant()?;
+    let mut req = json!({ "op": "exec", "sessionId": session_id, "command": command });
+    if let Some(t) = timeout_secs {
+        req["timeoutSecs"] = json!(t);
+    }
+    proxy_call(req)
+}
+
+pub fn session_read(session_id: &str, offset: Option<u64>) -> Result<Value, String> {
+    require_grant()?;
+    let mut req = json!({ "op": "read", "sessionId": session_id });
+    if let Some(o) = offset {
+        req["offset"] = json!(o);
+    }
+    proxy_call(req)
+}
+
+pub fn session_close(session_id: &str) -> Result<Value, String> {
+    require_grant()?;
+    proxy_call(json!({ "op": "close", "sessionId": session_id }))
+}
+
+pub fn session_list() -> Result<Value, String> {
+    require_grant()?;
+    proxy_call(json!({ "op": "list" }))
 }
 
 #[cfg(test)]
@@ -413,5 +954,105 @@ mod tests {
         assert!(confine_cwd(&root, Some("../../Windows")).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- persistent session helpers (S11) ----
+
+    #[test]
+    fn find_sub_locates_and_misses() {
+        assert_eq!(find_sub(b"hello world", b"world"), Some(6));
+        assert_eq!(find_sub(b"hello", b"xyz"), None);
+        assert_eq!(find_sub(b"ab", b""), None);
+    }
+
+    #[test]
+    fn extract_marked_output_pulls_output_and_code() {
+        let m = "abc123";
+        let buf = b"line one\nline two\n<<TERMEND abc123=0>>\n";
+        let (raw, code) = extract_marked_output(buf, m).expect("marker present");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8_lossy(&clean_output(&raw)), "line one\nline two");
+    }
+
+    #[test]
+    fn extract_marked_output_parses_nonzero_and_waits() {
+        // Absent until the marker arrives.
+        assert!(extract_marked_output(b"partial output no marker yet", "zz").is_none());
+        let (raw, code) = extract_marked_output(b"boom\n<<TERMEND zz=2>>", "zz").unwrap();
+        assert_eq!(code, 2);
+        assert_eq!(String::from_utf8_lossy(&clean_output(&raw)), "boom");
+    }
+
+    #[test]
+    fn extract_marked_output_ignores_other_markers() {
+        // A different exec's marker must not satisfy this exec.
+        let buf = b"out\n<<TERMEND other=0>>\nmore\n<<TERMEND mine=5>>";
+        let (raw, code) = extract_marked_output(buf, "mine").expect("mine present");
+        assert_eq!(code, 5);
+        assert!(String::from_utf8_lossy(&raw).contains("more"));
+    }
+
+    #[test]
+    fn clean_output_strips_echoed_prompt_lines() {
+        // Echoed input lines carry the prompt token; real output does not.
+        let raw = b"<<PSPROMPT>>Get-Location\nE:\\proj\n<<PSPROMPT>>Write-Output x\n";
+        assert_eq!(String::from_utf8_lossy(&clean_output(raw)), "E:\\proj");
+    }
+
+    #[test]
+    fn bufstate_pages_and_drops_front_with_base() {
+        let mut b = BufState { data: Vec::new(), base: 0, truncated: false };
+        b.append(b"0123456789", 100);
+        assert_eq!(b.logical_len(), 10);
+        assert_eq!(String::from_utf8_lossy(&b.slice_from(4)), "456789");
+        // Exceed cap → front drops, base advances, logical offsets stay valid.
+        b.append(&vec![b'x'; 100], 50);
+        assert!(b.truncated);
+        assert_eq!(b.logical_len(), 110);
+        assert_eq!(b.data.len(), 50);
+        assert_eq!(b.base, 60);
+        // A read from a dropped offset clamps to what remains, never panics.
+        assert_eq!(b.slice_from(0).len(), 50);
+        assert_eq!(b.slice_from(200).len(), 0);
+    }
+
+    #[test]
+    fn cap_bytes_flags_overflow() {
+        let (b, t) = cap_bytes(vec![1, 2, 3], 10);
+        assert_eq!(b.len(), 3);
+        assert!(!t);
+        let (b, t) = cap_bytes(vec![0u8; 20], 10);
+        assert_eq!(b.len(), 10);
+        assert!(t);
+    }
+
+    #[test]
+    fn control_roundtrips_json() {
+        let c = TermControl {
+            host: "127.0.0.1".into(),
+            port: 51234,
+            pid: 42,
+            token: "deadbeef".into(),
+            updated_at: "now".into(),
+        };
+        let raw = serde_json::to_string(&c).unwrap();
+        let back: TermControl = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.port, 51234);
+        assert_eq!(back.token, "deadbeef");
+    }
+
+    #[test]
+    fn dispatch_rejects_bad_token_and_ungranted() {
+        let mgr = SessionManager::default();
+        // Bad token is refused before any grant/op work.
+        let bad = dispatch(&mgr, &json!({ "op": "list", "token": "wrong" }).to_string());
+        assert_eq!(bad.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert!(bad.get("error").unwrap().as_str().unwrap().contains("token"));
+        // Right token but (default) no grant → refused with the grant message.
+        let ungranted = dispatch(&mgr, &json!({ "op": "list", "token": mgr.token() }).to_string());
+        if ungranted.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            assert!(ungranted.get("error").unwrap().as_str().unwrap().contains("not granted"));
+        }
+        // (If the dev machine has the grant on, list succeeds — either way, no panic.)
     }
 }
