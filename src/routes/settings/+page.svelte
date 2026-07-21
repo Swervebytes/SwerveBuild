@@ -51,6 +51,9 @@
   let appUiGranted = $state(false);
   let appUiSaving = $state(false);
   let appUiMessage = $state<string | null>(null);
+  let termGranted = $state(false);
+  let termSaving = $state(false);
+  let termMessage = $state<string | null>(null);
 
   const themeOptions: { value: ThemePref; label: string; icon: IconName }[] = [
     { value: "system", label: "System", icon: "settings" },
@@ -85,6 +88,12 @@
     } catch {
       appUiGranted = false;
     }
+    try {
+      const grant = await invoke<{ granted: boolean }>("get_term_grant");
+      termGranted = !!grant.granted;
+    } catch {
+      termGranted = false;
+    }
   });
 
   async function setAppUiGrant(next: boolean) {
@@ -102,6 +111,24 @@
       appUiMessage = String(e);
     } finally {
       appUiSaving = false;
+    }
+  }
+
+  async function setTermGrant(next: boolean) {
+    termSaving = true;
+    termMessage = null;
+    try {
+      const grant = await invoke<{ granted: boolean }>("set_term_grant", {
+        granted: next,
+      });
+      termGranted = !!grant.granted;
+      termMessage = termGranted
+        ? "Agents in this app may run one-shot terminal commands in the open project."
+        : "Agent terminal access revoked.";
+    } catch (e) {
+      termMessage = String(e);
+    } finally {
+      termSaving = false;
     }
   }
 
@@ -416,6 +443,55 @@
     </Field>
     {#if appUiMessage}
       <p class="ep-msg">{appUiMessage}</p>
+    {/if}
+  </section>
+
+  <section class="card">
+    <div class="group-head">
+      <h2 class="group-title">Agent terminal</h2>
+      <StatusPill
+        tone={termGranted ? "warning" : "muted"}
+        label={termGranted ? "Granted" : "Off"}
+      />
+    </div>
+    <p class="group-note">
+      Allow the in-app agent to run <strong>one-shot</strong> shell commands via the
+      <code>term_run</code> MCP tool, confined to the open project folder. Output is size-capped and
+      each run is logged. Off by default. Never enabled for automations. Revoke anytime.
+    </p>
+    <Field
+      label="Allow agent to run terminal commands"
+      hint="PowerShell by default; cwd cannot escape the project. Does not grant persistent shells."
+      row
+    >
+      <div class="segmented" role="radiogroup" aria-label="Agent terminal grant">
+        <button
+          class="seg"
+          class:active={!termGranted}
+          type="button"
+          role="radio"
+          aria-checked={!termGranted}
+          disabled={termSaving}
+          onclick={() => setTermGrant(false)}
+        >
+          Off
+        </button>
+        <button
+          class="seg"
+          class:active={termGranted}
+          type="button"
+          role="radio"
+          aria-checked={termGranted}
+          disabled={termSaving}
+          data-testid="term-grant-on"
+          onclick={() => setTermGrant(true)}
+        >
+          On
+        </button>
+      </div>
+    </Field>
+    {#if termMessage}
+      <p class="ep-msg">{termMessage}</p>
     {/if}
   </section>
 

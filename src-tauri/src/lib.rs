@@ -9,6 +9,7 @@ mod model_catalog;
 pub mod paths;
 mod providers;
 mod store;
+pub mod terminal;
 mod util;
 pub mod workflows_tauri;
 
@@ -1185,6 +1186,16 @@ fn set_app_ui_grant(granted: bool) -> Result<app_ui::AppUiGrant, String> {
     app_ui::set_granted(granted)
 }
 
+#[tauri::command]
+fn get_term_grant() -> terminal::TermGrant {
+    terminal::load_grant()
+}
+
+#[tauri::command]
+fn set_term_grant(granted: bool) -> Result<terminal::TermGrant, String> {
+    terminal::set_granted(granted)
+}
+
 /// Frontend publishes the visible route/title so MCP `app_ui_state` can report it
 /// without CDP. Does not require the human grant (publish is local telemetry).
 #[tauri::command]
@@ -1286,6 +1297,8 @@ pub fn run() {
             automation_failure_count,
             get_app_ui_grant,
             set_app_ui_grant,
+            get_term_grant,
+            set_term_grant,
             publish_app_ui_state,
             workflows_tauri::workflows_list,
             workflows_tauri::workflow_get,
