@@ -6,6 +6,8 @@
 //!
 //! Runs use the app's real data dir for run records and secrets, and the real
 //! grok agent runner, so a CLI run is a faithful rehearsal of an in-app run.
+//! Exception: `local:` models need the app's managed llama-server and are
+//! refused here with a clear error.
 
 use std::sync::Arc;
 use swerve_workflows::engine::{run_workflow, CancelFlag, EngineConfig, TriggerFire};
@@ -116,7 +118,7 @@ fn cmd_run(args: &[String]) -> i32 {
     let cfg = EngineConfig {
         runs_dir: swerve_build_lib::paths::workflow_runs_dir(),
         services: EngineServices {
-            agent: Some(Arc::new(swerve_build_lib::workflows_tauri::GrokAgentRunner)),
+            agent: Some(Arc::new(swerve_build_lib::workflows_tauri::GrokAgentRunner::headless())),
             secrets: Arc::new(swerve_build_lib::workflows_tauri::FileSecrets),
             events: Arc::new(PrintEvents),
         },

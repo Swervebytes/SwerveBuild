@@ -664,10 +664,44 @@ M0 through M3 shipped in one pass. Verification: engine crate 37 tests, app crat
 - `TriggerFire` gained an optional caller-assigned `run_id` so the manager can track queued runs.
 - Trigger params for git/file live on the trigger node (`cwd`/`branch`, `path`/`glob`); bookkeeping in `state.trigger[<node_id>]` as designed.
 - The CLI runs with the REAL grok agent runner and secrets (faithful rehearsal), not a stub.
-- Agent node rejects local (`local:`) models for now — the llama-server lifecycle needs an AppHandle the runner does not have.
+- ~~Agent node rejects local (`local:`) models for now~~ — closed in the leftovers pass (below): in-app runs lease the llama-server; only the headless CLI still rejects them.
 - Param forms are a TS-side registry (`src/lib/workflows/model.ts`) mirroring the Rust specs; ports/needs/labels still come from the Rust catalog command.
 
-**Left for later:** editor niceties (copy/paste, undo, drag-from-palette), webhook trigger, loops, binary items, sub-workflows, keyring secrets, M4 convergence.
+**Left for later:** webhook trigger, loops, binary items, sub-workflows, keyring secrets, M4 convergence.
+
+### Leftovers pass (2026-07-20, post-S09)
+
+The shipped-feature loose ends were closed before S10; the v2 features above stay
+deferred on their design rationale (webhook = listening sockets a desktop shell
+doesn't have yet; loops = DAG-only v1; binary items / sub-workflows = schema room
+reserved; keyring = coupled to the endpoint-API-key migration; M4 = needs usage).
+
+- **Agent node local models.** `GrokAgentRunner` now carries `Option<AppHandle>`
+  (`in_app` / `headless` constructors). In-app, a `local:` model leases the managed
+  llama-server exactly like `jobs.rs` (acquire before spawn so model load doesn't
+  eat the agent timeout; RAII `LeaseGuard` releases on every return path). The
+  gate itself is a pure `local_model_gate` fn — unit-testable without linking the
+  runner, which matters: pulling `run()` into the lib-test binary links Tauri GUI
+  objects whose comctl32-v6 import (`TaskDialogIndirect`) needs the app manifest
+  test executables don't get, and the test exe then fails to load with
+  STATUS_ENTRYPOINT_NOT_FOUND. The headless CLI keeps rejecting local models with
+  a clear error.
+- **Editor: drag-from-palette.** Palette entries are draggable
+  (`application/x-swervebuild-node` payload); the canvas drop handler converts
+  screen→flow coordinates via the bound viewport (verified exact under pan+zoom).
+  Click-to-add unchanged.
+- **Editor: copy/paste.** Ctrl+C copies the selected node(s) with the edges
+  between them; Ctrl+V pastes with fresh ids, unique names, +32px cascade, and
+  selects the pasted set. Field focus is respected (native copy/paste inside
+  inputs).
+- **Editor: undo/redo.** Snapshot-stack history (60 deep) over every edit path —
+  graph edits capture immediately, typing coalesces at 600 ms so a burst undoes
+  as one step. Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z plus topbar buttons. History
+  entries are *serialized* docs: node objects that round-trip through Svelte Flow
+  pick up proxies that `structuredClone` rejects (DataCloneError), so the stacks
+  hold JSON text and rebuild plain objects on apply — the clipboard does the
+  same. `state`/ids are never restored from history; `workflow_save` keeps
+  owning scheduler state.
 
 ### Post-review hardening (same day)
 
