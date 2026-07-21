@@ -1,8 +1,11 @@
 # Build release binaries, stage the MCP sidecar, and produce an installer.
 # Does not mutate tauri.conf.json: externalBin is applied via a merge overlay
 # so a killed build cannot leave the tracked conf dirty (F4).
+#
+# Preflight: package.json / Cargo.toml / tauri.conf.json versions must match.
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+. "$PSScriptRoot\app-version.ps1"
+$root = Get-SwerveRepoRoot
 $tauri = Join-Path $root "src-tauri"
 $triple = "x86_64-pc-windows-msvc"
 $overlay = Join-Path $root "scripts\tauri-release-externalbin.json"
@@ -11,14 +14,19 @@ if (-not (Test-Path $overlay)) {
     throw "Missing release overlay: $overlay"
 }
 
+$version = Assert-SwerveVersionsInSync -Root $root
+Write-Host "Release version (manifests in sync): $version" -ForegroundColor Green
+
 Push-Location $root
 try {
     Write-Host "Building frontend..." -ForegroundColor Cyan
     npm run build
+    if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit $LASTEXITCODE" }
 
     Push-Location $tauri
     Write-Host "Building release binaries..." -ForegroundColor Cyan
     cargo build --release --bins
+    if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit $LASTEXITCODE" }
 
     $mcpSrc = Join-Path $tauri "target\release\swervebuild-mcp.exe"
     if (-not (Test-Path $mcpSrc)) {
@@ -44,8 +52,13 @@ try {
         throw "tauri build failed with exit code $LASTEXITCODE"
     }
 
+    $installer = Join-Path $tauri "target\release\bundle\nsis\Swerve Build_${version}_x64-setup.exe"
     Write-Host "`nRelease artifacts: src-tauri/target/release/bundle/" -ForegroundColor Green
-    Write-Host "Tag path (after main is clean + CI green): git tag -a v0.2.1 -m 'v0.2.1'; git push origin main --tags" -ForegroundColor DarkGray
+    if (Test-Path -LiteralPath $installer) {
+        Write-Host "Installer: $installer" -ForegroundColor Green
+    }
+    Write-Host "Local install:  npm run install:local" -ForegroundColor DarkGray
+    Write-Host "Tag path (after main is clean + CI green): git tag -a v$version -m `"v$version`"; git push origin main --tags" -ForegroundColor DarkGray
 } finally {
     Pop-Location
 }

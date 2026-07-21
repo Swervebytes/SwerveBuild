@@ -1,6 +1,6 @@
 {
   "name": "swerve-build",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents",
   "type": "module",
   "scripts": {
@@ -11,6 +11,10 @@
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "test:e2e": "powershell -NoProfile -ExecutionPolicy Bypass -File ./test-e2e.ps1",
     "release": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/prepare-release.ps1",
+    "install:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-local.ps1",
+    "version:check": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bump-version.ps1 -CheckOnly",
+    "version:bump": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bump-version.ps1",
+    "version:set": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bump-version.ps1 -Set",
     "tauri": "tauri"
   },
   "license": "MIT",
