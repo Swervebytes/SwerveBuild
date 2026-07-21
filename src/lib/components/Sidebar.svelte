@@ -9,8 +9,9 @@
   import { providerStore } from "$lib/stores/providers.svelte";
   import Wordmark from "./Wordmark.svelte";
   import Icon from "./ui/Icon.svelte";
+  import { APP_VERSION } from "$lib/version";
 
-  const appVersion = "0.2.0";
+  const appVersion = APP_VERSION;
   let creating = $state(false);
 
   const recent = $derived(workspaceStore.recent(7));

@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/platform-Windows-0d1220?style=flat-square" alt="Windows" />
   <img src="https://img.shields.io/badge/built_with-Tauri_2_·_Rust_·_Svelte_5-0d1220?style=flat-square" alt="Tauri · Rust · Svelte" />
   <img src="https://img.shields.io/badge/license-MIT-0d1220?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/version-0.2.0-6cb5ff?style=flat-square" alt="v0.2.0" />
+  <img src="https://img.shields.io/badge/version-0.2.1-6cb5ff?style=flat-square" alt="v0.2.1" />
 </p>
 
 ---
@@ -50,7 +50,7 @@ Start from a one-click recipe — *Project summary*, *Doc-drift check*, *Find lo
 
 No Node.js or Rust required for end users.
 
-1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`) — prefer **v0.2.0+**.
+1. Download the latest **Windows installer** from [Releases](https://github.com/Swervebytes/SwerveBuild/releases) (`Swerve Build_*_x64-setup.exe`) — prefer **v0.2.1+**.
 2. Run it and open **Swerve Build**.
 3. On the home screen, click **Install Grok Build** (installs the official Grok CLI to `~/.grok/`).
 4. Click **Sign In** and finish OAuth in your browser.
@@ -92,7 +92,7 @@ npm run tauri dev
 | `npm run test:e2e` | CLI tests (MCP always; ACP if grok + `SWERVE_E2E_CWD` set) |
 | `npm run release` | Production Windows installer |
 
-The release output lands at `src-tauri/target/release/bundle/nsis/Swerve Build_0.2.0_x64-setup.exe`; upload the `*-setup.exe` to GitHub Releases.
+The release output lands at `src-tauri/target/release/bundle/nsis/Swerve Build_0.2.1_x64-setup.exe`; upload the `*-setup.exe` to GitHub Releases.
 
 ## Data locations
 

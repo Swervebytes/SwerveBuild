@@ -8,6 +8,7 @@
   import ProviderList from "$lib/components/providers/ProviderList.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import LocalModelsCard from "$lib/components/models/LocalModelsCard.svelte";
+  import { APP_VERSION } from "$lib/version";
 
   type GrokStatus = {
     installed: boolean;
@@ -442,7 +443,7 @@
 
   <section class="card about">
     <h2 class="group-title">About</h2>
-    <p class="about-line">Swerve Build v0.2.0</p>
+    <p class="about-line">Swerve Build v{APP_VERSION}</p>
     <p class="about-line muted">MIT License · Open source</p>
   </section>
 </div>

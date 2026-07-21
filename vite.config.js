@@ -1,5 +1,9 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+// Single source for the on-screen app version — injected into the client via
+// `define` below so a manifest bump can't drift from what the UI shows
+// (see src/lib/version.ts).
+import pkg from "./package.json";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -7,6 +11,10 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [sveltekit()],
+
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
