@@ -32,15 +32,18 @@ fn persistent_session_survives_execs_and_persists_state() {
     let sid = start["sessionId"].as_str().expect("sessionId").to_string();
     let _guard = SessionGuard(sid.clone());
 
-    // --- exec 1: set a variable AND change directory ---
-    let e1 = terminal::session_exec(&sid, "$marker = 41; Set-Location src-tauri", Some(30)).expect("exec1");
+    // --- exec 1: set a variable AND change directory. Use an ABSOLUTE dir that
+    // always exists — session_start(None) opens whichever project is most
+    // recently opened, so a project-relative subdir would make this test depend
+    // on which project that happens to be. ---
+    let e1 = terminal::session_exec(&sid, "$marker = 41; Set-Location C:\\Windows", Some(30)).expect("exec1");
     assert_eq!(e1["ok"], true, "exec1 not ok: {e1}");
 
     // --- exec 2: BOTH the variable and the cwd must have survived ---
     let e2 = terminal::session_exec(&sid, "\"$($marker + 1) @ $((Get-Location).Path)\"", Some(30)).expect("exec2");
     let out2 = e2["output"].as_str().unwrap_or("");
     assert!(out2.contains("42"), "variable did not persist across execs: {e2}");
-    assert!(out2.to_lowercase().contains("src-tauri"), "cwd did not persist across execs: {e2}");
+    assert!(out2.to_lowercase().contains("windows"), "cwd did not persist across execs: {e2}");
 
     // --- exit code propagation (native non-zero) ---
     let e3 = terminal::session_exec(&sid, "cmd /c exit 7", Some(30)).expect("exec3");

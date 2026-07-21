@@ -21,6 +21,10 @@ const GRANT_FILE: &str = "browser_debug_grant.json";
 const TARGET_CACHE_FILE: &str = "browser_debug_target.json";
 const NAV_LOG_FILE: &str = "browser_debug_nav.jsonl";
 const NAV_LOG_KEEP: usize = 200;
+const ARTIFACTS_SUBDIR: &str = "browser_debug_artifacts";
+const ARTIFACT_KEEP: usize = 30;
+/// Max characters `browser_type` accepts in one call.
+const TYPE_TEXT_MAX: usize = 8_000;
 
 /// The debug pane's creation URL — the discovery marker before any navigation.
 /// `lib.rs` creates the hidden window at this URL; `pick_main_target` excludes it.
@@ -456,15 +460,207 @@ pub fn state_report() -> Value {
         "paneUrl": url,
         "paneTitle": title,
         "hooksInstalled": hooks,
-        "policy": "read-only; http/https to loopback hosts only; navigations logged",
+        "policy": "read + interact; http/https to loopback hosts only; navigations logged",
         "tools": {
             "browser_state": "available",
             "browser_open": tool_status,
             "browser_read_page": tool_status,
             "browser_console": tool_status,
             "browser_network": tool_status,
+            "browser_screenshot": tool_status,
+            "browser_click": tool_status,
+            "browser_type": tool_status,
+            "browser_navigate": tool_status,
         },
     })
+}
+
+// --------------------------------------------------- interaction + capture (S13b)
+
+/// Grant is checked by each pub tool; this resolves the pane's CDP websocket —
+/// the shared preamble for screenshot/click/type/navigate.
+fn pane_ws() -> Result<String, String> {
+    let ep = require_endpoint()?;
+    let pane = find_pane(&ep)?;
+    Ok(pane.web_socket_debugger_url)
+}
+
+/// Normalize an interaction selector: a bare token becomes a `data-testid`
+/// selector; a CSS selector passes through. No shell denylist here — the pane
+/// hosts the user's OWN local app, not SwerveBuild's UI (that's `app_ui`).
+fn norm_selector(raw: &str) -> Result<String, String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 300 {
+        return Err("selector must be 1..300 chars".into());
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("javascript:") || s.contains("</") || s.contains("{{") {
+        return Err("selector rejected (unsafe pattern)".into());
+    }
+    let bare = !s.contains(['[', '#', '.', ' ', '>', ':']);
+    if bare {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        return Ok(format!("[data-testid=\"{escaped}\"]"));
+    }
+    Ok(s.to_string())
+}
+
+fn nav_js(action: &str) -> Result<&'static str, String> {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "back" => Ok("history.back()"),
+        "forward" => Ok("history.forward()"),
+        "reload" | "refresh" => Ok("location.reload()"),
+        other => Err(format!("unknown action: {other} (back | forward | reload)")),
+    }
+}
+
+fn artifacts_dir() -> PathBuf {
+    crate::paths::data_dir().join(ARTIFACTS_SUBDIR)
+}
+
+fn prune_artifacts(dir: &PathBuf) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<_> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("png"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if files.len() <= ARTIFACT_KEEP {
+        return;
+    }
+    files.sort_by_key(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    let drop_n = files.len() - ARTIFACT_KEEP;
+    for e in files.into_iter().take(drop_n) {
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
+/// Capture the debug pane as PNG (visual preview). Returns artifact id + path,
+/// mirroring `app_ui_screenshot`.
+pub fn screenshot() -> Result<Value, String> {
+    require_grant()?;
+    let ws = pane_ws()?;
+    let png = app_ui_cdp::capture_screenshot_png(&ws)?;
+    if png.is_empty() {
+        return Err("CDP screenshot returned empty PNG".into());
+    }
+    let dir = artifacts_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = dir.join(format!("{id}.png"));
+    std::fs::write(&path, &png).map_err(|e| format!("write screenshot: {e}"))?;
+    prune_artifacts(&dir);
+    Ok(json!({
+        "ok": true,
+        "id": id,
+        "path": path.to_string_lossy(),
+        "bytes": png.len(),
+        "format": "png",
+        "via": "cdp",
+    }))
+}
+
+/// Click an element in the pane (CSS selector or bare data-testid).
+pub fn click(selector: &str) -> Result<Value, String> {
+    require_grant()?;
+    let sel = norm_selector(selector)?;
+    let ws = pane_ws()?;
+    let js_sel = js_str(&sel);
+    let expression = format!(
+        r#"(function() {{
+  var el = document.querySelector({js_sel});
+  if (!el) return {{ ok: false, error: 'not_found', selector: {js_sel} }};
+  el.scrollIntoView({{ block: 'center', inline: 'center' }});
+  if (typeof el.click === 'function') el.click();
+  else el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
+  return {{ ok: true, selector: {js_sel}, tag: el.tagName || '',
+           text: (el.innerText || el.textContent || '').trim().slice(0, 80) }};
+}})()"#
+    );
+    let value = app_ui_cdp::evaluate(&ws, &expression)?;
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = value.get("error").and_then(|v| v.as_str()).unwrap_or("click failed");
+        return Err(format!("browser_click: {err} (selector={sel})"));
+    }
+    Ok(json!({ "ok": true, "selector": sel, "result": value, "via": "cdp" }))
+}
+
+/// Fill an input / textarea / contenteditable in the pane (native value setter +
+/// bubbling input/change events, so framework bindings react like a real edit).
+pub fn type_text(selector: &str, text: &str, clear: bool) -> Result<Value, String> {
+    require_grant()?;
+    if text.chars().count() > TYPE_TEXT_MAX {
+        return Err(format!("browser_type: text too long (max {TYPE_TEXT_MAX} chars)"));
+    }
+    let sel = norm_selector(selector)?;
+    let ws = pane_ws()?;
+    let js_sel = js_str(&sel);
+    let js_text = js_str(text);
+    let js_clear = if clear { "true" } else { "false" };
+    let expression = format!(
+        r#"(function() {{
+  var el = document.querySelector({js_sel});
+  if (!el) return {{ ok: false, error: 'not_found', selector: {js_sel} }};
+  el.scrollIntoView({{ block: 'center', inline: 'center' }});
+  var text = {js_text}; var clear = {js_clear};
+  var tag = (el.tagName || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA') {{
+    el.focus();
+    var proto = tag === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    var next = clear ? text : (el.value || '') + text;
+    if (desc && desc.set) desc.set.call(el, next); else el.value = next;
+    el.dispatchEvent(new InputEvent('input', {{ bubbles: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    return {{ ok: true, selector: {js_sel}, tag: tag, valueLength: (el.value || '').length }};
+  }}
+  if (el.isContentEditable) {{
+    el.focus();
+    el.textContent = clear ? text : (el.textContent || '') + text;
+    el.dispatchEvent(new InputEvent('input', {{ bubbles: true }}));
+    return {{ ok: true, selector: {js_sel}, tag: tag, contentEditable: true }};
+  }}
+  return {{ ok: false, error: 'not_typable', selector: {js_sel}, tag: tag }};
+}})()"#
+    );
+    let value = app_ui_cdp::evaluate(&ws, &expression)?;
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = value.get("error").and_then(|v| v.as_str()).unwrap_or("type failed");
+        return Err(format!("browser_type: {err} (selector={sel})"));
+    }
+    Ok(json!({ "ok": true, "selector": sel, "result": value, "via": "cdp" }))
+}
+
+/// History navigation in the pane: back | forward | reload. A reload/back yields
+/// an un-hooked document (hooks are document-start-registered per browser_open),
+/// so console/network capture resumes only after the next `browser_open`.
+pub fn navigate(action: &str) -> Result<Value, String> {
+    require_grant()?;
+    let js = nav_js(action)?;
+    let ws = pane_ws()?;
+    let _ = app_ui_cdp::evaluate(&ws, &format!("(function(){{ try {{ {js}; }} catch(e) {{}} return true; }})()"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let url = app_ui_cdp::evaluate(&ws, "location.href")
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    append_nav_log(&url, true, action);
+    Ok(json!({
+        "ok": true,
+        "action": action,
+        "url": url,
+        "note": "console/network capture resumes after the next browser_open",
+    }))
 }
 
 #[cfg(test)]
@@ -525,6 +721,25 @@ mod tests {
         let raw = serde_json::to_string(&cache).unwrap();
         let back: TargetCache = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.target_id, "T-1");
+    }
+
+    #[test]
+    fn norm_selector_bare_css_and_reject() {
+        assert_eq!(norm_selector("submit-btn").unwrap(), "[data-testid=\"submit-btn\"]");
+        assert_eq!(norm_selector("#app .btn").unwrap(), "#app .btn");
+        assert_eq!(norm_selector("[data-testid=\"x\"]").unwrap(), "[data-testid=\"x\"]");
+        assert!(norm_selector("   ").is_err());
+        assert!(norm_selector("x</script>").is_err());
+        assert!(norm_selector(&"a".repeat(400)).is_err());
+    }
+
+    #[test]
+    fn nav_js_maps_actions() {
+        assert_eq!(nav_js("back").unwrap(), "history.back()");
+        assert_eq!(nav_js("Forward").unwrap(), "history.forward()");
+        assert_eq!(nav_js("reload").unwrap(), "location.reload()");
+        assert_eq!(nav_js("refresh").unwrap(), "location.reload()");
+        assert!(nav_js("teleport").is_err());
     }
 
     #[test]
