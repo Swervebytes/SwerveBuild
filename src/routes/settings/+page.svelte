@@ -54,6 +54,9 @@
   let termGranted = $state(false);
   let termSaving = $state(false);
   let termMessage = $state<string | null>(null);
+  let browserGranted = $state(false);
+  let browserSaving = $state(false);
+  let browserMessage = $state<string | null>(null);
 
   const themeOptions: { value: ThemePref; label: string; icon: IconName }[] = [
     { value: "system", label: "System", icon: "settings" },
@@ -94,6 +97,12 @@
     } catch {
       termGranted = false;
     }
+    try {
+      const grant = await invoke<{ granted: boolean }>("get_browser_debug_grant");
+      browserGranted = !!grant.granted;
+    } catch {
+      browserGranted = false;
+    }
   });
 
   async function setAppUiGrant(next: boolean) {
@@ -129,6 +138,32 @@
       termMessage = String(e);
     } finally {
       termSaving = false;
+    }
+  }
+
+  async function setBrowserGrant(next: boolean) {
+    browserSaving = true;
+    browserMessage = null;
+    try {
+      const grant = await invoke<{ granted: boolean }>("set_browser_debug_grant", {
+        granted: next,
+      });
+      browserGranted = !!grant.granted;
+      browserMessage = browserGranted
+        ? "Agents may drive the debug browser (read-only, localhost apps only)."
+        : "Debug browser access revoked.";
+    } catch (e) {
+      browserMessage = String(e);
+    } finally {
+      browserSaving = false;
+    }
+  }
+
+  async function showDebugPane(visible: boolean) {
+    try {
+      await invoke("show_debug_pane", { visible });
+    } catch (e) {
+      browserMessage = String(e);
     }
   }
 
@@ -498,6 +533,60 @@
 
   <section class="card">
     <div class="group-head">
+      <h2 class="group-title">Agent browser debug</h2>
+      <StatusPill
+        tone={browserGranted ? "warning" : "muted"}
+        label={browserGranted ? "Granted" : "Off"}
+      />
+    </div>
+    <p class="group-note">
+      Allow the in-app agent to drive a <strong>separate hidden debug browser</strong> via
+      <code>browser_*</code> MCP tools — navigate to a <strong>localhost</strong> app, read the page,
+      console, and fetch/XHR activity. Read-only; it is never this app's own window, and agent
+      navigations are logged. Off by default. Revoke anytime.
+    </p>
+    <Field
+      label="Allow agent to use the debug browser"
+      hint="http/https to localhost only. Use Show pane to watch what the agent sees."
+      row
+    >
+      <div class="segmented" role="radiogroup" aria-label="Browser debug grant">
+        <button
+          class="seg"
+          class:active={!browserGranted}
+          type="button"
+          role="radio"
+          aria-checked={!browserGranted}
+          disabled={browserSaving}
+          onclick={() => setBrowserGrant(false)}
+        >
+          Off
+        </button>
+        <button
+          class="seg"
+          class:active={browserGranted}
+          type="button"
+          role="radio"
+          aria-checked={browserGranted}
+          disabled={browserSaving}
+          data-testid="browser-grant-on"
+          onclick={() => setBrowserGrant(true)}
+        >
+          On
+        </button>
+      </div>
+    </Field>
+    <div class="pane-row">
+      <button class="btn btn-sm" onclick={() => showDebugPane(true)}>Show pane</button>
+      <button class="btn btn-sm" onclick={() => showDebugPane(false)}>Hide pane</button>
+    </div>
+    {#if browserMessage}
+      <p class="ep-msg">{browserMessage}</p>
+    {/if}
+  </section>
+
+  <section class="card">
+    <div class="group-head">
       <h2 class="group-title">Automations &amp; safety</h2>
       <StatusPill tone="accent" label="Shadow mode default" />
     </div>
@@ -655,6 +744,11 @@
     color: var(--text-secondary);
     margin-top: 0.6rem;
     word-break: break-word;
+  }
+  .pane-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
   }
   .ep-msg.error {
     color: var(--danger, #ff6b6b);

@@ -154,19 +154,35 @@ pub fn list_targets(host: &str, port: u16) -> Result<Vec<CdpTarget>, String> {
     Ok(out)
 }
 
-/// Pick the main app page target (prefer type=page, non-devtools URL).
-pub fn pick_main_target(targets: &[CdpTarget]) -> Result<&CdpTarget, String> {
-    let page = targets.iter().find(|t| {
-        t.target_type == "page"
+/// URL prefixes the SwerveBuild shell can load at (prod WebView2 origin forms +
+/// the vite dev server). Used to prefer the MAIN window now that the process
+/// hosts a second webview (the S12 debug pane).
+const SHELL_ORIGINS: [&str; 4] = [
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "http://localhost:1420",
+];
+
+/// Pick the main app page target. With the S12 debug pane, the process exposes
+/// TWO page targets, and /json list order is unspecified — so prefer a known
+/// shell origin, and always exclude the debug pane (by its cached target id and
+/// its marker creation URL) so `app_ui_*` can never drive the pane.
+pub fn pick_main_target<'a>(
+    targets: &'a [CdpTarget],
+    exclude_id: Option<&str>,
+) -> Result<&'a CdpTarget, String> {
+    let usable = |t: &&CdpTarget| {
+        !t.web_socket_debugger_url.is_empty()
             && !t.url.starts_with("devtools://")
-            && !t.web_socket_debugger_url.is_empty()
-    });
-    if let Some(t) = page {
-        return Ok(t);
-    }
-    targets
-        .iter()
-        .find(|t| !t.web_socket_debugger_url.is_empty() && !t.url.starts_with("devtools://"))
+            && Some(t.id.as_str()) != exclude_id
+            && !t.url.starts_with(crate::browser_debug::DEBUG_PANE_INITIAL_URL)
+    };
+    let pages = || targets.iter().filter(|t| t.target_type == "page").filter(usable);
+    pages()
+        .find(|t| SHELL_ORIGINS.iter().any(|o| t.url.starts_with(o)))
+        .or_else(|| pages().next())
+        .or_else(|| targets.iter().find(usable))
         .ok_or_else(|| {
             "CDP: no page target found. Wait for the main window to finish loading.".into()
         })
@@ -276,21 +292,8 @@ pub fn capture_screenshot_png(ws_url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("CDP screenshot base64 decode: {e}"))
 }
 
-/// Run a JS expression and return the remote object value (Runtime.evaluate).
-pub fn evaluate(ws_url: &str, expression: &str) -> Result<Value, String> {
-    let result = cdp_call(
-        ws_url,
-        "Runtime.evaluate",
-        json!({
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": true,
-        }),
-    )?;
-    if result
-        .get("exceptionDetails")
-        .is_some()
-    {
+fn unwrap_evaluate(result: Value) -> Result<Value, String> {
+    if result.get("exceptionDetails").is_some() {
         let text = result
             .pointer("/exceptionDetails/text")
             .and_then(|v| v.as_str())
@@ -305,6 +308,54 @@ pub fn evaluate(ws_url: &str, expression: &str) -> Result<Value, String> {
         .pointer("/result/value")
         .cloned()
         .unwrap_or(Value::Null))
+}
+
+/// Run a JS expression and return the remote object value (Runtime.evaluate).
+pub fn evaluate(ws_url: &str, expression: &str) -> Result<Value, String> {
+    let result = cdp_call(
+        ws_url,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true,
+        }),
+    )?;
+    unwrap_evaluate(result)
+}
+
+/// A HELD DevTools session (one WebSocket kept open across calls).
+///
+/// Needed when session-scoped state must survive between commands:
+/// `Page.addScriptToEvaluateOnNewDocument` registrations are removed when the
+/// registering session detaches, so register-then-navigate must happen on ONE
+/// session — per-call sockets silently lose the script before navigation.
+pub struct CdpSession {
+    socket: CdpSocket,
+    next_id: u64,
+}
+
+impl CdpSession {
+    pub fn connect(ws_url: &str) -> Result<Self, String> {
+        Ok(CdpSession { socket: connect_ws(ws_url)?, next_id: 0 })
+    }
+
+    pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        send_and_wait(&mut self.socket, self.next_id, method, params)
+    }
+
+    pub fn evaluate(&mut self, expression: &str) -> Result<Value, String> {
+        let result = self.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+        )?;
+        unwrap_evaluate(result)
+    }
 }
 
 /// Probe whether the CDP HTTP endpoint answers (drive ready).
@@ -345,25 +396,59 @@ mod tests {
         assert_eq!(take_http_body(raw, true).as_deref(), Some("{\"a\":1}"));
     }
 
+    fn target(id: &str, url: &str) -> CdpTarget {
+        CdpTarget {
+            id: id.into(),
+            title: String::new(),
+            url: url.into(),
+            web_socket_debugger_url: format!("ws://127.0.0.1/{id}"),
+            target_type: "page".into(),
+        }
+    }
+
     #[test]
     fn pick_main_prefers_page() {
-        let targets = vec![
-            CdpTarget {
-                id: "1".into(),
-                title: "DevTools".into(),
-                url: "devtools://x".into(),
-                web_socket_debugger_url: "ws://127.0.0.1/1".into(),
-                target_type: "page".into(),
-            },
-            CdpTarget {
-                id: "2".into(),
-                title: "Swerve".into(),
-                url: "http://localhost:1420/".into(),
-                web_socket_debugger_url: "ws://127.0.0.1/2".into(),
-                target_type: "page".into(),
-            },
-        ];
-        let t = pick_main_target(&targets).unwrap();
+        let mut devtools = target("1", "devtools://x");
+        devtools.title = "DevTools".into();
+        let targets = vec![devtools, target("2", "http://localhost:1420/")];
+        let t = pick_main_target(&targets, None).unwrap();
         assert_eq!(t.id, "2");
+    }
+
+    #[test]
+    fn pick_main_prefers_shell_origin_over_debug_pane_listed_first() {
+        // The pane navigated to some arbitrary localhost app AND is listed
+        // first — the shell origin must still win.
+        let targets = vec![
+            target("pane", "http://localhost:5500/app/"),
+            target("main", "tauri://localhost/settings"),
+        ];
+        let t = pick_main_target(&targets, None).unwrap();
+        assert_eq!(t.id, "main");
+    }
+
+    #[test]
+    fn pick_main_excludes_debug_pane_by_id_and_marker_url() {
+        // By cached id, even when no shell-origin candidate exists (dev
+        // edge: main not loaded yet).
+        let targets = vec![
+            target("pane", "http://localhost:5500/app/"),
+            target("other", "http://localhost:9000/x"),
+        ];
+        let t = pick_main_target(&targets, Some("pane")).unwrap();
+        assert_eq!(t.id, "other");
+        // By the creation-marker URL with no cache at all.
+        let targets = vec![
+            target("pane", "about:blank#swerve-debug-pane"),
+            target("main", "http://localhost:1420/"),
+        ];
+        let t = pick_main_target(&targets, None).unwrap();
+        assert_eq!(t.id, "main");
+    }
+
+    #[test]
+    fn pick_main_errors_when_only_the_pane_exists() {
+        let targets = vec![target("pane", "about:blank#swerve-debug-pane")];
+        assert!(pick_main_target(&targets, Some("pane")).is_err());
     }
 }

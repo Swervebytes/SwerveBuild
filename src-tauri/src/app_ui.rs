@@ -235,7 +235,9 @@ fn require_drive() -> Result<AppUiCdpEndpoint, String> {
 
 fn connect_main_page(ep: &AppUiCdpEndpoint) -> Result<String, String> {
     let targets = app_ui_cdp::list_targets(&ep.host, ep.port)?;
-    let t = app_ui_cdp::pick_main_target(&targets)?;
+    // Exclude the S12 debug pane so drive tools can never grab the wrong webview.
+    let exclude = crate::browser_debug::cached_target_id();
+    let t = app_ui_cdp::pick_main_target(&targets, exclude.as_deref())?;
     Ok(t.web_socket_debugger_url.clone())
 }
 

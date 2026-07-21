@@ -211,6 +211,54 @@ fn tools() -> Vec<ToolDef> {
             description: "List open persistent terminal sessions (id, cwd, shell, alive, bytes buffered).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
+        // --- Browser debug pane (Step 6, S12). Read-only; own Settings grant. ---
+        ToolDef {
+            name: "browser_state".into(),
+            description: "Status of the SwerveBuild debug browser: grant, CDP reachability, whether the hidden debug pane exists, its current URL/title, and whether console/network hooks are installed. Read-only; no grant required.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "browser_open".into(),
+            description: "Navigate the SwerveBuild debug browser (a dedicated hidden webview — NOT the app UI) to a LOCAL web app and wait for it to load. Only http/https to localhost / 127.x / [::1] are allowed. Installs console+network capture hooks before navigating. Load timeout returns ok:false (read browser_console for why). Navigations are logged. Requires Settings → Agent browser debug grant (off by default).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "http(s)://localhost… URL of the local app to debug" }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolDef {
+            name: "browser_read_page".into(),
+            description: "Read the debug browser's current page: without a selector, a size-capped text digest (url, title, body innerText); with a CSS selector, that element's outerHTML. Requires the browser debug grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "Optional CSS selector for one element's outerHTML" },
+                    "max_chars": { "type": "number", "description": "Cap on returned characters (default 8000, max 20000)" }
+                }
+            }),
+        },
+        ToolDef {
+            name: "browser_console".into(),
+            description: "Recent console activity in the debug browser page: console.log/info/warn/error/debug, window errors, and unhandled rejections (level, text, timestamp; last 100). clear:true empties the buffer after reading. Requires the browser debug grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "clear": { "type": "boolean", "description": "Empty the buffer after reading (default false)" }
+                }
+            }),
+        },
+        ToolDef {
+            name: "browser_network".into(),
+            description: "Recent fetch/XHR requests made by the debug browser page (url, method, status, duration ms; last 100). Does not see <img>/CSS/document loads. clear:true empties the buffer after reading. Requires the browser debug grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "clear": { "type": "boolean", "description": "Empty the buffer after reading (default false)" }
+                }
+            }),
+        },
     ]
 }
 
@@ -507,6 +555,29 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
             swerve_build_lib::terminal::session_close(session_id)
         }
         "term_list" | "swervebuild_term_list" => swerve_build_lib::terminal::session_list(),
+        "browser_state" | "swervebuild_browser_state" => {
+            Ok(swerve_build_lib::browser_debug::state_report())
+        }
+        "browser_open" | "swervebuild_browser_open" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "url required".to_string())?;
+            swerve_build_lib::browser_debug::open(url)
+        }
+        "browser_read_page" | "swervebuild_browser_read_page" => {
+            let selector = args.get("selector").and_then(|v| v.as_str());
+            let max_chars = args.get("max_chars").and_then(|v| v.as_u64());
+            swerve_build_lib::browser_debug::read_page(selector, max_chars)
+        }
+        "browser_console" | "swervebuild_browser_console" => {
+            let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            swerve_build_lib::browser_debug::console(clear)
+        }
+        "browser_network" | "swervebuild_browser_network" => {
+            let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            swerve_build_lib::browser_debug::network(clear)
+        }
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
