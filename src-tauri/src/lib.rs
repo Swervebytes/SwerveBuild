@@ -1,6 +1,7 @@
 mod acp;
 pub mod app_ui;
 mod app_ui_cdp;
+pub mod browser_debug;
 mod env_context;
 mod grok_config;
 mod jobs;
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use store::{AppStore, Chat, ChatMessage, MessagePart, Project, Store};
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 #[derive(Serialize)]
 pub struct GrokStatus {
@@ -1196,6 +1197,29 @@ fn set_term_grant(granted: bool) -> Result<terminal::TermGrant, String> {
     terminal::set_granted(granted)
 }
 
+#[tauri::command]
+fn get_browser_debug_grant() -> browser_debug::BrowserDebugGrant {
+    browser_debug::load_grant()
+}
+
+#[tauri::command]
+fn set_browser_debug_grant(granted: bool) -> Result<browser_debug::BrowserDebugGrant, String> {
+    browser_debug::set_granted(granted)
+}
+
+/// Human-side visibility for the debug pane (the sidecar cannot show windows).
+#[tauri::command]
+fn show_debug_pane(app: AppHandle, visible: bool) -> Result<(), String> {
+    let win = app
+        .get_webview_window(browser_debug::DEBUG_PANE_LABEL)
+        .ok_or("debug pane window missing — restart SwerveBuild")?;
+    if visible {
+        win.show().and_then(|_| win.set_focus()).map_err(|e| e.to_string())
+    } else {
+        win.hide().map_err(|e| e.to_string())
+    }
+}
+
 /// Frontend publishes the visible route/title so MCP `app_ui_state` can report it
 /// without CDP. Does not require the human grant (publish is local telemetry).
 #[tauri::command]
@@ -1247,6 +1271,35 @@ pub fn run() {
             workflows_tauri::spawn_scheduler(app.handle().clone(), wf_sched);
             if let Err(e) = terminal::serve(term_serve) {
                 eprintln!("[swervebuild] terminal control server: {e}");
+            }
+            // S12 debug pane: a hidden second webview at a marker URL, driven
+            // over the shared CDP port by grant-gated browser_* MCP tools.
+            // Close → hide, so the CDP target survives a user closing it.
+            match browser_debug::DEBUG_PANE_INITIAL_URL.parse::<tauri::Url>() {
+                Ok(debug_url) => {
+                    match tauri::WebviewWindowBuilder::new(
+                        app,
+                        browser_debug::DEBUG_PANE_LABEL,
+                        tauri::WebviewUrl::External(debug_url),
+                    )
+                    .title("Swerve Debug Pane")
+                    .inner_size(1100.0, 800.0)
+                    .visible(false)
+                    .build()
+                    {
+                        Ok(win) => {
+                            let hide = win.clone();
+                            win.on_window_event(move |event| {
+                                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                                    api.prevent_close();
+                                    let _ = hide.hide();
+                                }
+                            });
+                        }
+                        Err(e) => eprintln!("[swervebuild] debug pane create: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[swervebuild] debug pane url: {e}"),
             }
             Ok(())
         })
@@ -1308,6 +1361,9 @@ pub fn run() {
             set_app_ui_grant,
             get_term_grant,
             set_term_grant,
+            get_browser_debug_grant,
+            set_browser_debug_grant,
+            show_debug_pane,
             publish_app_ui_state,
             workflows_tauri::workflows_list,
             workflows_tauri::workflow_get,
