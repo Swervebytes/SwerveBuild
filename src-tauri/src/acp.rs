@@ -916,7 +916,10 @@ fn reject_write_approvals_for_chat(
 /// final path, after resolving existing junctions/symlinks, stays inside the
 /// canonicalized project directory. Pure lexical `..` collapse is not enough on
 /// Windows: a directory junction inside the project can point outside.
-fn confine_to_cwd(requested: &str, cwd: &str) -> Option<PathBuf> {
+///
+/// `pub(crate)` so the terminal tool shares this one junction-safe check (audit
+/// A4) rather than reimplementing confinement.
+pub(crate) fn confine_to_cwd(requested: &str, cwd: &str) -> Option<PathBuf> {
     let root = strip_verbatim(&fs::canonicalize(cwd).ok()?);
     let req = Path::new(requested);
     let abs = if req.is_absolute() {

@@ -138,6 +138,27 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["condition"]
             }),
         },
+        // --- Terminal (Step 6). One-shot command runner. Require Settings grant. ---
+        ToolDef {
+            name: "term_state".into(),
+            description: "Report the terminal tool status: human grant, the resolved open-project folder commands run in, and defaults (shell, timeout, output cap). Read-only; no grant required.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "term_run".into(),
+            description: "Run ONE shell command to completion inside the open SwerveBuild project and return captured output. Windows PowerShell by default (shell:\"cmd\" for cmd.exe). cwd is confined to the project folder (junction-safe); output is size-capped (truncated flagged); a timeout tree-kills the process. Non-zero exit and timeout are normal results (ok:false), not tool errors. Requires Settings → Agent terminal grant (off by default); never enabled for shadow automations.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The command line to run (max 8000 chars)" },
+                    "cwd": { "type": "string", "description": "Optional sub-folder of the project to run in; must stay inside the project" },
+                    "project_id": { "type": "string", "description": "Optional Swerve project id; defaults to the most-recently-opened project" },
+                    "timeout_secs": { "type": "number", "description": "Max seconds before the process is killed (default 30, cap 120)" },
+                    "shell": { "type": "string", "description": "powershell (default) or cmd" }
+                },
+                "required": ["command"]
+            }),
+        },
     ]
 }
 
@@ -388,6 +409,18 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .ok_or_else(|| "condition required".to_string())?;
             let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64());
             swerve_build_lib::app_ui::wait_for(condition, timeout_ms)
+        }
+        "term_state" | "swervebuild_term_state" => Ok(swerve_build_lib::terminal::state_report()),
+        "term_run" | "swervebuild_term_run" => {
+            let command = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "command required".to_string())?;
+            let cwd = args.get("cwd").and_then(|v| v.as_str());
+            let project_id = args.get("project_id").and_then(|v| v.as_str());
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+            let shell = args.get("shell").and_then(|v| v.as_str());
+            swerve_build_lib::terminal::run_command(command, project_id, cwd, timeout_secs, shell)
         }
         _ => Err(format!("Unknown tool: {name}")),
     }
