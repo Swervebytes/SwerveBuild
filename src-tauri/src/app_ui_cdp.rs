@@ -23,6 +23,10 @@ pub struct CdpTarget {
 }
 
 /// HTTP GET against the CDP discovery HTTP server (not the page WebSocket).
+///
+/// WebView2's debugger often keeps the socket open after the response (ignores
+/// `Connection: close`). Do **not** `read_to_end` — parse `Content-Length` and
+/// stop once the body is complete (otherwise probes hang until read timeout).
 pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect((host, port)).map_err(|e| {
         format!("CDP HTTP connect {host}:{port} failed: {e}. Is SwerveBuild running with CDP enabled?")
@@ -41,24 +45,64 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
         .write_all(req.as_bytes())
         .map_err(|e| format!("CDP HTTP write: {e}"))?;
 
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("CDP HTTP read: {e}"))?;
-    let raw = String::from_utf8_lossy(&buf);
-    let body = split_http_body(&raw).ok_or_else(|| {
-        format!("CDP HTTP: no body in response ({} bytes)", buf.len())
-    })?;
-    Ok(body.to_string())
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                // Peer closed — accept whatever body we have after headers.
+                return take_http_body(&buf, true).ok_or_else(|| {
+                    format!("CDP HTTP: incomplete response ({} bytes)", buf.len())
+                });
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(body) = take_http_body(&buf, false) {
+                    return Ok(body);
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Timed out — only succeed if Content-Length body is already complete.
+                if let Some(body) = take_http_body(&buf, false) {
+                    return Ok(body);
+                }
+                return Err(format!("CDP HTTP read: {e}"));
+            }
+            Err(e) => return Err(format!("CDP HTTP read: {e}")),
+        }
+        if buf.len() > 8 * 1024 * 1024 {
+            return Err("CDP HTTP response too large".into());
+        }
+    }
 }
 
-fn split_http_body(raw: &str) -> Option<&str> {
-    // Handle both CRLF and LF separators.
-    if let Some(i) = raw.find("\r\n\r\n") {
-        return Some(&raw[i + 4..]);
+/// If `buf` contains a full HTTP response, return the body as a String.
+/// When `peer_closed` is false, only complete `Content-Length` responses return.
+fn take_http_body(buf: &[u8], peer_closed: bool) -> Option<String> {
+    let raw = String::from_utf8_lossy(buf);
+    let header_end = raw
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.find("\n\n").map(|i| i + 2))?;
+    let headers = &raw[..header_end];
+    let body_bytes = &buf[header_end..];
+    let content_len = headers.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("content-length:")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    });
+    if let Some(len) = content_len {
+        if body_bytes.len() >= len {
+            return Some(String::from_utf8_lossy(&body_bytes[..len]).into_owned());
+        }
+        return None;
     }
-    if let Some(i) = raw.find("\n\n") {
-        return Some(&raw[i + 2..]);
+    if peer_closed {
+        return Some(String::from_utf8_lossy(body_bytes).into_owned());
     }
     None
 }
@@ -128,12 +172,9 @@ pub fn pick_main_target(targets: &[CdpTarget]) -> Result<&CdpTarget, String> {
         })
 }
 
-/// Send one CDP command and wait for the matching id response.
-pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value, String> {
-    cdp_call_id(ws_url, 1, method, params)
-}
+type CdpSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
 
-fn cdp_call_id(ws_url: &str, id: u64, method: &str, params: Value) -> Result<Value, String> {
+fn connect_ws(ws_url: &str) -> Result<CdpSocket, String> {
     let (mut socket, _resp) = tungstenite::connect(ws_url)
         .map_err(|e| format!("CDP WebSocket connect failed: {e}"))?;
 
@@ -145,7 +186,37 @@ fn cdp_call_id(ws_url: &str, id: u64, method: &str, params: Value) -> Result<Val
             let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
         }
     }
+    Ok(socket)
+}
 
+/// Send one CDP command and wait for the matching id response.
+pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value, String> {
+    let mut socket = connect_ws(ws_url)?;
+    send_and_wait(&mut socket, 1, method, params)
+}
+
+/// Send several CDP commands over ONE WebSocket connection, awaiting each
+/// response in order. Required for paired events (keyDown + keyUp).
+pub fn cdp_call_many(ws_url: &str, calls: &[(&str, Value)]) -> Result<Vec<Value>, String> {
+    let mut socket = connect_ws(ws_url)?;
+    let mut out = Vec::with_capacity(calls.len());
+    for (i, (method, params)) in calls.iter().enumerate() {
+        out.push(send_and_wait(
+            &mut socket,
+            (i + 1) as u64,
+            method,
+            params.clone(),
+        )?);
+    }
+    Ok(out)
+}
+
+fn send_and_wait(
+    socket: &mut CdpSocket,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let msg = json!({ "id": id, "method": method, "params": params });
     let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
     socket
@@ -253,9 +324,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_http_body_crlf() {
-        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
-        assert_eq!(split_http_body(raw), Some("[]"));
+    fn take_http_body_content_length_complete() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+        assert_eq!(take_http_body(raw, false).as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn take_http_body_waits_for_full_content_length() {
+        // Body shorter than Content-Length is incomplete — even on close
+        // (a truncated response must error, not silently return a prefix).
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n[]";
+        assert_eq!(take_http_body(raw, false), None);
+        assert_eq!(take_http_body(raw, true), None);
+    }
+
+    #[test]
+    fn take_http_body_no_content_length_needs_close() {
+        let raw = b"HTTP/1.1 200 OK\r\n\r\n{\"a\":1}";
+        assert_eq!(take_http_body(raw, false), None);
+        assert_eq!(take_http_body(raw, true).as_deref(), Some("{\"a\":1}"));
     }
 
     #[test]

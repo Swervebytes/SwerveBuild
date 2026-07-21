@@ -104,47 +104,41 @@ fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "app_ui_type".into(),
-            description: "Type into a SwerveBuild UI field. Not implemented yet (screenshot + click ship first).".into(),
+            description: "Fill a SwerveBuild UI field via CDP: input, textarea, or contenteditable. Pass a CSS selector or bare data-testid. Fires real input/change events so bindings update. Requires grant + running app with CDP.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string" },
-                    "text": { "type": "string" }
+                    "selector": { "type": "string", "description": "CSS selector or bare data-testid token" },
+                    "text": { "type": "string", "description": "Text to set (max 4000 chars)" },
+                    "clear": { "type": "boolean", "description": "Replace existing value (default true); false appends" }
                 },
                 "required": ["selector", "text"]
             }),
         },
         ToolDef {
             name: "app_ui_press".into(),
-            description: "Send a key to the SwerveBuild UI. Not implemented yet.".into(),
+            description: "Send a trusted key press to the focused SwerveBuild element via CDP (focus a field first with app_ui_click/app_ui_type). Named keys: Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, Space — or one printable character. Chords: Ctrl+Enter, Shift+Tab, … Requires grant + running app with CDP.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "e.g. Enter, Escape" }
+                    "key": { "type": "string", "description": "e.g. Enter, Escape, Ctrl+Enter, a" }
                 },
                 "required": ["key"]
             }),
         },
         ToolDef {
             name: "app_ui_wait".into(),
-            description: "Wait for a UI condition. Not implemented yet.".into(),
+            description: "Wait for a SwerveBuild UI condition via CDP polling. Condition forms: CSS selector or bare data-testid (present), !selector (absent), route:/path (SPA route), text:needle (visible text). Timeout capped at 15000 ms (default 5000). Timeout returns matched:false — not an error. Requires grant + running app with CDP.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "condition": { "type": "string" },
-                    "timeout_ms": { "type": "number" }
+                    "condition": { "type": "string", "description": "selector | !selector | route:/path | text:needle" },
+                    "timeout_ms": { "type": "number", "description": "Max wait in ms (default 5000, cap 15000)" }
                 },
                 "required": ["condition"]
             }),
         },
     ]
-}
-
-fn app_ui_not_implemented(tool: &str) -> Result<Value, String> {
-    swerve_build_lib::app_ui::require_grant()?;
-    Err(format!(
-        "{tool}: not_implemented — use app_ui_screenshot / app_ui_click (CDP) for drive; type/press/wait come later."
-    ))
 }
 
 fn data_path() -> PathBuf {
@@ -368,9 +362,33 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .ok_or_else(|| "selector required".to_string())?;
             swerve_build_lib::app_ui::click(selector)
         }
-        "app_ui_type" | "swervebuild_app_ui_type" => app_ui_not_implemented("app_ui_type"),
-        "app_ui_press" | "swervebuild_app_ui_press" => app_ui_not_implemented("app_ui_press"),
-        "app_ui_wait" | "swervebuild_app_ui_wait" => app_ui_not_implemented("app_ui_wait"),
+        "app_ui_type" | "swervebuild_app_ui_type" => {
+            let selector = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "selector required".to_string())?;
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "text required".to_string())?;
+            let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(true);
+            swerve_build_lib::app_ui::type_text(selector, text, clear)
+        }
+        "app_ui_press" | "swervebuild_app_ui_press" => {
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "key required".to_string())?;
+            swerve_build_lib::app_ui::press_key(key)
+        }
+        "app_ui_wait" | "swervebuild_app_ui_wait" => {
+            let condition = args
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "condition required".to_string())?;
+            let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64());
+            swerve_build_lib::app_ui::wait_for(condition, timeout_ms)
+        }
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
