@@ -11,6 +11,7 @@
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
+  import { browserPane } from "$lib/stores/browserPane.svelte";
 
   type StreamMessage = {
     id: string;
@@ -367,6 +368,11 @@
         error =
           "Live agent session ended. Your saved messages are below — send a message to reconnect.";
         refreshActiveSessions();
+      }),
+      // Agent (or human) drove the preview browser — auto-open the dock so the
+      // human sees it. Emitted by the Rust pane supervisor on navigation.
+      subscribe<{ url?: string }>("browser-pane-activity", (event) => {
+        browserPane.onActivity(event.payload?.url);
       }),
     ];
     return () => offs.forEach((o) => o());

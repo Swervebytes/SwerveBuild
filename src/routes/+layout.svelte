@@ -23,6 +23,10 @@
   // would compete with the message composer at narrow widths.
   const showFeedback = $derived(!$page.url.pathname.startsWith("/chat/"));
 
+  // The preview browser is a CHAT tool — only render its docked pane on a chat
+  // route. Leaving chat unmounts BrowserPane, which parks the native webview.
+  const isChatRoute = $derived($page.url.pathname.startsWith("/chat/"));
+
   // Publish route/title for MCP app_ui_state (no CDP required).
   $effect(() => {
     const route = $page.url.pathname;
@@ -69,7 +73,7 @@
     <main class="content">
       {@render children()}
     </main>
-    {#if browserPane.open}
+    {#if browserPane.open && isChatRoute}
       <BrowserPane />
     {/if}
   </div>

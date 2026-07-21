@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow, type Window } from "@tauri-apps/api/window";
-  import { browserPane } from "$lib/stores/browserPane.svelte";
 
   let maximized = $state(false);
 
@@ -55,20 +54,6 @@
 <div class="titlebar">
   <div class="pane rail" data-tauri-drag-region></div>
   <div class="pane main" data-tauri-drag-region>
-    <button
-      class="ctl globe"
-      class:active={browserPane.open}
-      type="button"
-      onclick={() => browserPane.toggle()}
-      aria-label="Toggle preview browser"
-      aria-pressed={browserPane.open}
-      title="Preview browser"
-    >
-      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
-        <circle cx="8" cy="8" r="6.25" />
-        <path d="M1.75 8h12.5M8 1.75c1.9 2 1.9 10.5 0 12.5M8 1.75c-1.9 2-1.9 10.5 0 12.5" />
-      </svg>
-    </button>
     <div class="controls">
       <button class="ctl" type="button" onclick={minimize} aria-label="Minimize" title="Minimize">
         <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
@@ -157,13 +142,5 @@
   .ctl.close:hover {
     background: #e8452c;
     color: #fff;
-  }
-  /* Preview-browser toggle sits at the LEFT of the window-controls row. */
-  .globe {
-    margin-right: auto;
-    -webkit-app-region: no-drag;
-  }
-  .globe.active {
-    color: var(--sc-accent);
   }
 </style>

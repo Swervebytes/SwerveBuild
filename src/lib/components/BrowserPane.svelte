@@ -48,6 +48,9 @@
     return () => {
       ro.disconnect();
       window.removeEventListener("resize", onResize);
+      // Leaving the chat (or closing) unmounts us — park the native webview so it
+      // doesn't float over non-chat pages.
+      browserPane.park();
     };
   });
 
@@ -99,7 +102,7 @@
         type="text"
         spellcheck="false"
         autocomplete="off"
-        placeholder="localhost URL — e.g. http://localhost:1420"
+        placeholder="Type a URL — localhost or a website"
         bind:value={urlValue}
         onfocus={() => (editing = true)}
         onblur={() => (editing = false)}
@@ -130,7 +133,7 @@
   {/if}
 
   <div class="viewport" bind:this={viewport}>
-    <p class="hint">Local preview browser · loopback only (localhost / 127.x)</p>
+    <p class="hint">Preview browser · type a URL above to load a page</p>
   </div>
 </section>
 
