@@ -276,39 +276,13 @@ const HOOK_JS: &str = r#"(function () {
 // hook + toolbar survive EVERY navigation (human or agent), not just the one
 // `open()` drove.
 
-/// A shadow-DOM browser toolbar injected at document-start (URL bar +
-/// back/forward/reload). Shadow-isolated so it stays out of the app's
-/// `body.innerText` / `querySelector` (agent reads stay clean); pushes the body
-/// down 40px so nothing is hidden. Self-driving (history / location.href), with
-/// the same loopback-only policy the agent's `browser_open` enforces.
-const TOOLBAR_JS: &str = r##"(function(){
-  if (window.__swerveToolbar) return;
-  window.__swerveToolbar = true;
-  function isLoopback(h){ h=(h||'').toLowerCase(); return h==='localhost'||h==='[::1]'||h==='::1'||/^127\./.test(h); }
-  function build(){
-    if (!document.body) { return setTimeout(build, 30); }
-    var host = document.createElement('div');
-    host.id='__swerve_tb';
-    host.style.cssText='position:fixed;top:0;left:0;right:0;height:40px;z-index:2147483647;';
-    var root = host.attachShadow ? host.attachShadow({mode:'open'}) : host;
-    root.innerHTML='<style>*{box-sizing:border-box;font-family:system-ui,sans-serif}.bar{display:flex;align-items:center;gap:6px;height:40px;padding:0 8px;background:#1b1b1f;border-bottom:1px solid #333}button{background:#2a2a30;color:#ddd;border:1px solid #3a3a42;border-radius:6px;height:26px;min-width:30px;cursor:pointer;font-size:14px}button:hover{background:#33333b}input{flex:1;height:28px;background:#111;color:#eee;border:1px solid #3a3a42;border-radius:6px;padding:0 10px;font-size:13px}.msg{color:#e8452c;font-size:11px;white-space:nowrap}</style><div class="bar"><button id="b" title="Back">&#9664;</button><button id="f" title="Forward">&#9654;</button><button id="r" title="Reload">&#8635;</button><input id="u" spellcheck="false" placeholder="localhost URL" /><span class="msg" id="m"></span></div>';
-    document.documentElement.appendChild(host);
-    var pad=document.createElement('style'); pad.setAttribute('data-swerve-tb','1'); pad.textContent='body{margin-top:40px !important}'; (document.head||document.documentElement).appendChild(pad);
-    var q=function(s){return root.querySelector(s)};
-    q('#b').onclick=function(){history.back()};
-    q('#f').onclick=function(){history.forward()};
-    q('#r').onclick=function(){location.reload()};
-    var u=q('#u'), m=q('#m'); u.value=location.href;
-    u.addEventListener('keydown',function(e){ if(e.key!=='Enter')return; var v=u.value.trim(); if(!v)return; if(!/^https?:\/\//i.test(v)) v='http://'+v; var hn; try{hn=new URL(v).hostname}catch(_){m.textContent='bad url';return} if(!isLoopback(hn)){m.textContent='localhost only';return} m.textContent=''; location.href=v; });
-  }
-  build();
-})();"##;
-
-/// The full page-init script the persistent supervisor keeps registered: the
-/// console/network capture hook plus the browser toolbar. Both are idempotent
-/// per document.
+/// The page-init script the persistent supervisor keeps registered for
+/// document-start. S13d moved the URL bar / back-forward-reload chrome OUT of
+/// the page and into the app's Svelte toolbar above the docked pane (real
+/// window chrome), so only the console/network capture hook is injected now.
+/// Idempotent per document.
 fn pane_init_js() -> String {
-    format!("{HOOK_JS}\n{TOOLBAR_JS}")
+    HOOK_JS.to_string()
 }
 
 /// Establish and HOLD one CDP session to the pane with the init script
@@ -371,6 +345,17 @@ fn append_nav_log(url: &str, ok: bool, note: &str) {
 /// still registered at navigation commit (see the note above).
 pub fn open(raw_url: &str) -> Result<Value, String> {
     require_grant()?;
+    open_impl(raw_url)
+}
+
+/// Human-driven navigation from the docked pane's toolbar (S13d). Same
+/// loopback-only policy as the agent tool, but no agent grant required — the
+/// person clicking their own URL bar is not "the agent driving the browser".
+pub fn human_open(raw_url: &str) -> Result<Value, String> {
+    open_impl(raw_url)
+}
+
+fn open_impl(raw_url: &str) -> Result<Value, String> {
     let url = validate_debug_url(raw_url)?;
     let ep = require_endpoint()?;
     let pane = find_pane(&ep)?;
@@ -526,7 +511,7 @@ pub fn state_report() -> Value {
         "paneTitle": title,
         "hooksInstalled": hooks,
         "policy": "read + interact; http/https to loopback hosts only; navigations logged",
-        "humanToolbar": "injected URL bar + back/forward/reload (Settings → Show pane to use); hooks persist across navigations",
+        "humanToolbar": "docked pane in the app window with a real toolbar (URL bar + back/forward/reload); toggle from the titlebar globe or Settings → Show pane; hooks persist across navigations",
         "tools": {
             "browser_state": "available",
             "browser_open": tool_status,
@@ -712,6 +697,15 @@ pub fn type_text(selector: &str, text: &str, clear: bool) -> Result<Value, Strin
 /// console/network keep capturing.
 pub fn navigate(action: &str) -> Result<Value, String> {
     require_grant()?;
+    navigate_impl(action)
+}
+
+/// Human-driven back/forward/reload from the docked pane toolbar (S13d).
+pub fn human_navigate(action: &str) -> Result<Value, String> {
+    navigate_impl(action)
+}
+
+fn navigate_impl(action: &str) -> Result<Value, String> {
     let js = nav_js(action)?;
     let ws = pane_ws()?;
     let _ = app_ui_cdp::evaluate(&ws, &format!("(function(){{ try {{ {js}; }} catch(e) {{}} return true; }})()"));

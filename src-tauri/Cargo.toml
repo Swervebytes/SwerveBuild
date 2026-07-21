@@ -27,7 +27,11 @@ members = ["crates/swerve-workflows"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
+# `unstable` unlocks multi-webview-per-window (Window::add_child) — S13d docks
+# the debug browser as a child webview INSIDE the main window instead of a
+# separate hidden window. Pinned to a specific 2.x in Cargo.lock; revisit on
+# Tauri minor bumps since the multiwebview API is not yet semver-stable.
+tauri = { version = "2", features = ["protocol-asset", "unstable"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

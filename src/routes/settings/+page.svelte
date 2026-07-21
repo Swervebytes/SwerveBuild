@@ -8,6 +8,7 @@
   import ProviderList from "$lib/components/providers/ProviderList.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import LocalModelsCard from "$lib/components/models/LocalModelsCard.svelte";
+  import { browserPane } from "$lib/stores/browserPane.svelte";
   import { APP_VERSION } from "$lib/version";
 
   type GrokStatus = {
@@ -156,14 +157,6 @@
       browserMessage = String(e);
     } finally {
       browserSaving = false;
-    }
-  }
-
-  async function showDebugPane(visible: boolean) {
-    try {
-      await invoke("show_debug_pane", { visible });
-    } catch (e) {
-      browserMessage = String(e);
     }
   }
 
@@ -540,14 +533,15 @@
       />
     </div>
     <p class="group-note">
-      Allow the in-app agent to drive a <strong>separate hidden debug browser</strong> via
+      Allow the in-app agent to drive the <strong>preview browser</strong> via
       <code>browser_*</code> MCP tools — navigate to a <strong>localhost</strong> app, read the page,
-      console, and fetch/XHR activity. Read-only; it is never this app's own window, and agent
-      navigations are logged. Off by default. Revoke anytime.
+      console, and fetch/XHR activity. Agent navigations are logged. Off by default; revoke anytime.
+      The browser is a docked pane in this window — toggle it from the titlebar globe or
+      <strong>Show pane</strong> below to watch (and drive) the same webview the agent sees.
     </p>
     <Field
       label="Allow agent to use the debug browser"
-      hint="http/https to localhost only. Use Show pane to watch what the agent sees."
+      hint="http/https to localhost only. Toggle the pane from the titlebar globe."
       row
     >
       <div class="segmented" role="radiogroup" aria-label="Browser debug grant">
@@ -577,8 +571,8 @@
       </div>
     </Field>
     <div class="pane-row">
-      <button class="btn btn-sm" onclick={() => showDebugPane(true)}>Show pane</button>
-      <button class="btn btn-sm" onclick={() => showDebugPane(false)}>Hide pane</button>
+      <button class="btn btn-sm" onclick={() => browserPane.openPane()}>Show pane</button>
+      <button class="btn btn-sm" onclick={() => browserPane.closePane()}>Hide pane</button>
     </div>
     {#if browserMessage}
       <p class="ep-msg">{browserMessage}</p>
