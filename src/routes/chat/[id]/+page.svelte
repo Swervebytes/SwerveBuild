@@ -8,6 +8,12 @@
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
   import { imageSrc } from "$lib/attachments";
+  import {
+    type ChatUsage,
+    emptyUsage,
+    parseEndTurnUsage,
+    parseUsageUpdate,
+  } from "$lib/chatUsage";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
@@ -30,6 +36,8 @@
   let modelSwitching = $state(false);
   let error = $state<string | null>(null);
   let activeSessionCount = $state(0);
+  /** ACP-reported context window; stays empty until agent sends used+size. */
+  let usage = $state<ChatUsage>(emptyUsage());
 
   // `-m` is a grok flag; hide the model picker when another agent backs this chat.
   const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
@@ -38,6 +46,11 @@
 
   function resetStream() {
     streaming = [];
+  }
+
+  function applyUsage(next: ChatUsage | null) {
+    if (!next) return;
+    usage = next;
   }
 
   function appendStream(update: Record<string, unknown>) {
@@ -49,7 +62,13 @@
       (inner.title as string) ??
       "";
 
-    if (!text && sessionUpdate !== "tool_call") return;
+    // ACP session-usage RFD: sessionUpdate "usage_update" with used + size.
+    if (sessionUpdate === "usage_update") {
+      applyUsage(parseUsageUpdate(inner));
+      return;
+    }
+
+    if (!text && sessionUpdate !== "tool_call" && sessionUpdate !== "tool_call_update") return;
 
     if (sessionUpdate === "agent_message_chunk") {
       const last = streaming[streaming.length - 1];
@@ -205,6 +224,7 @@
   async function bootstrap(id: string, gen: number) {
     error = null;
     sessionReady = false;
+    usage = emptyUsage();
     resetStream();
 
     await workspaceStore.refresh();
@@ -345,10 +365,13 @@
         }
         refreshActiveSessions();
       }),
-      subscribe<{ chatId: string }>("chat-turn-end", (event) => {
+      subscribe<{ chatId: string; usage?: unknown }>("chat-turn-end", (event) => {
         // Arrives after the turn's last chunk event, so the saved reply includes
         // the tail that finalizing on the send's return could clip.
         if (event.payload.chatId !== $page.params.id) return;
+        if (event.payload.usage !== undefined) {
+          applyUsage(parseEndTurnUsage(event.payload.usage));
+        }
         void finalizeAssistantMessage().then((saved) => {
           if (saved) workspaceStore.refresh();
         });
@@ -390,6 +413,7 @@
       showModelPicker={chatProviderId === "grok"}
       modelId={chat?.model_id ?? null}
       {modelSwitching}
+      {usage}
       onmodelchange={switchModel}
     />
   </div>

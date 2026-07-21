@@ -366,8 +366,16 @@ impl AcpManager {
                         _ => false,
                     };
                     if is_prompt_reply {
-                        let _ = app_for_reader
-                            .emit("chat-turn-end", json!({ "chatId": chat_for_reader }));
+                        // Forward optional end-turn / context usage from the prompt
+                        // result when present (S14). UI only displays used+size;
+                        // incomplete usage is ignored so we never invent numbers.
+                        let mut payload = json!({ "chatId": chat_for_reader });
+                        if let Some(usage) =
+                            usage_payload_from_prompt_response(&value)
+                        {
+                            payload["usage"] = usage;
+                        }
+                        let _ = app_for_reader.emit("chat-turn-end", payload);
                     }
 
                     if let Ok(mut pending) = transport_for_reader.responses.lock() {
@@ -721,6 +729,47 @@ fn jsonrpc_id(value: &Value) -> Option<u64> {
         .or_else(|| id.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
 }
 
+/// Extract a usage payload suitable for the UI from a `session/prompt` JSON-RPC
+/// response. Prefer objects that include both `used` and `size` (session context
+/// RFD). If only a nested `usage` object exists, forward it as-is so the client
+/// can decide — it must still refuse to invent a context window size.
+fn usage_payload_from_prompt_response(response: &Value) -> Option<Value> {
+    let result = response.get("result")?;
+    if result.is_null() {
+        return None;
+    }
+    // Full result already looks like a usage_update (used + size).
+    if result_has_used_and_size(result) {
+        return Some(result.clone());
+    }
+    if let Some(usage) = result.get("usage") {
+        if usage.is_object() {
+            return Some(usage.clone());
+        }
+    }
+    // Nested context / contextWindow shapes some agents may use.
+    for key in ["context", "contextWindow", "context_window"] {
+        if let Some(ctx) = result.get(key) {
+            if result_has_used_and_size(ctx) {
+                return Some(ctx.clone());
+            }
+        }
+    }
+    None
+}
+
+fn result_has_used_and_size(v: &Value) -> bool {
+    let used_ok = v
+        .get("used")
+        .and_then(|x| x.as_f64().or_else(|| x.as_i64().map(|n| n as f64)))
+        .is_some_and(|n| n.is_finite() && n >= 0.0);
+    let size_ok = v
+        .get("size")
+        .and_then(|x| x.as_f64().or_else(|| x.as_i64().map(|n| n as f64)))
+        .is_some_and(|n| n.is_finite() && n > 0.0);
+    used_ok && size_ok
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1041,6 +1090,44 @@ mod tests {
         assert_eq!(err.0, -32002);
         assert!(!dir.join("x.txt").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_from_prompt_result_used_size() {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "stopReason": "end_turn", "used": 53000, "size": 200000 }
+        });
+        let usage = usage_payload_from_prompt_response(&resp).unwrap();
+        assert_eq!(usage["used"], 53000);
+        assert_eq!(usage["size"], 200000);
+    }
+
+    #[test]
+    fn usage_from_prompt_result_nested_usage_object() {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "stopReason": "end_turn",
+                "usage": { "totalTokens": 100, "inputTokens": 80, "outputTokens": 20 }
+            }
+        });
+        let usage = usage_payload_from_prompt_response(&resp).unwrap();
+        // Forwarded as-is; client will not treat this as context used/size.
+        assert_eq!(usage["totalTokens"], 100);
+        assert!(usage.get("used").is_none());
+    }
+
+    #[test]
+    fn usage_from_prompt_result_absent() {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "stopReason": "end_turn" }
+        });
+        assert!(usage_payload_from_prompt_response(&resp).is_none());
     }
 
     fn tempfile_dir(label: &str) -> PathBuf {
