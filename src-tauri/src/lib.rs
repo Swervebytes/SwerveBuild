@@ -1234,17 +1234,60 @@ fn set_browser_debug_grant(granted: bool) -> Result<browser_debug::BrowserDebugG
     browser_debug::set_granted(granted)
 }
 
-/// Human-side visibility for the debug pane (the sidecar cannot show windows).
+/// Offscreen Y (logical px) where the docked debug pane is parked when the
+/// human dock is closed. Far below any real window height so the child webview
+/// is clipped out of view, yet still alive — the agent's browser_* tools and
+/// CDP screenshots keep working headlessly.
+const PANE_PARK_Y: f64 = 30_000.0;
+
+/// The docked debug-pane child webview (label `swerve-debug`) living inside the
+/// main window. `None` until `add_child` has run at startup.
+fn debug_pane_webview(app: &AppHandle) -> Option<tauri::Webview<tauri::Wry>> {
+    app.get_webview(browser_debug::DEBUG_PANE_LABEL)
+}
+
+/// Position + size the docked pane over the frontend's reserved area. Bounds
+/// are **physical** pixels (CSS px × devicePixelRatio) relative to the window
+/// client area: a child webview is positioned in device pixels, so the frontend
+/// pre-multiplies its `getBoundingClientRect` by the current DPR (this window
+/// runs at fractional scale, e.g. 1.38). Called on dock open and on resize.
 #[tauri::command]
-fn show_debug_pane(app: AppHandle, visible: bool) -> Result<(), String> {
-    let win = app
-        .get_webview_window(browser_debug::DEBUG_PANE_LABEL)
-        .ok_or("debug pane window missing — restart SwerveBuild")?;
-    if visible {
-        win.show().and_then(|_| win.set_focus()).map_err(|e| e.to_string())
-    } else {
-        win.hide().map_err(|e| e.to_string())
-    }
+fn browser_pane_set_bounds(
+    app: AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let pane = debug_pane_webview(&app).ok_or("debug pane missing — restart SwerveBuild")?;
+    pane.set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|e| e.to_string())?;
+    pane.set_size(tauri::PhysicalSize::new(width.max(1.0), height.max(1.0)))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Park the docked pane offscreen — dock closed, or temporarily hidden while a
+/// modal is up (a native child webview always paints above the HTML). The
+/// webview stays alive so agent tools keep working.
+#[tauri::command]
+fn browser_pane_park(app: AppHandle) -> Result<(), String> {
+    let pane = debug_pane_webview(&app).ok_or("debug pane missing — restart SwerveBuild")?;
+    pane.set_position(tauri::PhysicalPosition::new(0.0, PANE_PARK_Y))
+        .map_err(|e| e.to_string())
+}
+
+/// Human toolbar: navigate the docked pane to a LOCAL url. Loopback-only (same
+/// policy as the agent tool) but no agent grant — the human is driving.
+#[tauri::command]
+fn browser_pane_open(url: String) -> Result<serde_json::Value, String> {
+    browser_debug::human_open(&url)
+}
+
+/// Human toolbar: back | forward | reload in the docked pane.
+#[tauri::command]
+fn browser_pane_nav(action: String) -> Result<serde_json::Value, String> {
+    browser_debug::human_navigate(&action)
 }
 
 /// Frontend publishes the visible route/title so MCP `app_ui_state` can report it
@@ -1299,37 +1342,48 @@ pub fn run() {
             if let Err(e) = terminal::serve(term_serve) {
                 eprintln!("[swervebuild] terminal control server: {e}");
             }
-            // S12 debug pane: a hidden second webview at a marker URL, driven
-            // over the shared CDP port by grant-gated browser_* MCP tools.
-            // Close → hide, so the CDP target survives a user closing it.
-            match browser_debug::DEBUG_PANE_INITIAL_URL.parse::<tauri::Url>() {
-                Ok(debug_url) => {
-                    match tauri::WebviewWindowBuilder::new(
-                        app,
-                        browser_debug::DEBUG_PANE_LABEL,
-                        tauri::WebviewUrl::External(debug_url),
-                    )
-                    .title("Swerve Debug Pane")
-                    .inner_size(1100.0, 800.0)
-                    .visible(false)
-                    .build()
-                    {
-                        Ok(win) => {
-                            let hide = win.clone();
-                            win.on_window_event(move |event| {
-                                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                                    api.prevent_close();
-                                    let _ = hide.hide();
-                                }
-                            });
-                        }
-                        Err(e) => eprintln!("[swervebuild] debug pane create: {e}"),
+            // S13d debug pane: a second webview docked as a CHILD of the main
+            // window (was a separate hidden window through S13c) so it is visible
+            // IN the app — a Claude-style browser pane. Still the same marker URL
+            // and label, so the CDP supervisor + grant-gated browser_* MCP tools
+            // find and drive it exactly as before. It is created parked offscreen
+            // (see PANE_PARK_Y): alive and agent-drivable at all times, brought
+            // on-screen only when the human opens the dock (browser_pane_*).
+            //
+            // Created on a background thread: Window::add_child dispatches the
+            // build to the main thread and BLOCKS until it runs — calling it
+            // inline here (also the main thread, before the event loop pumps)
+            // would deadlock.
+            let pane_app = app.handle().clone();
+            std::thread::spawn(move || {
+                let url = match browser_debug::DEBUG_PANE_INITIAL_URL.parse::<tauri::Url>() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[swervebuild] debug pane url: {e}");
+                        return;
                     }
+                };
+                let Some(window) = pane_app.get_window("main") else {
+                    eprintln!("[swervebuild] debug pane: main window missing");
+                    return;
+                };
+                let builder = tauri::webview::WebviewBuilder::new(
+                    browser_debug::DEBUG_PANE_LABEL,
+                    tauri::WebviewUrl::External(url),
+                );
+                // Born offscreen at a real size so it renders (CDP screenshots
+                // work) but is clipped out of view until the dock opens. Physical
+                // px (see browser_pane_set_bounds): PANE_PARK_Y is far offscreen.
+                if let Err(e) = window.add_child(
+                    builder,
+                    tauri::PhysicalPosition::new(0.0, PANE_PARK_Y),
+                    tauri::PhysicalSize::new(800.0, 600.0),
+                ) {
+                    eprintln!("[swervebuild] debug pane add_child: {e}");
                 }
-                Err(e) => eprintln!("[swervebuild] debug pane url: {e}"),
-            }
+            });
             // S13c: hold a persistent CDP session to the pane so the console/
-            // network hooks + the browser toolbar survive every navigation.
+            // network capture hooks survive every navigation (human or agent).
             browser_debug::spawn_pane_supervisor();
             Ok(())
         })
@@ -1394,7 +1448,10 @@ pub fn run() {
             set_term_grant,
             get_browser_debug_grant,
             set_browser_debug_grant,
-            show_debug_pane,
+            browser_pane_set_bounds,
+            browser_pane_park,
+            browser_pane_open,
+            browser_pane_nav,
             publish_app_ui_state,
             workflows_tauri::workflows_list,
             workflows_tauri::workflow_get,

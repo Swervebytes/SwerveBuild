@@ -6,7 +6,9 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import Titlebar from "$lib/components/Titlebar.svelte";
+  import BrowserPane from "$lib/components/BrowserPane.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { browserPane } from "$lib/stores/browserPane.svelte";
   import { theme } from "$lib/stores/theme.svelte";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
@@ -67,6 +69,9 @@
     <main class="content">
       {@render children()}
     </main>
+    {#if browserPane.open}
+      <BrowserPane />
+    {/if}
   </div>
 </div>
 
