@@ -183,12 +183,9 @@ pub fn pick_main_target(targets: &[CdpTarget]) -> Result<&CdpTarget, String> {
         })
 }
 
-/// Send one CDP command and wait for the matching id response.
-pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value, String> {
-    cdp_call_id(ws_url, 1, method, params)
-}
+type CdpSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
 
-fn cdp_call_id(ws_url: &str, id: u64, method: &str, params: Value) -> Result<Value, String> {
+fn connect_ws(ws_url: &str) -> Result<CdpSocket, String> {
     let (mut socket, _resp) = tungstenite::connect(ws_url)
         .map_err(|e| format!("CDP WebSocket connect failed: {e}"))?;
 
@@ -200,7 +197,37 @@ fn cdp_call_id(ws_url: &str, id: u64, method: &str, params: Value) -> Result<Val
             let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
         }
     }
+    Ok(socket)
+}
 
+/// Send one CDP command and wait for the matching id response.
+pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value, String> {
+    let mut socket = connect_ws(ws_url)?;
+    send_and_wait(&mut socket, 1, method, params)
+}
+
+/// Send several CDP commands over ONE WebSocket connection, awaiting each
+/// response in order. Required for paired events (keyDown + keyUp).
+pub fn cdp_call_many(ws_url: &str, calls: &[(&str, Value)]) -> Result<Vec<Value>, String> {
+    let mut socket = connect_ws(ws_url)?;
+    let mut out = Vec::with_capacity(calls.len());
+    for (i, (method, params)) in calls.iter().enumerate() {
+        out.push(send_and_wait(
+            &mut socket,
+            (i + 1) as u64,
+            method,
+            params.clone(),
+        )?);
+    }
+    Ok(out)
+}
+
+fn send_and_wait(
+    socket: &mut CdpSocket,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let msg = json!({ "id": id, "method": method, "params": params });
     let text = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
     socket
