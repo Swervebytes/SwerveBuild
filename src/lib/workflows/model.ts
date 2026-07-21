@@ -183,7 +183,13 @@ export const PARAM_FORMS: Record<string, Field[]> = {
   "agent.run": [
     { key: "prompt", label: "Prompt", kind: "expression", placeholder: "Summarize {{ $json.text }}" },
     { key: "cwd", label: "Project folder", kind: "text", placeholder: "E:\\MyProject" },
-    { key: "model", label: "Model", kind: "text", placeholder: "Blank for the default model" },
+    {
+      key: "model",
+      label: "Model",
+      kind: "text",
+      placeholder: "Blank for the default model",
+      help: "A Grok model id, or a local model id (swerve-local-…) when run inside the app.",
+    },
     { key: "max_turns", label: "Max turns", kind: "number" },
     { key: "timeout_secs", label: "Timeout seconds", kind: "number" },
     { key: "web_search", label: "Allow web search", kind: "toggle" },

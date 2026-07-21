@@ -381,6 +381,18 @@ impl LlmManager {
         inner.leases.retain(|h, _| !h.starts_with(prefix));
     }
 
+    /// Test seam: seed the lease book without an AppHandle / live server.
+    #[cfg(test)]
+    pub(crate) fn test_insert_lease(&self, holder: &str) {
+        let mut inner = self.inner.lock().expect("llm lock");
+        inner.leases.insert(holder.to_string(), ());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lease_held(&self, holder: &str) -> bool {
+        self.inner.lock().expect("llm lock").leases.contains_key(holder)
+    }
+
     /// Stop only when idle (no leases). Used by Settings stop / remove.
     pub fn stop_if_idle(&self, app: &AppHandle) -> Result<(), String> {
         {

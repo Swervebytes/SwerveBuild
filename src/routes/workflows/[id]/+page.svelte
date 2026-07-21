@@ -11,6 +11,7 @@
     type Node as FlowNode,
     type Edge as FlowEdge,
     type Connection,
+    type Viewport,
   } from "@xyflow/svelte";
   import "@xyflow/svelte/dist/style.css";
   import Icon from "$lib/components/ui/Icon.svelte";
@@ -24,6 +25,7 @@
     inTauri,
     wfApi,
     type CatalogEntry,
+    type WfConnection,
     type WfNode,
     type WfNodeFinished,
     type WfNodeStarted,
@@ -32,7 +34,7 @@
     type WfValidation,
     type WorkflowDoc,
   } from "$lib/workflows/api";
-  import { makeNode, newWorkflowDoc } from "$lib/workflows/model";
+  import { freshNodeId, makeNode, newWorkflowDoc, uniqueName } from "$lib/workflows/model";
 
   const nodeTypes = { wf: WorkflowNode } as never;
 
@@ -56,6 +58,19 @@
   let awaitingRun = $state(false);
   let toast = $state<string | null>(null);
   let colorMode = $state<"dark" | "light">("dark");
+  let viewport = $state<Viewport>({ x: 0, y: 0, zoom: 1 });
+  let canvasEl = $state<HTMLDivElement | null>(null);
+  let clipboard: { defs: WfNode[]; conns: WfConnection[] } | null = null;
+  // Undo history: top of `past` is always the current settled state, so undo
+  // needs at least two entries. Entries are SERIALIZED docs — node objects that
+  // round-trip through Svelte Flow pick up proxies that structuredClone rejects,
+  // so history stores JSON text (workflow docs are JSON by definition) and
+  // rebuilds guaranteed-plain objects on apply.
+  let past = $state<string[]>([]);
+  let future = $state<string[]>([]);
+  let historyTimer: ReturnType<typeof setTimeout> | null = null;
+  const canUndo = $derived(past.length > 1);
+  const canRedo = $derived(future.length > 0);
 
   const specOf = (type: string) => catalog.find((c) => c.type === type);
   const selectedNode = $derived(
@@ -65,6 +80,69 @@
   function flash(message: string) {
     toast = message;
     setTimeout(() => (toast = null), 2600);
+  }
+
+  // ---------------------------------------------------------------- history
+
+  function serializeNow(): string {
+    return JSON.stringify($state.snapshot(toDoc()));
+  }
+
+  function captureHistory() {
+    if (historyTimer) {
+      clearTimeout(historyTimer);
+      historyTimer = null;
+    }
+    const snap = serializeNow();
+    if (past[past.length - 1] === snap) return;
+    past = [...past.slice(-59), snap];
+    future = [];
+  }
+
+  /** Mark the workflow edited: dirty flag + history capture. Coalesce=true
+   *  debounces the capture so a typing burst undoes as one step. */
+  function touch(coalesce = false) {
+    dirty = true;
+    if (coalesce) {
+      if (historyTimer) clearTimeout(historyTimer);
+      historyTimer = setTimeout(captureHistory, 600);
+    } else {
+      captureHistory();
+    }
+  }
+
+  /** Restore the editable surface (never `state`/ids — those stay live). */
+  function applyHistory(snap: string) {
+    const w = JSON.parse(snap) as WorkflowDoc;
+    doc = {
+      ...doc!,
+      name: w.name,
+      enabled: w.enabled,
+      settings: w.settings,
+      permissions: w.permissions,
+      nodes: w.nodes,
+      connections: w.connections,
+    };
+    toFlow(doc);
+    selectedId = null;
+    dirty = true;
+  }
+
+  function undo() {
+    if (historyTimer) captureHistory(); // settle a pending typing burst first
+    if (past.length < 2) return;
+    const current = past[past.length - 1];
+    past = past.slice(0, -1);
+    future = [...future, current];
+    applyHistory(past[past.length - 1]);
+  }
+
+  function redo() {
+    if (future.length === 0) return;
+    const next = future[future.length - 1];
+    future = future.slice(0, -1);
+    past = [...past, next];
+    applyHistory(next);
   }
 
   function toFlow(w: WorkflowDoc) {
@@ -120,6 +198,8 @@
       doc.id = "w-sandbox";
     }
     toFlow(doc!);
+    past = [serializeNow()];
+    future = [];
     await refreshRuns();
     loading = false;
   }
@@ -224,11 +304,11 @@
 
   // ---------------------------------------------------------------- editing
 
-  function addNode(entry: CatalogEntry) {
+  function addNode(entry: CatalogEntry, position?: [number, number]) {
     if (!doc) return;
     const taken = new Set(nodes.map((n) => (n.data as { def: WfNode }).def.name));
     const rightmost = nodes.reduce((mx, n) => Math.max(mx, n.position.x), 40);
-    const def = makeNode(entry, taken, [rightmost + 260, 220 + (nodes.length % 3) * 40]);
+    const def = makeNode(entry, taken, position ?? [rightmost + 260, 220 + (nodes.length % 3) * 40]);
     nodes = [
       ...nodes,
       {
@@ -241,7 +321,7 @@
     ];
     selectedId = def.id;
     rightTab = "inspect";
-    dirty = true;
+    touch();
   }
 
   function deleteSelected() {
@@ -250,7 +330,96 @@
     selectedId = null;
     nodes = nodes.filter((n) => n.id !== id);
     edges = edges.filter((e) => e.source !== id && e.target !== id);
-    dirty = true;
+    touch();
+  }
+
+  // ------------------------------------------------------------ drag & drop
+
+  const DND_TYPE = "application/x-swervebuild-node";
+
+  function onCanvasDragover(e: DragEvent) {
+    if (e.dataTransfer?.types.includes(DND_TYPE)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    }
+  }
+
+  function onCanvasDrop(e: DragEvent) {
+    const type = e.dataTransfer?.getData(DND_TYPE);
+    if (!type || !canvasEl) return;
+    const entry = specOf(type);
+    if (!entry) return;
+    e.preventDefault();
+    const rect = canvasEl.getBoundingClientRect();
+    // Screen → flow coordinates via the bound viewport; nudge so the node
+    // head lands under the cursor rather than its top-left corner.
+    addNode(entry, [
+      Math.round((e.clientX - rect.left - viewport.x) / viewport.zoom) - 90,
+      Math.round((e.clientY - rect.top - viewport.y) / viewport.zoom) - 18,
+    ]);
+  }
+
+  // ------------------------------------------------------------- copy/paste
+
+  function copySelection(): boolean {
+    const picked = nodes.filter((n) => n.selected || n.id === selectedId);
+    if (picked.length === 0) return false;
+    const ids = new Set(picked.map((n) => n.id));
+    clipboard = {
+      defs: picked.map((n) => {
+        const def = $state.snapshot((n.data as { def: WfNode }).def) as WfNode;
+        def.position = [Math.round(n.position.x), Math.round(n.position.y)];
+        return def;
+      }),
+      conns: edges
+        .filter((e) => ids.has(e.source) && ids.has(e.target))
+        .map((e) => ({ from: e.source, out: e.sourceHandle ?? "main", to: e.target, in: e.targetHandle ?? "main" })),
+    };
+    flash(`Copied ${picked.length} node${picked.length === 1 ? "" : "s"}`);
+    return true;
+  }
+
+  function pasteClipboard() {
+    if (!clipboard || !doc) return;
+    const taken = new Set(nodes.map((n) => (n.data as { def: WfNode }).def.name));
+    const idMap = new Map<string, string>();
+    const pastedNodes = clipboard.defs.map((orig) => {
+      // JSON round-trip, not structuredClone: defs touched by the canvas can
+      // carry proxies that structuredClone rejects.
+      const def = JSON.parse(JSON.stringify(orig)) as WfNode;
+      def.id = freshNodeId();
+      def.name = uniqueName(def.name, taken);
+      taken.add(def.name);
+      def.position = [orig.position[0] + 32, orig.position[1] + 32];
+      idMap.set(orig.id, def.id);
+      return {
+        id: def.id,
+        type: "wf",
+        position: { x: def.position[0], y: def.position[1] },
+        data: { def, spec: specOf(def.type), run: null },
+        selected: true,
+      } as FlowNode;
+    });
+    const stamp = Date.now().toString(36);
+    const pastedEdges = clipboard.conns.map(
+      (c, i) =>
+        ({
+          id: `e-paste-${stamp}-${i}`,
+          source: idMap.get(c.from)!,
+          sourceHandle: c.out,
+          target: idMap.get(c.to)!,
+          targetHandle: c.in,
+        }) as FlowEdge,
+    );
+    nodes = [...nodes.map((n) => ({ ...n, selected: false })), ...pastedNodes];
+    edges = [...edges, ...pastedEdges];
+    selectedId = pastedNodes.length === 1 ? pastedNodes[0].id : null;
+    // Cascade repeated pastes instead of stacking exactly on top of each other.
+    clipboard = {
+      ...clipboard,
+      defs: clipboard.defs.map((d) => ({ ...d, position: [d.position[0] + 32, d.position[1] + 32] as [number, number] })),
+    };
+    touch();
   }
 
   function isValidConnection(conn: FlowEdge | Connection): boolean {
@@ -264,8 +433,8 @@
     );
   }
 
-  function onconnect(conn: Connection) {
-    dirty = true;
+  function onconnect(_conn: Connection) {
+    touch();
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -309,10 +478,31 @@
       }),
     ];
 
+    const inTextField = (t: EventTarget | null) =>
+      t instanceof HTMLElement &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+
     const keydown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === "s") {
         e.preventDefault();
         save();
+        return;
+      }
+      // Inside a field, leave copy/paste/undo to the browser's native handling.
+      if (inTextField(e.target)) return;
+      if (k === "c") {
+        if (copySelection()) e.preventDefault();
+      } else if (k === "v") {
+        e.preventDefault();
+        pasteClipboard();
+      } else if (k === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if (k === "y" || (k === "z" && e.shiftKey)) {
+        e.preventDefault();
+        redo();
       }
     };
     window.addEventListener("keydown", keydown);
@@ -358,14 +548,21 @@
 {:else if doc}
   <div class="editor">
     <header class="topbar">
-      <button class="btn btn-ghost btn-icon" title="Back to workflows" onclick={() => goto("/workflows")}>
+      <button class="btn btn-ghost btn-icon back-btn" title="Back to workflows" onclick={() => goto("/workflows")}>
         <Icon name="chevron-right" size={14} />
       </button>
-      <input class="wf-title" bind:value={doc.name} oninput={() => (dirty = true)} spellcheck="false" />
+      <input class="wf-title" bind:value={doc.name} oninput={() => touch(true)} spellcheck="false" />
       <label class="enabled-toggle" title="Scheduled triggers only fire while enabled">
-        <input type="checkbox" bind:checked={doc.enabled} onchange={() => (dirty = true)} />
+        <input type="checkbox" bind:checked={doc.enabled} onchange={() => touch()} />
         <span>{doc.enabled ? "Enabled" : "Disabled"}</span>
       </label>
+
+      <button class="btn btn-ghost btn-icon" title="Undo (Ctrl+Z)" disabled={!canUndo} onclick={undo}>
+        <Icon name="undo" size={14} />
+      </button>
+      <button class="btn btn-ghost btn-icon" title="Redo (Ctrl+Y)" disabled={!canRedo} onclick={redo}>
+        <Icon name="redo" size={14} />
+      </button>
 
       <div class="topbar-spacer"></div>
 
@@ -396,10 +593,11 @@
     <div class="body">
       <NodePalette {catalog} onadd={addNode} />
 
-      <div class="canvas">
+      <div class="canvas" bind:this={canvasEl} ondragover={onCanvasDragover} ondrop={onCanvasDrop} role="application">
         <SvelteFlow
           bind:nodes
           bind:edges
+          bind:viewport
           {nodeTypes}
           {colorMode}
           {isValidConnection}
@@ -415,10 +613,10 @@
             rightTab = "inspect";
           }}
           onpaneclick={() => (selectedId = null)}
-          onnodedragstop={() => (dirty = true)}
+          onnodedragstop={() => touch()}
           ondelete={() => {
             selectedId = null;
-            dirty = true;
+            touch();
           }}
         >
           <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
@@ -467,7 +665,7 @@
             <Inspector
               node={selectedNode.def}
               spec={selectedNode.spec}
-              onchange={() => (dirty = true)}
+              onchange={() => touch(true)}
               ondelete={deleteSelected}
             />
           {:else}
@@ -475,24 +673,27 @@
               <div class="mono-label">Workflow settings</div>
               <label class="setting">
                 <span>Run time limit (seconds)</span>
-                <input type="number" bind:value={doc.settings.timeout_secs} oninput={() => (dirty = true)} />
+                <input type="number" bind:value={doc.settings.timeout_secs} oninput={() => touch(true)} />
               </label>
               <label class="setting">
                 <span>If a run is already going</span>
-                <select bind:value={doc.settings.overlap} onchange={() => (dirty = true)}>
+                <select bind:value={doc.settings.overlap} onchange={() => touch()}>
                   <option value="skip">Skip the new one</option>
                   <option value="replace">Stop it and start fresh</option>
                 </select>
               </label>
               <label class="setting">
                 <span>Keep run data</span>
-                <select bind:value={doc.settings.capture} onchange={() => (dirty = true)}>
+                <select bind:value={doc.settings.capture} onchange={() => touch()}>
                   <option value="sample">Sample (first 20 items)</option>
                   <option value="full">Everything</option>
                   <option value="none">Nothing</option>
                 </select>
               </label>
-              <p class="hint">Click a node to edit it. Drag between the port dots to connect nodes.</p>
+              <p class="hint">
+                Click a node to edit it, or drag one in from the palette. Drag between the port dots to connect
+                nodes. Ctrl+C / Ctrl+V duplicates the selected nodes; Ctrl+Z undoes.
+              </p>
             </div>
           {/if}
         {:else}
@@ -513,7 +714,7 @@
       permissions={doc.permissions}
       nodes={nodes.map((n) => (n.data as { def: WfNode }).def)}
       {catalog}
-      onchange={() => (dirty = true)}
+      onchange={() => touch(true)}
       onclose={() => (permissionsOpen = false)}
     />
   {/if}
@@ -543,7 +744,7 @@
     background: var(--bg-sidebar);
   }
 
-  .topbar :global(.btn-icon svg) {
+  .topbar .back-btn :global(svg) {
     transform: rotate(180deg);
   }
 

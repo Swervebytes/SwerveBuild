@@ -28,10 +28,17 @@
       entries: catalog.filter((e) => e.category === cat),
     })).filter((g) => g.entries.length > 0),
   );
+
+  /** Payload type matched by the canvas drop handler in the editor page. */
+  function dragstart(e: DragEvent, entry: CatalogEntry) {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.setData("application/x-swervebuild-node", entry.type);
+    e.dataTransfer.effectAllowed = "copy";
+  }
 </script>
 
 <aside class="palette">
-  <div class="palette-head mono-label">Add nodes</div>
+  <div class="palette-head mono-label">Add nodes — click or drag</div>
   <div class="groups">
     {#each groups as group (group.cat)}
       <div class="group">
@@ -40,7 +47,13 @@
           {group.label}
         </div>
         {#each group.entries as entry (entry.type)}
-          <button class="entry" title={entry.description} onclick={() => onadd(entry)}>
+          <button
+            class="entry"
+            title={entry.description}
+            draggable="true"
+            ondragstart={(e) => dragstart(e, entry)}
+            onclick={() => onadd(entry)}
+          >
             <span class="entry-icon" style="--cat-color: {categoryColor(entry.category)}">
               <Icon name={nodeIcon(entry.type)} size={14} />
             </span>

@@ -194,7 +194,48 @@ impl RunEvents for TauriRunEvents {
 /// The workflow Agent node's runner: the same headless grok invocation
 /// discipline as Automations (shadow-enforced args, hidden window, stdin null,
 /// tree-kill), run synchronously with cancel polling.
-pub struct GrokAgentRunner;
+///
+/// Holds an `AppHandle` when constructed in-app so `local:` models can lease
+/// the managed llama-server; the headless CLI constructs it without one, and
+/// local models stay unsupported there.
+pub struct GrokAgentRunner {
+    app: Option<AppHandle>,
+}
+
+impl GrokAgentRunner {
+    pub fn in_app(app: AppHandle) -> Self {
+        GrokAgentRunner { app: Some(app) }
+    }
+
+    pub fn headless() -> Self {
+        GrokAgentRunner { app: None }
+    }
+}
+
+/// Releases a llama-server lease on every runner return path via RAII.
+struct LeaseGuard(String);
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        crate::local_llm::manager().release(&self.0);
+    }
+}
+
+/// Pure decision for the local-model gate: `Ok(None)` = not a local model,
+/// `Ok(Some(id))` = lease this model, `Err` = headless context, refuse.
+/// Split out `decide_ensure`-style so the unit test doesn't reference `run()`
+/// — linking the full runner into the test binary drags in Tauri GUI objects
+/// whose comctl32-v6 imports (TaskDialogIndirect) need the app manifest that
+/// test executables don't get, and the binary then fails to load.
+fn local_model_gate(has_app: bool, model: Option<&str>) -> Result<Option<String>, String> {
+    match model.filter(|m| m.starts_with(crate::grok_config::LOCAL_PREFIX)) {
+        None => Ok(None),
+        Some(m) if has_app => Ok(Some(m.to_string())),
+        Some(_) => {
+            Err("local models need the app's llama-server; run this workflow inside SwerveBuild".into())
+        }
+    }
+}
 
 impl AgentRunner for GrokAgentRunner {
     fn run(&self, req: AgentRequest, cancel: &CancelFlag) -> Result<AgentResult, String> {
@@ -202,11 +243,20 @@ impl AgentRunner for GrokAgentRunner {
         if cwd.is_empty() || !std::path::Path::new(&cwd).is_dir() {
             return Err(format!("project folder not found: {cwd}"));
         }
-        if let Some(model) = req.model.as_deref() {
-            if model.starts_with(crate::grok_config::LOCAL_PREFIX) {
-                return Err("local models are not supported in workflow agent nodes yet".into());
+        // Local model? Lease the app's llama-server (same discipline as jobs.rs)
+        // so a chat or another run can't swap the GGUF out from under us mid-run.
+        // Leased before spawn so model load time doesn't eat the agent timeout.
+        let _lease: Option<LeaseGuard> = match local_model_gate(self.app.is_some(), req.model.as_deref())? {
+            None => None,
+            Some(model) => {
+                let app = self.app.as_ref().expect("gate returned Some only with an app");
+                let holder = format!("workflow:{}", crate::store::Store::new_id());
+                crate::local_llm::manager()
+                    .acquire(app, &holder, &model)
+                    .map_err(|e| format!("local model unavailable: {e}"))?;
+                Some(LeaseGuard(holder))
             }
-        }
+        };
         let grok = crate::resolve_grok_executable().ok_or("Grok Build is not installed.")?;
 
         // Env context pack (Step 5) into headless `--rules`, same as automations.
@@ -386,7 +436,7 @@ impl WorkflowManager {
 
     fn services(app: &AppHandle) -> EngineServices {
         EngineServices {
-            agent: Some(Arc::new(GrokAgentRunner)),
+            agent: Some(Arc::new(GrokAgentRunner::in_app(app.clone()))),
             secrets: Arc::new(FileSecrets),
             events: Arc::new(TauriRunEvents { app: app.clone() }),
         }
@@ -936,4 +986,35 @@ pub fn workflow_secret_delete(name: String) -> Result<(), String> {
     let mut map = FileSecrets::load();
     map.remove(&name);
     FileSecrets::store(&map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_gate_passes_non_local_models_through() {
+        assert_eq!(local_model_gate(false, None), Ok(None));
+        assert_eq!(local_model_gate(false, Some("grok-4")), Ok(None));
+        assert_eq!(local_model_gate(true, Some("grok-4")), Ok(None));
+    }
+
+    #[test]
+    fn local_gate_leases_in_app_and_rejects_headless() {
+        let local = format!("{}qwen", crate::grok_config::LOCAL_PREFIX);
+        assert_eq!(local_model_gate(true, Some(&local)), Ok(Some(local.clone())));
+        let err = local_model_gate(false, Some(&local)).unwrap_err();
+        assert!(err.contains("inside SwerveBuild"), "got: {err}");
+    }
+
+    #[test]
+    fn lease_guard_releases_on_drop() {
+        // A leaked lease would wedge "stop server" (stop_if_idle refuses while
+        // leases are held), so the RAII release is load-bearing.
+        let manager = crate::local_llm::manager();
+        manager.test_insert_lease("workflow:test-guard");
+        assert!(manager.test_lease_held("workflow:test-guard"));
+        drop(LeaseGuard("workflow:test-guard".to_string()));
+        assert!(!manager.test_lease_held("workflow:test-guard"));
+    }
 }
