@@ -18,6 +18,7 @@ def call_tool(name, arguments=None, timeout=20):
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        encoding="utf-8",
         bufsize=1,
     )
     result = {"error": "timeout"}
@@ -75,11 +76,25 @@ def call_tool(name, arguments=None, timeout=20):
 
 for tool, args, timeout in [
     ("get_app_status", {}, 10),
-    ("list_projects", {}, 10),
     ("app_ui_state", {}, 15),
-    ("app_ui_snapshot", {}, 15),
     ("app_ui_screenshot", {}, 25),
+    # Navigate: home → settings, then prove the route landed.
     ("app_ui_click", {"selector": "a[href='/settings']"}, 25),
+    ("app_ui_wait", {"condition": "route:/settings", "timeout_ms": 5000}, 20),
+    ("app_ui_wait", {"condition": ".ids-row input", "timeout_ms": 5000}, 20),
+    ("app_ui_snapshot", {}, 15),
+    # Type into the Extra model IDs field (unsaved without the Save click).
+    ("app_ui_type", {"selector": ".ids-row input", "text": "smoke-mcp-typed"}, 25),
+    ("app_ui_press", {"key": "End"}, 25),
+    ("app_ui_press", {"key": "9"}, 25),
+    ("app_ui_wait", {"condition": "text:Custom endpoint", "timeout_ms": 3000}, 20),
+    # Negative wait: must return matched:false (not an error).
+    ("app_ui_wait", {"condition": "no-such-testid-xyz", "timeout_ms": 1500}, 20),
+    ("app_ui_screenshot", {}, 25),
+    # Clean the field, go home, prove settings-only element is gone.
+    ("app_ui_type", {"selector": ".ids-row input", "text": ""}, 25),
+    ("app_ui_click", {"selector": "a[href='/']"}, 25),
+    ("app_ui_wait", {"condition": "!.ids-row input", "timeout_ms": 5000}, 20),
     ("app_ui_state", {}, 15),
 ]:
     print(f"\n=== {tool} {args} ===")
