@@ -6,15 +6,25 @@
     role,
     content,
     images = [],
+    videos = [],
     imageSrc,
     live = false,
   }: {
     role: "user" | "assistant";
     content: string;
     images?: string[];
+    /** Video attachments — same asset-protocol path as images. */
+    videos?: string[];
     imageSrc?: (path: string) => string;
     live?: boolean;
   } = $props();
+
+  /** Lightbox: the image path currently shown full-size, or null. */
+  let lightbox = $state<string | null>(null);
+
+  function onLightboxKey(e: KeyboardEvent) {
+    if (e.key === "Escape") lightbox = null;
+  }
 
   type Segment = { type: "text" | "code"; content: string; lang?: string };
 
@@ -114,12 +124,40 @@
     {#if images.length > 0 && imageSrc}
       <div class="images">
         {#each images as image}
-          <img src={imageSrc(image)} alt="Attached" />
+          <button class="thumb" type="button" title="Open full size" onclick={() => (lightbox = image)}>
+            <img src={imageSrc(image)} alt="Attached" />
+          </button>
+        {/each}
+      </div>
+    {/if}
+
+    {#if videos.length > 0 && imageSrc}
+      <div class="videos">
+        {#each videos as video}
+          <!-- svelte-ignore a11y_media_has_caption — agent-produced artifacts have no caption track -->
+          <video controls preload="metadata" src={imageSrc(video)}></video>
         {/each}
       </div>
     {/if}
   </div>
 </article>
+
+<!-- Escape must work wherever focus sits (the click leaves focus on the
+     thumbnail), so listen at the window while the lightbox is open. -->
+<svelte:window onkeydown={(e) => lightbox && onLightboxKey(e)} />
+
+{#if lightbox && imageSrc}
+  <div
+    class="lightbox"
+    role="button"
+    tabindex="0"
+    aria-label="Close full-size image"
+    onclick={() => (lightbox = null)}
+    onkeydown={onLightboxKey}
+  >
+    <img src={imageSrc(lightbox)} alt="Full size" />
+  </div>
+{/if}
 
 <style>
   .msg {
@@ -236,11 +274,50 @@
     margin-top: 0.6rem;
     flex-wrap: wrap;
   }
+  .thumb {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: zoom-in;
+    line-height: 0;
+  }
   .images img {
     max-width: 180px;
     max-height: 120px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
+  }
+  .videos {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+  }
+  .videos video {
+    max-width: min(480px, 100%);
+    max-height: 300px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg-muted);
+  }
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--bg-app) 78%, transparent);
+    backdrop-filter: blur(3px);
+    cursor: zoom-out;
+    border: 0;
+    padding: 2rem;
+  }
+  .lightbox img {
+    max-width: 92vw;
+    max-height: 88vh;
+    border-radius: var(--radius);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-md);
   }
 
   /* Rendered markdown (finalized assistant/user messages) */

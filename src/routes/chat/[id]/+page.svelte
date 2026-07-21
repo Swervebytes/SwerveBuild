@@ -164,11 +164,26 @@
         text: item.content,
       }));
 
+    // Media the turn produced (Imagine renders, tool artifacts …): the backend
+    // scans the WHOLE turn — prose + tool chips — for real on-disk image/video
+    // paths and copies them into the attachments store. Never fatal.
+    let media: { images: string[]; videos: string[] } = { images: [], videos: [] };
+    const turnText = streaming.map((item) => item.content).join("\n");
+    try {
+      media = await invoke<{ images: string[]; videos: string[] }>("detect_chat_media", {
+        chatId: chat.id,
+        text: turnText,
+      });
+    } catch {
+      /* detection is best-effort */
+    }
+
     const saved = await invoke<ChatMessage>("append_chat_message", {
       chatId: chat.id,
       role: "assistant",
       content: text,
-      images: [],
+      images: media.images,
+      videos: media.videos,
       parts,
     });
 

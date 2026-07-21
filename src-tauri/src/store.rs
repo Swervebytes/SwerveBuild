@@ -29,6 +29,9 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub images: Vec<String>,
+    /// Video attachments (agent-produced artifacts, S13). Absent in older data.
+    #[serde(default)]
+    pub videos: Vec<String>,
     /// Reasoning/tool trail captured during streaming. Absent in older data.
     #[serde(default)]
     pub parts: Vec<MessagePart>,
@@ -192,6 +195,7 @@ mod tests {
             role: "assistant".into(),
             content: "done".into(),
             images: vec![],
+            videos: vec!["E:/att/clip.mp4".into()],
             parts: vec![
                 MessagePart { kind: "thought".into(), text: "weighing options".into() },
                 MessagePart { kind: "tool".into(), text: "read_file src/main.rs".into() },
@@ -200,6 +204,13 @@ mod tests {
         };
         let back: ChatMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(back.parts.len(), 2);
+        assert_eq!(back.videos, vec!["E:/att/clip.mp4".to_string()]);
+        // Older data without a videos field must still deserialize (default []).
+        let legacy: ChatMessage = serde_json::from_str(
+            r#"{"id":"m0","role":"user","content":"hi","images":[],"created_at":"1"}"#,
+        )
+        .unwrap();
+        assert!(legacy.videos.is_empty());
         assert_eq!(back.parts[0].kind, "thought");
         assert_eq!(back.parts[0].text, "weighing options");
         assert_eq!(back.parts[1].kind, "tool");

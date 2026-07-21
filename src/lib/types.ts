@@ -18,6 +18,8 @@ export type ChatMessage = {
   role: string;
   content: string;
   images: string[];
+  /// Video attachments (agent-produced artifacts). Absent in older data.
+  videos?: string[];
   parts?: MessagePart[];
   created_at: string;
 };
