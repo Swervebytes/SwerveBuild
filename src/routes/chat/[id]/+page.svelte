@@ -38,8 +38,11 @@
   let activeSessionCount = $state(0);
   /** ACP-reported context window; stays empty until agent sends used+size. */
   let usage = $state<ChatUsage>(emptyUsage());
-  /** Image paths from ACP image content blocks this turn (prefer over path-scan). */
+  /** Agent images this turn (ACP blocks + live path-scan). Shown as thumbs while streaming. */
   let streamImages = $state<string[]>([]);
+  let streamVideos = $state<string[]>([]);
+  let pathDetectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pathDetectGen = 0;
 
   // `-m` is a grok flag; hide the model picker when another agent backs this chat.
   const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
@@ -49,11 +52,39 @@
   function resetStream() {
     streaming = [];
     streamImages = [];
+    streamVideos = [];
+    pathDetectGen += 1;
+    if (pathDetectTimer) {
+      clearTimeout(pathDetectTimer);
+      pathDetectTimer = null;
+    }
   }
 
   function applyUsage(next: ChatUsage | null) {
     if (!next) return;
     usage = next;
+  }
+
+  function mergeStreamMedia(images: string[], videos: string[] = []) {
+    let changed = false;
+    const nextImg = [...streamImages];
+    const nextVid = [...streamVideos];
+    for (const img of images) {
+      if (img && !nextImg.includes(img)) {
+        nextImg.push(img);
+        changed = true;
+      }
+    }
+    for (const vid of videos) {
+      if (vid && !nextVid.includes(vid)) {
+        nextVid.push(vid);
+        changed = true;
+      }
+    }
+    if (changed) {
+      streamImages = nextImg;
+      streamVideos = nextVid;
+    }
   }
 
   /** Prefer real ACP image content blocks; path-scan remains a finalize fallback. */
@@ -67,14 +98,80 @@
     const obj = node as Record<string, unknown>;
     if (obj.type === "image" && typeof obj.data === "string") {
       void saveAcpImageBlock(obj).then((path) => {
-        if (path && !streamImages.includes(path)) {
-          streamImages = [...streamImages, path];
-        }
+        if (path) mergeStreamMedia([path]);
       });
       return;
     }
     // Nested content blocks on tool / message updates.
     if (obj.content != null) harvestAcpImages(obj.content);
+  }
+
+  /** Flatten tool/update payloads so path-scan sees rawOutput, paths, etc. */
+  function flattenForPathScan(node: unknown, depth = 0): string {
+    if (depth > 6 || node == null) return "";
+    if (typeof node === "string") return node;
+    if (typeof node === "number" || typeof node === "boolean") return String(node);
+    if (Array.isArray(node)) {
+      return node.map((n) => flattenForPathScan(n, depth + 1)).filter(Boolean).join("\n");
+    }
+    if (typeof node === "object") {
+      const obj = node as Record<string, unknown>;
+      const prefer = [
+        "text",
+        "title",
+        "path",
+        "filePath",
+        "file_path",
+        "uri",
+        "url",
+        "rawOutput",
+        "rawInput",
+        "output",
+        "content",
+        "locations",
+      ];
+      const chunks: string[] = [];
+      for (const key of prefer) {
+        if (key in obj) chunks.push(flattenForPathScan(obj[key], depth + 1));
+      }
+      // Also walk remaining string fields lightly.
+      for (const [k, v] of Object.entries(obj)) {
+        if (prefer.includes(k)) continue;
+        if (typeof v === "string" && v.length < 4000) chunks.push(v);
+      }
+      return chunks.filter(Boolean).join("\n");
+    }
+    return "";
+  }
+
+  /** Debounced path-scan while the agent streams so thumbs appear before finalize. */
+  function schedulePathDetect(extraText = "") {
+    if (!chat) return;
+    const chatId = chat.id;
+    if (pathDetectTimer) clearTimeout(pathDetectTimer);
+    const gen = pathDetectGen;
+    pathDetectTimer = setTimeout(() => {
+      void (async () => {
+        if (gen !== pathDetectGen || !chat || chat.id !== chatId) return;
+        const turnText = [
+          extraText,
+          ...streaming.map((item) => item.content),
+        ]
+          .filter(Boolean)
+          .join("\n");
+        if (!turnText.trim()) return;
+        try {
+          const scanned = await invoke<{ images: string[]; videos: string[] }>(
+            "detect_chat_media",
+            { chatId, text: turnText },
+          );
+          if (gen !== pathDetectGen) return;
+          mergeStreamMedia(scanned.images ?? [], scanned.videos ?? []);
+        } catch {
+          /* best-effort */
+        }
+      })();
+    }, 280);
   }
 
   function appendStream(update: Record<string, unknown>) {
@@ -96,7 +193,7 @@
       return;
     }
 
-    // Image content blocks on agent/tool streams (S15) — save even without text.
+    // Image content blocks + path-bearing tool payloads (S15b).
     if (
       sessionUpdate === "agent_message_chunk" ||
       sessionUpdate === "tool_call" ||
@@ -104,6 +201,8 @@
     ) {
       harvestAcpImages(content);
       harvestAcpImages(inner);
+      const flat = flattenForPathScan(inner);
+      if (flat) schedulePathDetect(flat);
     }
 
     if (!text && sessionUpdate !== "tool_call" && sessionUpdate !== "tool_call_update") return;
@@ -118,6 +217,9 @@
           ...streaming,
           { id: crypto.randomUUID(), role: "assistant", content: text, kind: "message" },
         ];
+      }
+      if (/\.(png|jpe?g|gif|webp|bmp|svg|mp4|webm|mov)\b/i.test(text)) {
+        schedulePathDetect(text);
       }
       return;
     }
@@ -143,7 +245,13 @@
           "string" &&
           String((inner.toolCall as Record<string, unknown>).toolCallId)) ||
         undefined;
-      const label = text || (typeof inner.title === "string" ? inner.title : "") || sessionUpdate;
+      // Prefer a rich label for chips; still path-scan the full flattened payload.
+      const flat = flattenForPathScan(inner);
+      const label =
+        text ||
+        (typeof inner.title === "string" ? inner.title : "") ||
+        flat.slice(0, 200) ||
+        sessionUpdate;
 
       if (toolCallId) {
         const idx = streaming.findIndex(
@@ -151,9 +259,12 @@
         );
         if (idx >= 0) {
           const prev = streaming[idx];
+          // Keep the longer of label vs prior so rawOutput paths are retained.
+          const nextContent =
+            flat.length > (prev.content?.length ?? 0) ? flat : label || prev.content;
           streaming[idx] = {
             ...prev,
-            content: label || prev.content,
+            content: nextContent || prev.content,
             kind: sessionUpdate,
           };
           streaming = [...streaming];
@@ -165,7 +276,7 @@
             id: toolCallId,
             toolCallId,
             role: "tool",
-            content: label,
+            content: flat || label,
             kind: sessionUpdate,
           },
         ];
@@ -177,7 +288,7 @@
         {
           id: crypto.randomUUID(),
           role: "tool",
-          content: label,
+          content: flat || label,
           kind: sessionUpdate,
         },
       ];
@@ -200,18 +311,13 @@
   }
 
   async function doFinalize(note?: string) {
+    if (!chat) return false;
+
     let text = streaming
       .filter((item) => item.role === "assistant" && item.kind === "message")
       .map((item) => item.content)
       .join("")
       .trim();
-
-    if (!text) return false;
-    if (!chat) return false;
-
-    if (note) {
-      text = `${text}\n\n_${note}_`;
-    }
 
     // Persist the reasoning/tool trail with the reply. It used to be dropped on
     // save, so reloading a chat lost everything except the final prose.
@@ -222,11 +328,11 @@
         text: item.content,
       }));
 
-    // Media: prefer ACP image content blocks captured during the stream (S15);
-    // fall back to path-scan of prose/tool text for agents that only write paths.
+    // Media: stream harvest first, then final path-scan over prose + tool text
+    // (S15b — agent-generated images often only appear in tool payloads).
     let media: { images: string[]; videos: string[] } = {
       images: [...streamImages],
-      videos: [],
+      videos: [...streamVideos],
     };
     const turnText = streaming.map((item) => item.content).join("\n");
     try {
@@ -237,9 +343,22 @@
       for (const img of scanned.images ?? []) {
         if (!media.images.includes(img)) media.images.push(img);
       }
-      media.videos = scanned.videos ?? [];
+      for (const vid of scanned.videos ?? []) {
+        if (!media.videos.includes(vid)) media.videos.push(vid);
+      }
     } catch {
       /* path-scan is best-effort */
+    }
+
+    // Allow media-only turns (no prose) so generated images still save + preview.
+    if (!text && media.images.length === 0 && media.videos.length === 0 && parts.length === 0) {
+      return false;
+    }
+    if (!text && (media.images.length > 0 || media.videos.length > 0)) {
+      text = ""; // bubble shows thumbs/videos even with empty prose
+    }
+    if (note) {
+      text = text ? `${text}\n\n_${note}_` : `_${note}_`;
     }
 
     const saved = await invoke<ChatMessage>("append_chat_message", {
@@ -463,7 +582,13 @@
   </div>
 
   {#if chat}
-    <MessageList messages={chat.messages} {streaming} {imageSrc} />
+    <MessageList
+      messages={chat.messages}
+      {streaming}
+      streamImages={streamImages}
+      streamVideos={streamVideos}
+      {imageSrc}
+    />
   {:else}
     <div class="loading reading-col">Loading…</div>
   {/if}
