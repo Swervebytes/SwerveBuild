@@ -73,10 +73,10 @@
     aria-haspopup="menu"
     aria-expanded={open}
     disabled={disabled}
-    title="Switch model"
+    title="Agent (chat) model — text + tool decisions, not image pixels"
   >
     <Icon name="settings" size={12} />
-    <span class="label mono">{disabled ? "switching…" : triggerLabel}</span>
+    <span class="label mono">{disabled ? "switching…" : `agent · ${triggerLabel}`}</span>
     <span class="chev" class:open><Icon name="chevron-down" size={13} /></span>
   </button>
 
@@ -86,7 +86,10 @@
       role="menu"
       transition:scale={{ duration: 140, start: 0.97, opacity: 0, easing: cubicOut }}
     >
-      <div class="menu-head mono-label">Model</div>
+      <div class="menu-head mono-label">Agent model</div>
+      <p class="honesty">
+        Runs chat and decides tools. Does not render images — use the image picker for that.
+      </p>
       <button class="row" class:current={value === null} type="button" role="menuitem" onclick={() => choose(null)}>
         <span class="row-label">Default</span>
         <span class="row-note">agent's own model</span>
@@ -165,6 +168,12 @@
     transform: rotate(180deg);
   }
 
+  .honesty {
+    margin: 0 0.45rem 0.35rem;
+    font-size: 0.6875rem;
+    line-height: 1.4;
+    color: var(--text-muted);
+  }
   .menu {
     position: absolute;
     top: calc(100% + 8px);

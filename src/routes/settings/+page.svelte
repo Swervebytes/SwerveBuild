@@ -8,6 +8,7 @@
   import ProviderList from "$lib/components/providers/ProviderList.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import LocalModelsCard from "$lib/components/models/LocalModelsCard.svelte";
+  import MediaPicker from "$lib/components/models/MediaPicker.svelte";
   import { APP_VERSION } from "$lib/version";
 
   type GrokStatus = {
@@ -313,13 +314,31 @@
 
   <section class="card">
     <div class="group-head">
+      <h2 class="group-title">Image &amp; video generation</h2>
+      <span class="mono-label">separate from chat model</span>
+    </div>
+    <p class="group-note">
+      The chat/agent model (including local Qwen) only writes text and decides to call tools. Image
+      and video tools use a <strong>media provider</strong> — today that is <strong>xAI Imagine</strong>
+      (remote API, needs network). Local offline generation is planned after the VRAM UI; it will
+      appear here when available. Open the picker for the full list.
+    </p>
+    <div class="media-row">
+      <MediaPicker />
+      <span class="media-hint mono-label">Also in the chat header next to agent model</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="group-head">
       <h2 class="group-title">Local models</h2>
-      <span class="mono-label">llama.cpp · runs on this machine</span>
+      <span class="mono-label">llama.cpp · runs on this machine · chat only</span>
     </div>
     <p class="group-note">
       Run models entirely on this PC — no Ollama, no cloud, no sign-in. Swerve downloads its own
       inference engine once, then any <code>.gguf</code> you add becomes a model selectable in chats
       and automations. One local model is loaded at a time; the server listens on localhost only.
+      Local models do <strong>not</strong> render Imagine images offline.
     </p>
     <LocalModelsCard />
   </section>
@@ -769,6 +788,15 @@
     display: flex;
     gap: 0.5rem;
     margin-top: 1rem;
+  }
+  .media-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .media-hint {
+    color: var(--text-faint);
   }
   .ids-block {
     margin-top: 1rem;
