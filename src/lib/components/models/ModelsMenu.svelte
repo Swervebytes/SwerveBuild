@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import Icon from "$lib/components/ui/Icon.svelte";
   import ProviderPicker from "$lib/components/providers/ProviderPicker.svelte";
@@ -8,8 +9,8 @@
   import type { MediaProvidersView } from "$lib/types";
 
   /**
-   * S19 — one chat-header control for provider + agent model + image slot.
-   * Perf: prefs-only summary on mount (no Comfy probe); live probe when sheet opens.
+   * One chat-header control for provider + agent model + image slot.
+   * Summary = prefs only (no Comfy / no grok). Live data loads after open.
    */
 
   let {
@@ -27,6 +28,7 @@
   let open = $state(false);
   let root: HTMLDivElement | undefined = $state();
   let mediaView = $state<MediaProvidersView | null>(null);
+  /** Defer mounting heavy pickers until after the sheet paints. */
   let sheetReady = $state(false);
 
   const providerLabel = $derived(providerStore.active.label);
@@ -39,7 +41,6 @@
     if (id === "imagine") return "Imagine";
     if (id === "local") {
       const p = mediaView?.imageProviders.find((x) => x.id === "local");
-      // prefs-only marks local available; live view may show off
       if (p && p.available === false) return "Local off";
       return "Local";
     }
@@ -52,7 +53,6 @@
       .join(" · "),
   );
 
-  /** Header label only — never blocks chat paint on Comfy. */
   async function loadPrefsSummary() {
     try {
       mediaView = await invoke<MediaProvidersView>("list_media_providers", {
@@ -66,22 +66,24 @@
 
   function toggle(e: MouseEvent) {
     e.stopPropagation();
-    open = !open;
     if (open) {
-      // Mount heavy panel content on next frame so the button state flips first.
-      requestAnimationFrame(() => {
-        sheetReady = true;
-      });
-    } else {
-      sheetReady = false;
+      close();
+      return;
     }
+    open = true;
+    // Paint empty sheet first; mount pickers next frame (non-blocking async loads).
+    sheetReady = false;
+    requestAnimationFrame(() => {
+      if (open) sheetReady = true;
+    });
   }
+
   function close() {
     open = false;
     sheetReady = false;
   }
 
-  $effect(() => {
+  onMount(() => {
     void loadPrefsSummary();
   });
 
@@ -93,10 +95,11 @@
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
-    document.addEventListener("click", onDoc);
+    // Capture phase so we don't fight child stopPropagation oddly.
+    document.addEventListener("pointerdown", onDoc, true);
     document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("click", onDoc);
+      document.removeEventListener("pointerdown", onDoc, true);
       document.removeEventListener("keydown", onKey);
     };
   });
@@ -148,12 +151,12 @@
           <MediaPicker
             variant="panel"
             onchange={(v) => {
-              mediaView = v;
+              if (v) mediaView = v;
             }}
           />
         </section>
       {:else}
-        <p class="sheet-loading mono-label">Loading…</p>
+        <p class="sheet-loading mono-label">Opening…</p>
       {/if}
     </div>
   {/if}
@@ -177,9 +180,6 @@
     background: var(--bg-surface);
     color: var(--text-primary);
     cursor: pointer;
-    transition:
-      border-color var(--dur-fast) var(--ease),
-      background var(--dur-fast) var(--ease);
   }
   .trigger:hover {
     border-color: var(--sc-accent);

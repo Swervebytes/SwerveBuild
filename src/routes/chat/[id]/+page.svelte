@@ -437,12 +437,15 @@
     }
   }
 
+  // Only re-bootstrap when the chat id changes — not on every $page store tick.
+  let lastBootstrappedId = $state<string | null>(null);
   $effect(() => {
     const id = $page.params.id;
-    if (!id) return;
+    if (!id || id === lastBootstrappedId) return;
+    lastBootstrappedId = id;
     bootstrapGen += 1;
     const gen = bootstrapGen;
-    bootstrap(id, gen);
+    void bootstrap(id, gen);
   });
 
   /// Mid-chat model switch: persist the choice, respawn the agent with the new

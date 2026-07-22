@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { scale } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
   import { invoke } from "@tauri-apps/api/core";
   import type { ModelInfo } from "$lib/types";
   import Icon from "$lib/components/ui/Icon.svelte";
@@ -64,10 +62,10 @@
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
-    document.addEventListener("click", onDoc);
+    document.addEventListener("pointerdown", onDoc, true);
     document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("click", onDoc);
+      document.removeEventListener("pointerdown", onDoc, true);
       document.removeEventListener("keydown", onKey);
     };
   });
@@ -95,7 +93,6 @@
       class="menu"
       class:menu-panel={isPanel}
       role={isPanel ? "group" : "menu"}
-      transition:scale={{ duration: isPanel ? 0 : 140, start: 0.97, opacity: 0, easing: cubicOut }}
     >
       <div class="menu-head mono-label">Agent model</div>
       <p class="honesty">

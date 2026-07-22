@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { scale } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
   import { providerStore } from "$lib/stores/providers.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
 
@@ -76,7 +74,6 @@
       class="menu"
       class:menu-panel={isPanel}
       role={isPanel ? "group" : "menu"}
-      transition:scale={{ duration: isPanel ? 0 : 140, start: 0.97, opacity: 0, easing: cubicOut }}
     >
       <div class="menu-head mono-label">Provider</div>
       {#each providers as p (p.id)}

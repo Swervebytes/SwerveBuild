@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { scale } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
   import { invoke } from "@tauri-apps/api/core";
   import type { MediaProviderInfo, MediaProvidersView } from "$lib/types";
   import Icon from "$lib/components/ui/Icon.svelte";
@@ -131,9 +129,12 @@
     }
   }
 
-  // Panel: load once when mounted (sheet open). Standalone: only when menu opens.
+  // One-shot load for panel (sheet open). Never re-fire on parent re-renders.
+  let panelLoaded = false;
   $effect(() => {
-    if (isPanel) void load();
+    if (!isPanel || panelLoaded) return;
+    panelLoaded = true;
+    void load();
   });
 
   $effect(() => {
@@ -144,10 +145,10 @@
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
-    document.addEventListener("click", onDoc);
+    document.addEventListener("pointerdown", onDoc, true);
     document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("click", onDoc);
+      document.removeEventListener("pointerdown", onDoc, true);
       document.removeEventListener("keydown", onKey);
     };
   });
@@ -177,7 +178,6 @@
       class="menu"
       class:menu-panel={isPanel}
       role={isPanel ? "group" : "menu"}
-      transition:scale={{ duration: isPanel ? 0 : 140, start: 0.97, opacity: 0, easing: cubicOut }}
     >
       <div class="menu-head mono-label">Image generation</div>
       <p class="honesty">

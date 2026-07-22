@@ -692,19 +692,25 @@ fn save_pasted_image(data_url: String) -> Result<String, String> {
 
 /// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
 /// `prefs_only: true` skips network entirely (header summary on chat paint).
+/// Runs on a worker thread so Comfy timeouts never freeze the WebView.
 #[tauri::command]
-fn list_media_providers(
+async fn list_media_providers(
     refresh: Option<bool>,
     prefs_only: Option<bool>,
 ) -> media_providers::MediaProvidersView {
-    if prefs_only.unwrap_or(false) {
-        return media_providers::view_prefs_only();
-    }
-    if refresh.unwrap_or(false) {
-        media_providers::view_refresh()
-    } else {
-        media_providers::view()
-    }
+    let refresh = refresh.unwrap_or(false);
+    let prefs_only = prefs_only.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if prefs_only {
+            media_providers::view_prefs_only()
+        } else if refresh {
+            media_providers::view_refresh()
+        } else {
+            media_providers::view()
+        }
+    })
+    .await
+    .unwrap_or_else(|_| media_providers::view_prefs_only())
 }
 
 #[tauri::command]
@@ -723,8 +729,15 @@ fn set_comfy_base_url(url: String) -> Result<media_providers::MediaProvidersView
 }
 
 #[tauri::command]
-fn probe_local_image() -> local_image::LocalImageStatus {
-    local_image::probe_fresh()
+async fn probe_local_image() -> local_image::LocalImageStatus {
+    tauri::async_runtime::spawn_blocking(local_image::probe_fresh)
+        .await
+        .unwrap_or_else(|_| local_image::LocalImageStatus {
+            reachable: false,
+            base_url: local_image::DEFAULT_COMFY_URL.into(),
+            note: "Probe worker failed".into(),
+            checkpoints: vec![],
+        })
 }
 
 /// Generate via ComfyUI when local provider is selected / available. Returns
@@ -1059,9 +1072,12 @@ fn test_grok_endpoint() -> CommandResult {
 
 // ------------------------------------------------------------ model registry
 
+/// May shell out to `grok models` — never on the UI thread.
 #[tauri::command]
-fn list_models() -> Vec<providers::ModelInfo> {
-    providers::list_models()
+async fn list_models() -> Vec<providers::ModelInfo> {
+    tauri::async_runtime::spawn_blocking(providers::list_models)
+        .await
+        .unwrap_or_default()
 }
 
 /// Pin a chat to a model (None/blank clears back to the agent default). The
