@@ -7,6 +7,16 @@
 
   /** Workspace image-provider slot (S16). Separate from chat/agent model. */
 
+  let {
+    /** standalone = header trigger; panel = section inside Models sheet */
+    variant = "standalone",
+    /** Fired after successful load/set so parent summary can refresh */
+    onchange,
+  }: {
+    variant?: "standalone" | "panel";
+    onchange?: (view: MediaProvidersView | null) => void;
+  } = $props();
+
   let open = $state(false);
   let root: HTMLDivElement | undefined = $state();
   let view = $state<MediaProvidersView | null>(null);
@@ -16,6 +26,7 @@
   let genPrompt = $state("");
   let genBusy = $state(false);
 
+  const isPanel = $derived(variant === "panel");
   const selected = $derived(
     view?.imageProviders.find((p) => p.id === view?.selectedImageProviderId) ?? null,
   );
@@ -25,7 +36,7 @@
 
   function shortLabel(p: MediaProviderInfo): string {
     if (p.id === "imagine") return "Imagine";
-    if (p.id === "local") return selected?.available === false ? "Local (off)" : "Local";
+    if (p.id === "local") return p.available === false ? "Local (off)" : "Local";
     return p.label;
   }
 
@@ -34,9 +45,11 @@
       view = await invoke<MediaProvidersView>("list_media_providers");
       error = null;
       if (view?.localImage?.baseUrl) comfyUrl = view.localImage.baseUrl;
+      onchange?.(view);
     } catch (e) {
       error = String(e);
       view = null;
+      onchange?.(null);
     }
   }
 
@@ -45,6 +58,7 @@
     error = null;
     try {
       view = await invoke<MediaProvidersView>("set_comfy_base_url", { url: comfyUrl });
+      onchange?.(view);
     } catch (e) {
       error = String(e);
     } finally {
@@ -67,7 +81,6 @@
       });
       error = null;
       genPrompt = "";
-      // Surface success in the note area (reuse error slot as message briefly).
       error = `Saved: ${path}`;
       await load();
     } catch (e) {
@@ -89,14 +102,15 @@
   async function choose(p: MediaProviderInfo) {
     if (!p.available) return;
     if (p.id === view?.selectedImageProviderId) {
-      close();
+      if (!isPanel) close();
       return;
     }
     busy = true;
     error = null;
     try {
       view = await invoke<MediaProvidersView>("set_image_provider", { id: p.id });
-      close();
+      onchange?.(view);
+      if (!isPanel) close();
     } catch (e) {
       error = String(e);
     } finally {
@@ -109,7 +123,7 @@
   });
 
   $effect(() => {
-    if (!open) return;
+    if (isPanel || !open) return;
     const onDoc = (e: MouseEvent) => {
       if (root && !root.contains(e.target as Node)) close();
     };
@@ -125,28 +139,31 @@
   });
 </script>
 
-<div class="picker" bind:this={root} data-testid="media-picker">
-  <button
-    class="trigger"
-    type="button"
-    onclick={toggle}
-    aria-haspopup="menu"
-    aria-expanded={open}
-    disabled={busy}
-    title={selected
-      ? `Image gen: ${selected.label} (${selected.locality}) — ${selected.note}`
-      : "Image generation provider"}
-  >
-    <Icon name="image" size={12} />
-    <span class="label mono">{busy ? "…" : triggerLabel}</span>
-    <span class="chev" class:open><Icon name="chevron-down" size={13} /></span>
-  </button>
+<div class="picker" class:panel={isPanel} bind:this={root} data-testid="media-picker">
+  {#if !isPanel}
+    <button
+      class="trigger"
+      type="button"
+      onclick={toggle}
+      aria-haspopup="menu"
+      aria-expanded={open}
+      disabled={busy}
+      title={selected
+        ? `Image gen: ${selected.label} (${selected.locality}) — ${selected.note}`
+        : "Image generation provider"}
+    >
+      <Icon name="image" size={12} />
+      <span class="label mono">{busy ? "…" : triggerLabel}</span>
+      <span class="chev" class:open><Icon name="chevron-down" size={13} /></span>
+    </button>
+  {/if}
 
-  {#if open}
+  {#if isPanel || open}
     <div
       class="menu"
-      role="menu"
-      transition:scale={{ duration: 140, start: 0.97, opacity: 0, easing: cubicOut }}
+      class:menu-panel={isPanel}
+      role={isPanel ? "group" : "menu"}
+      transition:scale={{ duration: isPanel ? 0 : 140, start: 0.97, opacity: 0, easing: cubicOut }}
     >
       <div class="menu-head mono-label">Image generation</div>
       <p class="honesty">
@@ -237,6 +254,11 @@
   .picker {
     position: relative;
   }
+  .picker.panel {
+    display: block;
+    width: 100%;
+    position: static;
+  }
   .trigger {
     display: inline-flex;
     align-items: center;
@@ -264,6 +286,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .mono {
+    font-family: var(--font-mono);
+  }
   .chev {
     display: grid;
     transition: transform 0.15s ease;
@@ -282,6 +307,15 @@
     border-radius: var(--radius, 8px);
     background: var(--bg-surface);
     box-shadow: var(--shadow-md);
+  }
+  .menu.menu-panel {
+    position: static;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
   }
   .menu-head {
     padding: 0.35rem 0.45rem 0.2rem;

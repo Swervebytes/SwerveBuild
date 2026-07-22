@@ -1,8 +1,6 @@
 <script lang="ts">
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
-  import ProviderPicker from "$lib/components/providers/ProviderPicker.svelte";
-  import ModelPicker from "$lib/components/models/ModelPicker.svelte";
-  import MediaPicker from "$lib/components/models/MediaPicker.svelte";
+  import ModelsMenu from "$lib/components/models/ModelsMenu.svelte";
   import { browserPane } from "$lib/stores/browserPane.svelte";
   import {
     type ChatUsage,
@@ -94,12 +92,12 @@
     {#if activeSessionCount > 0}
       <span class="badge badge-muted">{activeSessionCount}/3</span>
     {/if}
-    {#if showModelPicker && onmodelchange}
-      <ModelPicker value={modelId} disabled={modelSwitching} onchange={onmodelchange} />
-    {/if}
-    <!-- S16: image/video gen slot (Imagine remote today; local planned) -->
-    <MediaPicker />
-    <ProviderPicker />
+    <ModelsMenu
+      showModelPicker={showModelPicker}
+      modelId={modelId}
+      modelSwitching={modelSwitching}
+      onmodelchange={onmodelchange}
+    />
     <button
       class="browser-toggle"
       class:active={browserPane.open}
@@ -162,6 +160,8 @@
     align-items: center;
     gap: 0.5rem;
     flex-shrink: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   /* Context / token usage (S14) — honest; "—" when agent has not reported. */
