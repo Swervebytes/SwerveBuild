@@ -43,10 +43,10 @@ const ENGINE_SIZE: u64 = 33_271_430;
 const HEALTH_TIMEOUT_SECS: u64 = 240;
 /// Total context tokens shared across parallel slots.
 /// Grok assembles large agentic prompts — small contexts break tool calling.
-const CTX_TOKENS: u32 = 32768;
+pub const CTX_TOKENS: u32 = 32768;
 /// Concurrent OpenAI-compatible slots so a chat + an automation can share one
 /// loaded model without serializing into a single slot.
-const PARALLEL_SLOTS: u32 = 2;
+pub const PARALLEL_SLOTS: u32 = 2;
 
 /// Lease holder for a chat session (`chat:<chat_id>`).
 pub fn chat_holder(chat_id: &str) -> String {
