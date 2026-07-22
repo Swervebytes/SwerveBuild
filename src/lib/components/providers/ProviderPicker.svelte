@@ -4,11 +4,19 @@
   import { providerStore } from "$lib/stores/providers.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
 
+  let {
+    /** standalone = header trigger; panel = section inside Models sheet */
+    variant = "standalone",
+  }: {
+    variant?: "standalone" | "panel";
+  } = $props();
+
   let open = $state(false);
   let root: HTMLDivElement | undefined = $state();
 
   const providers = $derived(providerStore.all);
   const active = $derived(providerStore.active);
+  const isPanel = $derived(variant === "panel");
 
   function toggle(e: MouseEvent) {
     e.stopPropagation();
@@ -21,7 +29,7 @@
   async function choose(id: string, available: boolean) {
     if (!available) return;
     await providerStore.setActive(id);
-    close();
+    if (!isPanel) close();
   }
 
   function badgeFor(p: { available: boolean; kind: string }): string | null {
@@ -30,7 +38,7 @@
   }
 
   $effect(() => {
-    if (!open) return;
+    if (isPanel || !open) return;
     const onDoc = (e: MouseEvent) => {
       if (root && !root.contains(e.target as Node)) close();
     };
@@ -46,26 +54,29 @@
   });
 </script>
 
-<div class="picker" bind:this={root}>
-  <button
-    class="trigger"
-    type="button"
-    onclick={toggle}
-    aria-haspopup="menu"
-    aria-expanded={open}
-    title="Switch provider"
-  >
-    <span class="swatch" style="--c: {active.accent}"></span>
-    <span class="label">{active.label}</span>
-    {#if active.model}<span class="model">{active.model}</span>{/if}
-    <span class="chev" class:open><Icon name="chevron-down" size={13} /></span>
-  </button>
+<div class="picker" class:panel={isPanel} bind:this={root}>
+  {#if !isPanel}
+    <button
+      class="trigger"
+      type="button"
+      onclick={toggle}
+      aria-haspopup="menu"
+      aria-expanded={open}
+      title="Switch provider"
+    >
+      <span class="swatch" style="--c: {active.accent}"></span>
+      <span class="label">{active.label}</span>
+      {#if active.model}<span class="model">{active.model}</span>{/if}
+      <span class="chev" class:open><Icon name="chevron-down" size={13} /></span>
+    </button>
+  {/if}
 
-  {#if open}
+  {#if isPanel || open}
     <div
       class="menu"
-      role="menu"
-      transition:scale={{ duration: 140, start: 0.97, opacity: 0, easing: cubicOut }}
+      class:menu-panel={isPanel}
+      role={isPanel ? "group" : "menu"}
+      transition:scale={{ duration: isPanel ? 0 : 140, start: 0.97, opacity: 0, easing: cubicOut }}
     >
       <div class="menu-head mono-label">Provider</div>
       {#each providers as p (p.id)}
@@ -96,6 +107,11 @@
   .picker {
     position: relative;
     display: inline-flex;
+  }
+  .picker.panel {
+    display: block;
+    width: 100%;
+    position: static;
   }
 
   .trigger {
@@ -154,6 +170,16 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
     transform-origin: top right;
+  }
+  .menu.menu-panel {
+    position: static;
+    min-width: 0;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
   }
   .menu-head {
     padding: 0.5rem 0.6rem 0.4rem;
