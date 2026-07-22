@@ -67,12 +67,15 @@ fn default_store_version() -> u32 {
 /// the *agent* model; media generation is a separate slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPreferences {
-    /// Image gen/edit provider id (`imagine` today; `local` reserved).
+    /// Image gen/edit provider id (`imagine` | `local`).
     #[serde(default = "default_image_provider_id")]
     pub image_provider_id: String,
     /// Video gen provider id (`imagine` tools today; local later).
     #[serde(default = "default_video_provider_id")]
     pub video_provider_id: String,
+    /// ComfyUI HTTP base (S18). Models download via Comfy Manager, not Swerve.
+    #[serde(default = "default_comfy_base_url")]
+    pub comfy_base_url: String,
 }
 
 fn default_image_provider_id() -> String {
@@ -83,11 +86,16 @@ fn default_video_provider_id() -> String {
     "imagine".into()
 }
 
+fn default_comfy_base_url() -> String {
+    "http://127.0.0.1:8188".into()
+}
+
 impl Default for AppPreferences {
     fn default() -> Self {
         AppPreferences {
             image_provider_id: default_image_provider_id(),
             video_provider_id: default_video_provider_id(),
+            comfy_base_url: default_comfy_base_url(),
         }
     }
 }
