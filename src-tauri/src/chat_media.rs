@@ -97,13 +97,25 @@ pub fn extract_path_candidates(text: &str) -> Vec<String> {
             if cleaned.is_empty() {
                 continue;
             }
-            // Skip URLs and data URIs — file paths only.
+            // Skip remote URLs and data URIs — file paths only.
+            // `file://` is allowed and normalized to a filesystem path (S15b).
             let cl = cleaned.to_ascii_lowercase();
             if cl.starts_with("http://") || cl.starts_with("https://") || cl.starts_with("data:") {
                 continue;
             }
-            if !out.iter().any(|c| c.eq_ignore_ascii_case(&cleaned)) {
-                out.push(cleaned);
+            let path = if cl.starts_with("file:") {
+                match file_url_to_path(&cleaned) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            } else {
+                cleaned
+            };
+            if path.is_empty() {
+                continue;
+            }
+            if !out.iter().any(|c| c.eq_ignore_ascii_case(&path)) {
+                out.push(path);
             }
         }
     }
@@ -115,8 +127,68 @@ pub fn extract_path_candidates(text: &str) -> Vec<String> {
 fn clean_candidate(raw: &str) -> String {
     raw.trim()
         .trim_start_matches(['(', '[', '<', '"', '\'', '`', '*'])
-        .trim_end_matches(['"', '\'', '`', '*'])
+        .trim_end_matches(['"', '\'', '`', '*', ')', ']', '>', ',', ';', '.'])
         .to_string()
+}
+
+/// `file:///C:/Users/.../x.png` or `file://localhost/C:/...` → OS path.
+fn file_url_to_path(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("file://")
+        .or_else(|| url.strip_prefix("FILE://"))?;
+    // file:///C:/path  or  file://localhost/C:/path  or  file:///path
+    let path_part = rest
+        .strip_prefix("localhost")
+        .unwrap_or(rest)
+        .trim_start_matches('/');
+    // Windows drive: C:/Users/... (after stripping leading / from file:///C:/)
+    let decoded = percent_decode_lite(path_part);
+    if decoded.is_empty() {
+        return None;
+    }
+    // On Windows, file:///C:/foo → path_part "C:/foo" after one slash strip;
+    // file:///C:/ already handled. file:////server/share rare — skip.
+    if decoded.len() >= 2 && decoded.as_bytes()[1] == b':' {
+        // C:/... → C:\... for display consistency with Windows tools
+        return Some(decoded.replace('/', "\\"));
+    }
+    // Unix absolute: path was /tmp/x.png → after trim_start_matches('/') became tmp/x.png
+    // Restore leading slash for non-drive paths.
+    if !decoded.starts_with('/') && !(decoded.len() >= 2 && decoded.as_bytes()[1] == b':') {
+        // Re-check original: file:///tmp/x → rest starts with /tmp after strip file://
+        let after_host = rest.strip_prefix("localhost").unwrap_or(rest);
+        if after_host.starts_with('/') {
+            return Some(percent_decode_lite(after_host));
+        }
+    }
+    Some(decoded)
+}
+
+/// Minimal percent-decoder for file URLs (space, common path chars).
+fn percent_decode_lite(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = |c: u8| -> Option<u8> {
+                match c {
+                    b'0'..=b'9' => Some(c - b'0'),
+                    b'a'..=b'f' => Some(c - b'a' + 10),
+                    b'A'..=b'F' => Some(c - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(a), Some(b)) = (h(bytes[i + 1]), h(bytes[i + 2])) {
+                out.push((a << 4) | b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One resolved-and-copied attachment.
@@ -135,6 +207,8 @@ pub fn resolve_and_copy(candidates: &[String], cwd: &Path, dest_dir: &Path) -> V
     let mut images = 0usize;
     let mut videos = 0usize;
     let mut seen_sources: Vec<PathBuf> = Vec::new();
+
+    let dest_canon = std::fs::canonicalize(dest_dir).ok();
 
     for cand in candidates {
         let Some(kind) = classify(cand) else { continue };
@@ -160,6 +234,24 @@ pub fn resolve_and_copy(candidates: &[String], cwd: &Path, dest_dir: &Path) -> V
             MediaKind::Video if videos >= MAX_VIDEOS => continue,
             _ => {}
         }
+
+        // Already inside attachments dir — use as-is (agent may write there
+        // directly). Avoid a redundant copy so thumbs match the saved file.
+        if let Some(ref dest_root) = dest_canon {
+            if real.starts_with(dest_root) {
+                match kind {
+                    MediaKind::Image => images += 1,
+                    MediaKind::Video => videos += 1,
+                }
+                seen_sources.push(real.clone());
+                out.push(ResolvedMedia {
+                    kind,
+                    stored_path: real.display().to_string(),
+                });
+                continue;
+            }
+        }
+
         let ext = real
             .extension()
             .and_then(|e| e.to_str())
@@ -249,6 +341,34 @@ mod tests {
         assert!(!c.iter().any(|x| x.starts_with("data:")), "{c:?}");
         assert!(!c.iter().any(|x| x.contains("moviegoer")), "{c:?}");
         assert_eq!(c.iter().filter(|x| x.as_str() == "out.png").count(), 1, "{c:?}");
+    }
+
+    #[test]
+    fn extracts_file_url_to_windows_path() {
+        let text = "Wrote file:///C:/Users/me/Pictures/shot.png for you.";
+        let c = extract_path_candidates(text);
+        assert!(
+            c.iter().any(|p| p.eq_ignore_ascii_case(r"C:\Users\me\Pictures\shot.png")),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_reuses_file_already_in_dest() {
+        let dest = temp_dir("dest-reuse");
+        let existing = dest.join("already.png");
+        std::fs::write(&existing, b"png").unwrap();
+        let cands = vec![existing.display().to_string()];
+        let resolved = resolve_and_copy(&cands, &dest, &dest);
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        // Same file (or equivalent path), not a second copy with a new id.
+        let stored = Path::new(&resolved[0].stored_path);
+        assert!(stored.is_file());
+        assert_eq!(
+            std::fs::canonicalize(stored).unwrap(),
+            std::fs::canonicalize(&existing).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[test]
