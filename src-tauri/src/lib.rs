@@ -7,6 +7,7 @@ mod env_context;
 mod grok_config;
 mod jobs;
 mod local_llm;
+pub mod local_image;
 mod media_providers;
 mod model_catalog;
 pub mod paths;
@@ -702,6 +703,37 @@ fn set_image_provider(id: String) -> Result<media_providers::MediaProvidersView,
 #[tauri::command]
 fn set_video_provider(id: String) -> Result<media_providers::MediaProvidersView, String> {
     media_providers::set_video_provider(&id)
+}
+
+#[tauri::command]
+fn set_comfy_base_url(url: String) -> Result<media_providers::MediaProvidersView, String> {
+    media_providers::set_comfy_base_url(&url)
+}
+
+#[tauri::command]
+fn probe_local_image() -> local_image::LocalImageStatus {
+    local_image::probe()
+}
+
+/// Generate via ComfyUI when local provider is selected / available. Returns
+/// attachment path under ~/.swervebuild/attachments.
+#[tauri::command]
+async fn generate_local_image(
+    prompt: String,
+    negative: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        local_image::generate(
+            &prompt,
+            negative.as_deref(),
+            width.unwrap_or(512),
+            height.unwrap_or(512),
+        )
+    })
+    .await
+    .map_err(|e| format!("generate task failed: {e}"))?
 }
 
 /// Copy picked image files into `~/.swervebuild/attachments` so the webview
@@ -1481,6 +1513,9 @@ pub fn run() {
             list_media_providers,
             set_image_provider,
             set_video_provider,
+            set_comfy_base_url,
+            probe_local_image,
+            generate_local_image,
             get_local_state,
             install_local_engine,
             add_local_model,

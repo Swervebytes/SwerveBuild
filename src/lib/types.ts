@@ -55,11 +55,19 @@ export type MediaProviderInfo = {
   isDefault: boolean;
 };
 
+export type LocalImageStatus = {
+  reachable: boolean;
+  baseUrl: string;
+  note: string;
+  checkpoints: string[];
+};
+
 export type MediaProvidersView = {
   imageProviders: MediaProviderInfo[];
   videoProviders: MediaProviderInfo[];
   selectedImageProviderId: string;
   selectedVideoProviderId: string;
+  localImage?: LocalImageStatus;
 };
 
 export type Workspace = {

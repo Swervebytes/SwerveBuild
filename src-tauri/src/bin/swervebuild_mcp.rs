@@ -299,6 +299,25 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["action"]
             }),
         },
+        ToolDef {
+            name: "local_image_status".into(),
+            description: "Check local ComfyUI image backend (S18). Returns reachable, base URL, checkpoint list, and notes. Does NOT use xAI Imagine. Chat models never render pixels.".into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolDef {
+            name: "local_image_generate".into(),
+            description: "Generate an image via local ComfyUI (loopback). Saves PNG/JPG under ~/.swervebuild/attachments and returns the path for chat display. Requires ComfyUI running with at least one checkpoint (install models in Comfy Manager — not Swerve's GGUF catalog). Prefer this when Settings image provider is Local (ComfyUI). NOT Imagine/image_gen.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Positive prompt (required)" },
+                    "negative": { "type": "string", "description": "Negative prompt (optional)" },
+                    "width": { "type": "integer", "description": "Width 256–1280 (default 512)" },
+                    "height": { "type": "integer", "description": "Height 256–1280 (default 512)" }
+                },
+                "required": ["prompt"]
+            }),
+        },
     ]
 }
 
@@ -646,6 +665,26 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "action required".to_string())?;
             swerve_build_lib::browser_debug::navigate(action)
+        }
+        "local_image_status" | "swervebuild_local_image_status" => {
+            Ok(serde_json::to_value(swerve_build_lib::local_image::probe())
+                .unwrap_or_else(|_| json!({ "reachable": false })))
+        }
+        "local_image_generate" | "swervebuild_local_image_generate" => {
+            let prompt = args
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing prompt".to_string())?;
+            let negative = args.get("negative").and_then(|v| v.as_str());
+            let width = args.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let height = args.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let path = swerve_build_lib::local_image::generate(
+                prompt,
+                negative,
+                width.unwrap_or(512),
+                height.unwrap_or(512),
+            )?;
+            Ok(json!({ "path": path, "provider": "comfyui" }))
         }
         _ => Err(format!("Unknown tool: {name}")),
     }

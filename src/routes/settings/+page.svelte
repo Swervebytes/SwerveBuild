@@ -319,9 +319,10 @@
     </div>
     <p class="group-note">
       The chat/agent model (including local Qwen) only writes text and decides to call tools. Image
-      and video tools use a <strong>media provider</strong> — today that is <strong>xAI Imagine</strong>
-      (remote API, needs network). Local offline generation is planned after the VRAM UI; it will
-      appear here when available. Open the picker for the full list.
+      tools use a <strong>media provider</strong>: <strong>xAI Imagine</strong> (remote) or
+      <strong>Local (ComfyUI)</strong> when Comfy is running on loopback. Install checkpoints in
+      <strong>Comfy Manager</strong> — not the GGUF local-models catalog. Agents: prefer
+      <code>swervebuild__local_image_generate</code> when Local is selected.
     </p>
     <div class="media-row">
       <MediaPicker />
