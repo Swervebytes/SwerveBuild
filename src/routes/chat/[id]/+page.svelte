@@ -390,15 +390,23 @@
     usage = emptyUsage();
     resetStream();
 
-    await workspaceStore.refresh();
-
+    // Paint transcript ASAP from cache; don't block on a full workspace refresh
+    // or Comfy probes in the header.
     let loaded = workspaceStore.chats.find((item) => item.id === id);
     if (!loaded) {
-      try {
-        loaded = await invoke<Chat>("get_chat", { chatId: id });
-      } catch {
-        loaded = undefined;
+      await workspaceStore.refresh();
+      if (gen !== bootstrapGen) return;
+      loaded = workspaceStore.chats.find((item) => item.id === id);
+      if (!loaded) {
+        try {
+          loaded = await invoke<Chat>("get_chat", { chatId: id });
+        } catch {
+          loaded = undefined;
+        }
       }
+    } else {
+      // Keep rail fresh without delaying first paint.
+      void workspaceStore.refresh();
     }
 
     if (!loaded) {

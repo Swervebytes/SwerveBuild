@@ -690,9 +690,21 @@ fn save_pasted_image(data_url: String) -> Result<String, String> {
     acp::save_image_base64(&data_url)
 }
 
+/// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
+/// `prefs_only: true` skips network entirely (header summary on chat paint).
 #[tauri::command]
-fn list_media_providers() -> media_providers::MediaProvidersView {
-    media_providers::view()
+fn list_media_providers(
+    refresh: Option<bool>,
+    prefs_only: Option<bool>,
+) -> media_providers::MediaProvidersView {
+    if prefs_only.unwrap_or(false) {
+        return media_providers::view_prefs_only();
+    }
+    if refresh.unwrap_or(false) {
+        media_providers::view_refresh()
+    } else {
+        media_providers::view()
+    }
 }
 
 #[tauri::command]
@@ -712,7 +724,7 @@ fn set_comfy_base_url(url: String) -> Result<media_providers::MediaProvidersView
 
 #[tauri::command]
 fn probe_local_image() -> local_image::LocalImageStatus {
-    local_image::probe()
+    local_image::probe_fresh()
 }
 
 /// Generate via ComfyUI when local provider is selected / available. Returns

@@ -10,10 +10,15 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_COMFY_URL: &str = "http://127.0.0.1:8188";
+
+/// How long a successful/failed probe is reused (avoids Comfy HTTP on every
+/// chat paint / Models summary / env-pack build).
+const PROBE_CACHE_TTL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +28,15 @@ pub struct LocalImageStatus {
     pub note: String,
     pub checkpoints: Vec<String>,
 }
+
+struct ProbeCache {
+    at: Instant,
+    status: LocalImageStatus,
+    /// True when checkpoint list was fetched (not just system_stats).
+    full: bool,
+}
+
+static PROBE_CACHE: Mutex<Option<ProbeCache>> = Mutex::new(None);
 
 pub fn comfy_base_url() -> String {
     let prefs = Store::load().preferences;
@@ -38,18 +52,54 @@ pub fn is_available() -> bool {
     probe().reachable
 }
 
-/// Best-effort probe (short timeout). Never panics.
+/// Drop cached probe (after URL change or explicit Probe click).
+pub fn invalidate_probe_cache() {
+    if let Ok(mut g) = PROBE_CACHE.lock() {
+        *g = None;
+    }
+}
+
+/// Best-effort probe with short timeout + TTL cache. Never panics.
+/// Prefer this for UI listings; generation still gets a full checkpoint list.
 pub fn probe() -> LocalImageStatus {
+    probe_opts(false, true)
+}
+
+/// Force a fresh full probe (Probe button / URL save / generate path).
+pub fn probe_fresh() -> LocalImageStatus {
+    invalidate_probe_cache();
+    probe_opts(true, true)
+}
+
+/// Reachability only (no checkpoint catalog) — faster for headers / env pack.
+pub fn probe_quick() -> LocalImageStatus {
+    probe_opts(false, false)
+}
+
+fn probe_opts(force: bool, want_full: bool) -> LocalImageStatus {
     let base = comfy_base_url();
-    match probe_inner(&base) {
+    if !force {
+        if let Ok(g) = PROBE_CACHE.lock() {
+            if let Some(c) = g.as_ref() {
+                let same_url = c.status.base_url == base;
+                let fresh = c.at.elapsed() < PROBE_CACHE_TTL;
+                if same_url && fresh && (!want_full || c.full) {
+                    return c.status.clone();
+                }
+            }
+        }
+    }
+
+    let status = match probe_inner(&base, want_full) {
         Ok(checkpoints) => LocalImageStatus {
             reachable: true,
-            base_url: base,
-            note: if checkpoints.is_empty() {
-                "ComfyUI up — no checkpoints found; install one in Comfy Manager"
-                    .into()
-            } else {
+            base_url: base.clone(),
+            note: if want_full && checkpoints.is_empty() {
+                "ComfyUI up — no checkpoints found; install one in Comfy Manager".into()
+            } else if want_full {
                 format!("ComfyUI up · {} checkpoint(s)", checkpoints.len())
+            } else {
+                "ComfyUI up".into()
             },
             checkpoints,
         },
@@ -59,13 +109,36 @@ pub fn probe() -> LocalImageStatus {
             note: format!("ComfyUI not reachable — {e}"),
             checkpoints: vec![],
         },
+    };
+
+    if let Ok(mut g) = PROBE_CACHE.lock() {
+        // Prefer keeping a full result over replacing it with quick-only.
+        let replace = match g.as_ref() {
+            None => true,
+            Some(c) if c.status.base_url != status.base_url => true,
+            Some(_) if want_full => true,
+            Some(c) if !c.full => true,
+            Some(c) if c.at.elapsed() >= PROBE_CACHE_TTL => true,
+            Some(_) => force,
+        };
+        if replace {
+            *g = Some(ProbeCache {
+                at: Instant::now(),
+                status: status.clone(),
+                full: want_full && status.reachable,
+            });
+        }
     }
+    status
 }
 
-fn probe_inner(base: &str) -> Result<Vec<String>, String> {
-    // system_stats is lightweight; object_info lists checkpoints.
-    let _stats = http_get(&format!("{base}/system_stats"))?;
-    let info = http_get(&format!("{base}/object_info/CheckpointLoaderSimple")).ok();
+fn probe_inner(base: &str, full: bool) -> Result<Vec<String>, String> {
+    // Tight timeouts: Comfy is loopback; hanging UI is worse than a retry later.
+    let _stats = http_get_probe(&format!("{base}/system_stats"))?;
+    if !full {
+        return Ok(vec![]);
+    }
+    let info = http_get_probe(&format!("{base}/object_info/CheckpointLoaderSimple")).ok();
     let checkpoints = info
         .as_ref()
         .map(|v| parse_checkpoint_names(v))
@@ -102,7 +175,7 @@ pub fn generate(prompt: &str, negative: Option<&str>, width: u32, height: u32) -
     if prompt.chars().count() > 2000 {
         return Err("Prompt too long (max 2000 chars)".into());
     }
-    let status = probe();
+    let status = probe_fresh();
     if !status.reachable {
         return Err(status.note);
     }
@@ -288,6 +361,21 @@ fn urlencoding_lite(s: &str) -> String {
     out
 }
 
+/// Short timeouts for reachability / catalog probes (UI path).
+fn http_get_probe(url: &str) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(400))
+        .timeout(Duration::from_millis(1500))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    resp.into_json()
+        .map_err(|e| format!("JSON from {url}: {e}"))
+}
+
+/// Longer timeout for generation history polling / workflow posts.
 fn http_get(url: &str) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))

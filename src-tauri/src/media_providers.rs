@@ -105,9 +105,24 @@ pub fn load_preferences() -> AppPreferences {
     Store::load().preferences
 }
 
+/// UI listing. Uses cached Comfy probe (short TTL) so chat/header opens stay snappy.
 pub fn view() -> MediaProvidersView {
+    view_inner(false)
+}
+
+/// Force a fresh Comfy probe (Probe button / after URL change).
+pub fn view_refresh() -> MediaProvidersView {
+    view_inner(true)
+}
+
+fn view_inner(force_probe: bool) -> MediaProvidersView {
     let prefs = load_preferences();
-    let local = local_image::probe();
+    let local = if force_probe {
+        local_image::probe_fresh()
+    } else {
+        // Full probe when cache cold; otherwise TTL cache (see local_image).
+        local_image::probe()
+    };
     let catalog = image_catalog(&local);
     let mut image_id = normalize_image_provider_id(&prefs.image_provider_id);
     // If user selected local but Comfy is down, still report selection; UI shows offline note.
@@ -124,6 +139,50 @@ pub fn view() -> MediaProvidersView {
     let video_id = normalize_video_provider_id(&prefs.video_provider_id);
     MediaProvidersView {
         image_providers: catalog,
+        video_providers: video_catalog(),
+        selected_image_provider_id: image_id,
+        selected_video_provider_id: video_id,
+        local_image: local,
+    }
+}
+
+/// Preference-only snapshot for header summary — **no network**.
+pub fn view_prefs_only() -> MediaProvidersView {
+    let prefs = load_preferences();
+    let base = {
+        let u = prefs.comfy_base_url.trim();
+        if u.is_empty() {
+            local_image::DEFAULT_COMFY_URL.to_string()
+        } else {
+            u.trim_end_matches('/').to_string()
+        }
+    };
+    // Offline placeholder; open Models sheet / Probe for live reachability.
+    let local = local_image::LocalImageStatus {
+        reachable: false,
+        base_url: base,
+        note: "Open Models to probe ComfyUI".into(),
+        checkpoints: vec![],
+    };
+    let catalog = image_catalog(&local);
+    // When we don't probe, still show Local as selectable in summary sense —
+    // actual availability is refreshed when the sheet loads with a real probe.
+    // For prefs-only, mark local available:true so selection isn't forced away;
+    // the live view corrects availability.
+    let mut image_providers = catalog;
+    for p in &mut image_providers {
+        if p.id == IMAGE_PROVIDER_LOCAL {
+            p.available = true;
+            p.note = "Local ComfyUI — probe when Models opens".into();
+        }
+    }
+    let mut image_id = normalize_image_provider_id(&prefs.image_provider_id);
+    if !image_providers.iter().any(|p| p.id == image_id) {
+        image_id = IMAGE_PROVIDER_IMAGINE.into();
+    }
+    let video_id = normalize_video_provider_id(&prefs.video_provider_id);
+    MediaProvidersView {
+        image_providers,
         video_providers: video_catalog(),
         selected_image_provider_id: image_id,
         selected_video_provider_id: video_id,
@@ -191,37 +250,40 @@ pub fn set_comfy_base_url(url: &str) -> Result<MediaProvidersView, String> {
     let mut store = Store::load();
     store.preferences.comfy_base_url = trimmed;
     Store::save(&store)?;
-    Ok(view())
+    local_image::invalidate_probe_cache();
+    Ok(view_refresh())
 }
 
 /// One-line summary for env context / UI tooltips.
+/// **No network** — session start must not wait on Comfy.
 pub fn honesty_summary() -> String {
-    let v = view();
-    let img = v
-        .image_providers
-        .iter()
-        .find(|p| p.id == v.selected_image_provider_id);
-    let vid = v
-        .video_providers
-        .iter()
-        .find(|p| p.id == v.selected_video_provider_id);
-    let img_s = img
-        .map(|p| format!("{} ({})", p.label, p.locality))
-        .unwrap_or_else(|| "unknown".into());
-    let vid_s = vid
-        .map(|p| format!("{} ({})", p.label, p.locality))
-        .unwrap_or_else(|| "unknown".into());
-    let local_hint = if v.selected_image_provider_id == IMAGE_PROVIDER_LOCAL {
+    let prefs = load_preferences();
+    let image_id = normalize_image_provider_id(&prefs.image_provider_id);
+    let video_id = normalize_video_provider_id(&prefs.video_provider_id);
+    let img_s = match image_id.as_str() {
+        IMAGE_PROVIDER_LOCAL => "Local (ComfyUI) (local)",
+        _ => "xAI Imagine (remote)",
+    };
+    let vid_s = match video_id.as_str() {
+        VIDEO_PROVIDER_LOCAL => "Local video (planned) (local)",
+        _ => "xAI Imagine video (remote)",
+    };
+    let local_hint = if image_id == IMAGE_PROVIDER_LOCAL {
+        let base = {
+            let u = prefs.comfy_base_url.trim();
+            if u.is_empty() {
+                local_image::DEFAULT_COMFY_URL
+            } else {
+                u
+            }
+        };
         format!(
-            "; preferred tool: swervebuild__local_image_generate via {} ({})",
-            v.local_image.base_url, v.local_image.note
+            "; preferred tool: swervebuild__local_image_generate via {base} (probe at gen time)"
         )
     } else {
         "; Grok image_gen/image_edit = Imagine remote (not local chat model)".into()
     };
-    format!(
-        "images={img_s}; video={vid_s}; chat model does NOT render pixels{local_hint}"
-    )
+    format!("images={img_s}; video={vid_s}; chat model does NOT render pixels{local_hint}")
 }
 
 #[cfg(test)]

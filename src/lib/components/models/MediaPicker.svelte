@@ -40,9 +40,12 @@
     return p.label;
   }
 
-  async function load() {
+  async function load(opts: { refresh?: boolean } = {}) {
     try {
-      view = await invoke<MediaProvidersView>("list_media_providers");
+      view = await invoke<MediaProvidersView>("list_media_providers", {
+        refresh: opts.refresh ?? false,
+        prefsOnly: false,
+      });
       error = null;
       if (view?.localImage?.baseUrl) comfyUrl = view.localImage.baseUrl;
       onchange?.(view);
@@ -61,6 +64,16 @@
       onchange?.(view);
     } catch (e) {
       error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function probeNow() {
+    busy = true;
+    error = null;
+    try {
+      await load({ refresh: true });
     } finally {
       busy = false;
     }
@@ -118,8 +131,9 @@
     }
   }
 
+  // Panel: load once when mounted (sheet open). Standalone: only when menu opens.
   $effect(() => {
-    void load();
+    if (isPanel) void load();
   });
 
   $effect(() => {
@@ -208,7 +222,7 @@
             aria-label="ComfyUI base URL"
           />
           <button class="btn-mini" type="button" disabled={busy} onclick={saveComfyUrl}>Save URL</button>
-          <button class="btn-mini" type="button" disabled={busy} onclick={() => load()}>Probe</button>
+          <button class="btn-mini" type="button" disabled={busy} onclick={() => probeNow()}>Probe</button>
         </div>
         {#if view.localImage}
           <p class="comfy-status mono-label">

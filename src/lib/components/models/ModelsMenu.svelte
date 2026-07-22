@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { scale } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
   import { invoke } from "@tauri-apps/api/core";
   import Icon from "$lib/components/ui/Icon.svelte";
   import ProviderPicker from "$lib/components/providers/ProviderPicker.svelte";
@@ -11,7 +9,7 @@
 
   /**
    * S19 — one chat-header control for provider + agent model + image slot.
-   * Keeps always-visible chrome elsewhere (usage, browser).
+   * Perf: prefs-only summary on mount (no Comfy probe); live probe when sheet opens.
    */
 
   let {
@@ -29,6 +27,7 @@
   let open = $state(false);
   let root: HTMLDivElement | undefined = $state();
   let mediaView = $state<MediaProvidersView | null>(null);
+  let sheetReady = $state(false);
 
   const providerLabel = $derived(providerStore.active.label);
   const agentLabel = $derived(
@@ -40,7 +39,9 @@
     if (id === "imagine") return "Imagine";
     if (id === "local") {
       const p = mediaView?.imageProviders.find((x) => x.id === "local");
-      return p?.available === false ? "Local off" : "Local";
+      // prefs-only marks local available; live view may show off
+      if (p && p.available === false) return "Local off";
+      return "Local";
     }
     return id;
   });
@@ -51,26 +52,37 @@
       .join(" · "),
   );
 
-  async function refreshMediaSummary() {
+  /** Header label only — never blocks chat paint on Comfy. */
+  async function loadPrefsSummary() {
     try {
-      mediaView = await invoke<MediaProvidersView>("list_media_providers");
+      mediaView = await invoke<MediaProvidersView>("list_media_providers", {
+        refresh: false,
+        prefsOnly: true,
+      });
     } catch {
-      /* leave previous or null */
+      /* leave previous */
     }
   }
 
   function toggle(e: MouseEvent) {
     e.stopPropagation();
     open = !open;
-    if (open) void refreshMediaSummary();
+    if (open) {
+      // Mount heavy panel content on next frame so the button state flips first.
+      requestAnimationFrame(() => {
+        sheetReady = true;
+      });
+    } else {
+      sheetReady = false;
+    }
   }
   function close() {
     open = false;
-    void refreshMediaSummary();
+    sheetReady = false;
   }
 
   $effect(() => {
-    void refreshMediaSummary();
+    void loadPrefsSummary();
   });
 
   $effect(() => {
@@ -108,12 +120,7 @@
   </button>
 
   {#if open}
-    <div
-      class="sheet"
-      role="dialog"
-      aria-label="Models"
-      transition:scale={{ duration: 140, start: 0.97, opacity: 0, easing: cubicOut }}
-    >
+    <div class="sheet" role="dialog" aria-label="Models">
       <div class="sheet-head">
         <span class="mono-label">Models</span>
         <p class="sheet-hint">
@@ -121,29 +128,33 @@
         </p>
       </div>
 
-      <section class="section">
-        <ProviderPicker variant="panel" />
-      </section>
+      {#if sheetReady}
+        <section class="section">
+          <ProviderPicker variant="panel" />
+        </section>
 
-      {#if showModelPicker && onmodelchange}
+        {#if showModelPicker && onmodelchange}
+          <section class="section section-border">
+            <ModelPicker
+              variant="panel"
+              value={modelId}
+              disabled={modelSwitching}
+              onchange={onmodelchange}
+            />
+          </section>
+        {/if}
+
         <section class="section section-border">
-          <ModelPicker
+          <MediaPicker
             variant="panel"
-            value={modelId}
-            disabled={modelSwitching}
-            onchange={onmodelchange}
+            onchange={(v) => {
+              mediaView = v;
+            }}
           />
         </section>
+      {:else}
+        <p class="sheet-loading mono-label">Loading…</p>
       {/if}
-
-      <section class="section section-border">
-        <MediaPicker
-          variant="panel"
-          onchange={(v) => {
-            mediaView = v;
-          }}
-        />
-      </section>
     </div>
   {/if}
 </div>
@@ -209,7 +220,7 @@
     display: inline-flex;
     color: var(--text-faint);
     flex: none;
-    transition: transform var(--dur) var(--ease);
+    transition: transform 0.12s ease;
   }
   .chev.open {
     transform: rotate(180deg);
@@ -228,7 +239,6 @@
     border-radius: var(--radius-lg, 10px);
     background: var(--bg-surface);
     box-shadow: var(--shadow-lg);
-    transform-origin: top right;
   }
   .sheet-head {
     padding: 0.35rem 0.5rem 0.55rem;
@@ -238,6 +248,10 @@
     font-size: 0.6875rem;
     line-height: 1.4;
     color: var(--text-muted);
+  }
+  .sheet-loading {
+    padding: 0.75rem 0.5rem;
+    color: var(--text-faint);
   }
   .section {
     padding: 0.15rem 0;
