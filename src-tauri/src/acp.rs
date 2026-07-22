@@ -598,30 +598,47 @@ impl AcpManager {
             )
         };
 
-        let mut prompt_text = text.trim().to_string();
-        for (index, image) in images.iter().enumerate() {
-            if !prompt_text.is_empty() {
-                prompt_text.push('\n');
-            }
-            prompt_text.push_str(&format!("[Image #{}: {}]", index + 1, image));
-        }
-
-        if prompt_text.is_empty() {
-            return Err("Message cannot be empty".to_string());
-        }
+        // Build ACP content blocks: text (+ optional env pack) and real image
+        // blocks when files are readable. Path-only text is a last-resort fallback
+        // so agents that only understand prose still see the attachment.
+        let mut blocks: Vec<Value> = Vec::new();
 
         // Prepend env pack on first turn only. Delivery is a user-turn prefix
         // because Grok ACP `session/new` does not expose a client system-prompt
         // field we can rely on (design open item: verified via wire-prepend).
+        let mut body = text.trim().to_string();
         if let Some(pack) = env_pack {
-            prompt_text = format!("{pack}\n\n---\n\n{prompt_text}");
+            if body.is_empty() {
+                body = pack;
+            } else {
+                body = format!("{pack}\n\n---\n\n{body}");
+            }
+        }
+        if !body.is_empty() {
+            blocks.push(json!({ "type": "text", "text": body }));
+        }
+
+        for (index, image) in images.iter().enumerate() {
+            match image_path_to_acp_block(image) {
+                Ok(block) => blocks.push(block),
+                Err(_) => {
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": format!("[Image #{}: {}]", index + 1, image)
+                    }));
+                }
+            }
+        }
+
+        if blocks.is_empty() {
+            return Err("Message cannot be empty".to_string());
         }
 
         transport.rpc(
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": prompt_text }]
+                "prompt": blocks
             }),
             PROMPT_TIMEOUT_SECS,
         )?;
@@ -1130,6 +1147,52 @@ mod tests {
         assert!(usage_payload_from_prompt_response(&resp).is_none());
     }
 
+    #[test]
+    fn image_path_to_acp_block_reads_png_bytes() {
+        let dir = tempfile_dir("img-block");
+        // Minimal 1x1 PNG
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+            0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let path = dir.join("dot.png");
+        fs::write(&path, png).unwrap();
+        let block = image_path_to_acp_block(path.to_str().unwrap()).unwrap();
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/png");
+        assert!(block["data"].as_str().unwrap().len() > 8);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_attachment_files_copies_images_only() {
+        let dir = tempfile_dir("import-att");
+        let img = dir.join("a.jpg");
+        let txt = dir.join("notes.txt");
+        fs::write(&img, b"fake-jpeg-bytes").unwrap();
+        fs::write(&txt, b"not an image").unwrap();
+        let imported = import_attachment_files(&[
+            img.display().to_string(),
+            txt.display().to_string(),
+            dir.join("missing.png").display().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!(Path::new(&imported[0]).is_file());
+        assert!(
+            imported[0].contains("attachments")
+                || Path::new(&imported[0]).extension().is_some()
+        );
+        let _ = fs::remove_dir_all(&dir);
+        // Clean the copied attachment if under real attachments dir.
+        if let Some(p) = imported.first().map(PathBuf::from) {
+            let _ = fs::remove_file(p);
+        }
+    }
+
     fn tempfile_dir(label: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -1162,19 +1225,118 @@ pub fn attachments_dir() -> PathBuf {
 pub fn save_image_base64(data: &str) -> Result<String, String> {
     use base64::Engine;
 
-    let payload = data
-        .split_once(',')
-        .map(|(_, value)| value)
-        .unwrap_or(data);
+    let (meta, payload) = match data.split_once(',') {
+        Some((head, body)) => (head, body),
+        None => ("", data),
+    };
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(|e| format!("Invalid image data: {e}"))?;
 
+    if bytes.len() as u64 > IMAGE_ATTACH_MAX_BYTES {
+        return Err(format!(
+            "Image too large (max {} MB)",
+            IMAGE_ATTACH_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let ext = ext_from_data_url_meta(meta).unwrap_or("png");
     let dir = attachments_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let path = dir.join(format!("{}.png", Store::new_id()));
+    let path = dir.join(format!("{}.{ext}", Store::new_id()));
     fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path.display().to_string())
+}
+
+/// Copy user-selected image files into the attachments dir (asset-protocol scope).
+/// Skips non-images / oversize files; returns only successful paths.
+pub fn import_attachment_files(paths: &[String]) -> Result<Vec<String>, String> {
+    let dir = attachments_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for raw in paths {
+        let src = PathBuf::from(raw);
+        if !src.is_file() {
+            continue;
+        }
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !IMAGE_ATTACH_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let meta = fs::metadata(&src).map_err(|e| e.to_string())?;
+        if meta.len() > IMAGE_ATTACH_MAX_BYTES {
+            continue;
+        }
+        let dest = dir.join(format!("{}.{ext}", Store::new_id()));
+        fs::copy(&src, &dest).map_err(|e| format!("Failed to import attachment: {e}"))?;
+        out.push(dest.display().to_string());
+    }
+    Ok(out)
+}
+
+const IMAGE_ATTACH_MAX_BYTES: u64 = 25 * 1024 * 1024;
+const IMAGE_ATTACH_EXTS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+
+fn ext_from_data_url_meta(meta: &str) -> Option<&'static str> {
+    // data:image/png;base64
+    let lower = meta.to_ascii_lowercase();
+    if lower.contains("image/jpeg") || lower.contains("image/jpg") {
+        Some("jpg")
+    } else if lower.contains("image/png") {
+        Some("png")
+    } else if lower.contains("image/gif") {
+        Some("gif")
+    } else if lower.contains("image/webp") {
+        Some("webp")
+    } else if lower.contains("image/bmp") {
+        Some("bmp")
+    } else if lower.contains("image/svg") {
+        Some("svg")
+    } else {
+        None
+    }
+}
+
+fn mime_from_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        _ => "image/png",
+    }
+}
+
+/// Read a local image file into an ACP `image` content block.
+fn image_path_to_acp_block(path: &str) -> Result<Value, String> {
+    use base64::Engine;
+
+    let p = Path::new(path);
+    if !p.is_file() {
+        return Err("not a file".into());
+    }
+    let meta = fs::metadata(p).map_err(|e| e.to_string())?;
+    if meta.len() > IMAGE_ATTACH_MAX_BYTES {
+        return Err("image too large".into());
+    }
+    let bytes = fs::read(p).map_err(|e| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(json!({
+        "type": "image",
+        "mimeType": mime_from_path(path),
+        "data": b64
+    }))
 }

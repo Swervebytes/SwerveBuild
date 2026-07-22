@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/platform-Windows-0d1220?style=flat-square" alt="Windows" />
   <img src="https://img.shields.io/badge/built_with-Tauri_2_·_Rust_·_Svelte_5-0d1220?style=flat-square" alt="Tauri · Rust · Svelte" />
   <img src="https://img.shields.io/badge/license-MIT-0d1220?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/version-0.3.1-6cb5ff?style=flat-square" alt="v0.3.1" />
+  <img src="https://img.shields.io/badge/version-0.3.2-6cb5ff?style=flat-square" alt="v0.3.2" />
 </p>
 
 ---
