@@ -63,6 +63,35 @@ fn default_store_version() -> u32 {
     1
 }
 
+/// Workspace preferences (S16+) — not per-chat. Chat still has `model_id` for
+/// the *agent* model; media generation is a separate slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPreferences {
+    /// Image gen/edit provider id (`imagine` today; `local` reserved).
+    #[serde(default = "default_image_provider_id")]
+    pub image_provider_id: String,
+    /// Video gen provider id (`imagine` tools today; local later).
+    #[serde(default = "default_video_provider_id")]
+    pub video_provider_id: String,
+}
+
+fn default_image_provider_id() -> String {
+    "imagine".into()
+}
+
+fn default_video_provider_id() -> String {
+    "imagine".into()
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        AppPreferences {
+            image_provider_id: default_image_provider_id(),
+            video_provider_id: default_video_provider_id(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppStore {
     /// Schema version. Absent in pre-1.0 files (serde default = 1). Bump + add a
@@ -73,6 +102,9 @@ pub struct AppStore {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub chats: Vec<Chat>,
+    /// Global prefs (media providers, …). Absent in older data.json → defaults.
+    #[serde(default)]
+    pub preferences: AppPreferences,
 }
 
 impl Default for AppStore {
@@ -81,6 +113,7 @@ impl Default for AppStore {
             version: default_store_version(),
             projects: Vec::new(),
             chats: Vec::new(),
+            preferences: AppPreferences::default(),
         }
     }
 }

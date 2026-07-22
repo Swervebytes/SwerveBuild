@@ -36,6 +36,8 @@ pub struct EnvSnapshot {
     pub agent_surfaces: Vec<String>,
     /// Whether the human granted App UI MCP control (Settings → Agent UI control).
     pub app_ui_granted: bool,
+    /// S16: who actually runs image/video gen (not the chat model).
+    pub media_honesty: String,
 }
 
 /// Format the always-injected fact sheet. Keep it dense; models treat it as
@@ -100,6 +102,11 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
         surfaces,
         if s.app_ui_granted { "yes" } else { "no" }
     ));
+
+    // Keep short — chat model ≠ image renderer (common operator confusion).
+    if !s.media_honesty.is_empty() {
+        lines.push(format!("Media gen: {}", s.media_honesty));
+    }
 
     if s.self_dev {
         lines.push(
@@ -259,6 +266,7 @@ pub fn gather_for_chat(
         local_model_loaded,
         agent_surfaces: agent_surfaces(),
         app_ui_granted: crate::app_ui::is_granted(),
+        media_honesty: crate::media_providers::honesty_summary(),
     }
 }
 
@@ -316,6 +324,7 @@ pub fn gather_for_automation(
             .filter(|s| s != "app_ui")
             .collect(),
         app_ui_granted: false,
+        media_honesty: crate::media_providers::honesty_summary(),
     }
 }
 
@@ -345,6 +354,7 @@ mod tests {
             local_model_loaded: None,
             agent_surfaces: vec!["swervebuild".into()],
             app_ui_granted: false,
+            media_honesty: "images=xAI Imagine (remote); chat model does NOT render pixels".into(),
         }
     }
 
@@ -360,6 +370,8 @@ mod tests {
         assert!(pack.contains("Permissions: interactive approval"));
         assert!(pack.contains("chats=1"));
         assert!(pack.contains("app_ui granted: no"));
+        assert!(pack.contains("Media gen:"));
+        assert!(pack.contains("does NOT render pixels"));
         assert!(!pack.contains("Frozen core"));
     }
 

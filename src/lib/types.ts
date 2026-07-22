@@ -44,6 +44,24 @@ export type ModelInfo = {
   is_default: boolean;
 };
 
+/** S16 — image/video gen provider (not the chat/agent model). */
+export type MediaProviderInfo = {
+  id: string;
+  label: string;
+  kind: "image" | "video" | string;
+  locality: "remote" | "local" | string;
+  available: boolean;
+  note: string;
+  isDefault: boolean;
+};
+
+export type MediaProvidersView = {
+  imageProviders: MediaProviderInfo[];
+  videoProviders: MediaProviderInfo[];
+  selectedImageProviderId: string;
+  selectedVideoProviderId: string;
+};
+
 export type Workspace = {
   projects: Project[];
   chats: Chat[];

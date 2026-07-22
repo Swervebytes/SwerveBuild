@@ -7,6 +7,7 @@ mod env_context;
 mod grok_config;
 mod jobs;
 mod local_llm;
+mod media_providers;
 mod model_catalog;
 pub mod paths;
 mod providers;
@@ -686,6 +687,21 @@ fn append_chat_message(
 #[tauri::command]
 fn save_pasted_image(data_url: String) -> Result<String, String> {
     acp::save_image_base64(&data_url)
+}
+
+#[tauri::command]
+fn list_media_providers() -> media_providers::MediaProvidersView {
+    media_providers::view()
+}
+
+#[tauri::command]
+fn set_image_provider(id: String) -> Result<media_providers::MediaProvidersView, String> {
+    media_providers::set_image_provider(&id)
+}
+
+#[tauri::command]
+fn set_video_provider(id: String) -> Result<media_providers::MediaProvidersView, String> {
+    media_providers::set_video_provider(&id)
 }
 
 /// Copy picked image files into `~/.swervebuild/attachments` so the webview
@@ -1437,6 +1453,9 @@ pub fn run() {
             list_models,
             set_chat_model,
             set_custom_model_ids,
+            list_media_providers,
+            set_image_provider,
+            set_video_provider,
             get_local_state,
             install_local_engine,
             add_local_model,

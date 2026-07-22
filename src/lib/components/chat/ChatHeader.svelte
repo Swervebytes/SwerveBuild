@@ -2,6 +2,7 @@
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
   import ProviderPicker from "$lib/components/providers/ProviderPicker.svelte";
   import ModelPicker from "$lib/components/models/ModelPicker.svelte";
+  import MediaPicker from "$lib/components/models/MediaPicker.svelte";
   import { browserPane } from "$lib/stores/browserPane.svelte";
   import {
     type ChatUsage,
@@ -96,6 +97,8 @@
     {#if showModelPicker && onmodelchange}
       <ModelPicker value={modelId} disabled={modelSwitching} onchange={onmodelchange} />
     {/if}
+    <!-- S16: image/video gen slot (Imagine remote today; local planned) -->
+    <MediaPicker />
     <ProviderPicker />
     <button
       class="browser-toggle"
