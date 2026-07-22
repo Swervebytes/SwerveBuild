@@ -7,7 +7,7 @@
   import type { Chat, ChatMessage, MessagePart, Project } from "$lib/types";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
-  import { imageSrc } from "$lib/attachments";
+  import { imageSrc, saveAcpImageBlock } from "$lib/attachments";
   import {
     type ChatUsage,
     emptyUsage,
@@ -38,6 +38,8 @@
   let activeSessionCount = $state(0);
   /** ACP-reported context window; stays empty until agent sends used+size. */
   let usage = $state<ChatUsage>(emptyUsage());
+  /** Image paths from ACP image content blocks this turn (prefer over path-scan). */
+  let streamImages = $state<string[]>([]);
 
   // `-m` is a grok flag; hide the model picker when another agent backs this chat.
   const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
@@ -46,6 +48,7 @@
 
   function resetStream() {
     streaming = [];
+    streamImages = [];
   }
 
   function applyUsage(next: ChatUsage | null) {
@@ -53,19 +56,54 @@
     usage = next;
   }
 
+  /** Prefer real ACP image content blocks; path-scan remains a finalize fallback. */
+  function harvestAcpImages(node: unknown) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const item of node) harvestAcpImages(item);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const obj = node as Record<string, unknown>;
+    if (obj.type === "image" && typeof obj.data === "string") {
+      void saveAcpImageBlock(obj).then((path) => {
+        if (path && !streamImages.includes(path)) {
+          streamImages = [...streamImages, path];
+        }
+      });
+      return;
+    }
+    // Nested content blocks on tool / message updates.
+    if (obj.content != null) harvestAcpImages(obj.content);
+  }
+
   function appendStream(update: Record<string, unknown>) {
     const params = (update.params as Record<string, unknown>) ?? update;
     const inner = (params.update as Record<string, unknown>) ?? params;
     const sessionUpdate = String(inner.sessionUpdate ?? "");
+    const content = inner.content;
     const text =
-      ((inner.content as Record<string, unknown>)?.text as string) ??
-      (inner.title as string) ??
+      (typeof content === "object" &&
+        content !== null &&
+        typeof (content as Record<string, unknown>).text === "string" &&
+        String((content as Record<string, unknown>).text)) ||
+      (typeof inner.title === "string" ? inner.title : "") ||
       "";
 
     // ACP session-usage RFD: sessionUpdate "usage_update" with used + size.
     if (sessionUpdate === "usage_update") {
       applyUsage(parseUsageUpdate(inner));
       return;
+    }
+
+    // Image content blocks on agent/tool streams (S15) — save even without text.
+    if (
+      sessionUpdate === "agent_message_chunk" ||
+      sessionUpdate === "tool_call" ||
+      sessionUpdate === "tool_call_update"
+    ) {
+      harvestAcpImages(content);
+      harvestAcpImages(inner);
     }
 
     if (!text && sessionUpdate !== "tool_call" && sessionUpdate !== "tool_call_update") return;
@@ -184,18 +222,24 @@
         text: item.content,
       }));
 
-    // Media the turn produced (Imagine renders, tool artifacts …): the backend
-    // scans the WHOLE turn — prose + tool chips — for real on-disk image/video
-    // paths and copies them into the attachments store. Never fatal.
-    let media: { images: string[]; videos: string[] } = { images: [], videos: [] };
+    // Media: prefer ACP image content blocks captured during the stream (S15);
+    // fall back to path-scan of prose/tool text for agents that only write paths.
+    let media: { images: string[]; videos: string[] } = {
+      images: [...streamImages],
+      videos: [],
+    };
     const turnText = streaming.map((item) => item.content).join("\n");
     try {
-      media = await invoke<{ images: string[]; videos: string[] }>("detect_chat_media", {
+      const scanned = await invoke<{ images: string[]; videos: string[] }>("detect_chat_media", {
         chatId: chat.id,
         text: turnText,
       });
+      for (const img of scanned.images ?? []) {
+        if (!media.images.includes(img)) media.images.push(img);
+      }
+      media.videos = scanned.videos ?? [];
     } catch {
-      /* detection is best-effort */
+      /* path-scan is best-effort */
     }
 
     const saved = await invoke<ChatMessage>("append_chat_message", {

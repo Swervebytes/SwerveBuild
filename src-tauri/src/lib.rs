@@ -688,6 +688,13 @@ fn save_pasted_image(data_url: String) -> Result<String, String> {
     acp::save_image_base64(&data_url)
 }
 
+/// Copy picked image files into `~/.swervebuild/attachments` so the webview
+/// asset protocol can render them (S15). Non-images / oversize files are skipped.
+#[tauri::command]
+fn import_attachment_files(paths: Vec<String>) -> Result<Vec<String>, String> {
+    acp::import_attachment_files(&paths)
+}
+
 /// Scan an agent turn's text for image/video artifact paths (chat_media.rs),
 /// verify them on disk (relative → the chat's project folder), copy survivors
 /// into the attachments dir, and return the stored paths for persistence.
@@ -1411,6 +1418,7 @@ pub fn run() {
             get_chat,
             append_chat_message,
             save_pasted_image,
+            import_attachment_files,
             detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,
