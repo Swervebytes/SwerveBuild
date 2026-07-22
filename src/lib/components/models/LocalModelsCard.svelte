@@ -26,6 +26,13 @@
     engine_version: string;
     server: ServerStatus;
     models: LocalModel[];
+    /** S17 — from nvidia-smi; null when unavailable (show —). */
+    vram_total_mb?: number | null;
+    vram_used_mb?: number | null;
+    vram_source?: string;
+    model_est_vram_gb?: number | null;
+    parallel_slots?: number;
+    ctx_tokens?: number;
   };
   type EngineProgress = { phase: string; received: number; total: number };
   type FitTier = "fits" | "tight" | "too_big" | "cpu_only";
@@ -79,18 +86,27 @@
 
   onMount(() => {
     refresh();
+    // Live VRAM/leases while the settings card is open (S17).
+    const poll = setInterval(() => {
+      void refresh();
+    }, 3000);
     const offs = [
       subscribe<EngineProgress>("local-engine-progress", (ev) => {
         progress = ev.payload;
       }),
       subscribe<ServerStatus>("local-llm-status", (ev) => {
         if (local) local = { ...local, server: ev.payload };
+        // Refresh VRAM numbers after status changes.
+        void refresh();
       }),
       subscribe<ModelDownloadProgress>("local-model-download-progress", (ev) => {
         dlProgress = ev.payload;
       }),
     ];
-    return () => offs.forEach((o) => o());
+    return () => {
+      clearInterval(poll);
+      offs.forEach((o) => o());
+    };
   });
 
   async function installEngine() {
@@ -251,13 +267,107 @@
     if (f === "too_big") return "Too big";
     return "CPU only";
   }
-  function humanVram(mb: number | null): string {
+  function humanVram(mb: number | null | undefined): string {
     if (mb == null) return "GPU not detected";
     return `${(mb / 1024).toFixed(1)} GB VRAM`;
   }
+
+  function formatLease(h: string): string {
+    if (h.startsWith("chat:")) {
+      const id = h.slice(5);
+      return `Chat ${id.length > 8 ? id.slice(0, 8) + "…" : id}`;
+    }
+    if (h.startsWith("auto:")) {
+      const id = h.slice(5);
+      return `Automation ${id.length > 8 ? id.slice(0, 8) + "…" : id}`;
+    }
+    return h;
+  }
+
+  const vramKnown = $derived(
+    local != null &&
+      local.vram_total_mb != null &&
+      local.vram_total_mb > 0 &&
+      local.vram_used_mb != null,
+  );
+  const vramPct = $derived(
+    vramKnown && local
+      ? Math.min(100, Math.round(((local.vram_used_mb ?? 0) / (local.vram_total_mb ?? 1)) * 100))
+      : null,
+  );
+  const leaseList = $derived(local?.server.leases ?? []);
+  const chatLeases = $derived(leaseList.filter((h) => h.startsWith("chat:")).length);
+  const autoLeases = $derived(leaseList.filter((h) => h.startsWith("auto:")).length);
 </script>
 
 {#if local}
+  <!-- S17: live GPU / slot / lease plane (honest — when metrics missing). -->
+  <div class="resource" data-testid="local-vram-meter">
+    <div class="resource-head">
+      <span class="section-label">GPU &amp; inference slot</span>
+      <span class="sub mono-label">
+        {#if local.vram_source === "nvidia-smi"}
+          via nvidia-smi · refresh 3s
+        {:else}
+          VRAM metrics unavailable (no nvidia-smi)
+        {/if}
+      </span>
+    </div>
+
+    <div class="vram-row">
+      {#if vramKnown && vramPct != null}
+        <span class="vram-nums mono">
+          {((local.vram_used_mb ?? 0) / 1024).toFixed(1)} /
+          {((local.vram_total_mb ?? 0) / 1024).toFixed(1)} GB
+        </span>
+        <span class="vram-track" aria-hidden="true">
+          <span
+            class="vram-fill"
+            class:warn={vramPct >= 75 && vramPct < 90}
+            class:high={vramPct >= 90}
+            style="width: {vramPct}%"
+          ></span>
+        </span>
+        <span class="vram-pct mono">{vramPct}%</span>
+      {:else}
+        <span class="vram-unknown" title="Install NVIDIA drivers / nvidia-smi for live used/total VRAM"
+          >—</span
+        >
+        <span class="sub">VRAM used / total not reported</span>
+      {/if}
+    </div>
+
+    <div class="slot-row">
+      <StatusPill
+        tone={serverTone(local.server.state)}
+        label={serverLabel(local.server)}
+        pulse={local.server.state === "starting"}
+      />
+      <span class="sub mono-label">
+        {local.parallel_slots ?? 2} parallel slots · {(local.ctx_tokens ?? 32768) / 1000}k ctx
+        {#if local.model_est_vram_gb != null}
+          · catalog est. ~{local.model_est_vram_gb} GB for loaded model
+        {/if}
+      </span>
+    </div>
+
+    <div class="leases">
+      <span class="section-label soft">Holders</span>
+      {#if leaseList.length === 0}
+        <span class="sub">No active leases — slot free to swap models</span>
+      {:else}
+        <span class="sub mono-label">
+          {chatLeases} chat · {autoLeases} automation
+        </span>
+        <ul class="lease-list">
+          {#each leaseList as h (h)}
+            <li class="lease mono-label">{formatLease(h)}</li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  </div>
+
   <div class="row engine-row">
     {#if local.engine_installed}
       <StatusPill tone="success" label={`Engine ${local.engine_version}`} />
@@ -420,6 +530,101 @@
   }
   .engine-row {
     margin-bottom: 0.75rem;
+  }
+
+  .resource {
+    margin-bottom: 0.9rem;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-surface);
+  }
+  .resource-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.35rem 0.75rem;
+    margin-bottom: 0.45rem;
+  }
+  .vram-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.45rem;
+  }
+  .vram-nums {
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+  }
+  .vram-track {
+    flex: 1;
+    min-width: 4rem;
+    max-width: 12rem;
+    height: 6px;
+    border-radius: 99px;
+    background: var(--bg-muted);
+    overflow: hidden;
+  }
+  .vram-fill {
+    display: block;
+    height: 100%;
+    background: var(--sc-accent);
+    border-radius: inherit;
+    transition: width 0.25s ease;
+  }
+  .vram-fill.warn {
+    background: var(--warning, #d4a017);
+  }
+  .vram-fill.high {
+    background: var(--danger, #e25555);
+  }
+  .vram-pct {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    min-width: 2.25rem;
+    text-align: right;
+  }
+  .vram-unknown {
+    font-size: 1rem;
+    color: var(--text-faint);
+    padding: 0 0.15rem;
+  }
+  .slot-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.4rem;
+  }
+  .leases {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .section-label.soft {
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-faint);
+  }
+  .lease-list {
+    margin: 0.15rem 0 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+  .lease {
+    padding: 0.15rem 0.4rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill, 999px);
+    background: var(--bg-muted);
+    font-size: 0.6875rem;
+    color: var(--text-secondary);
   }
 
   .progress {

@@ -177,9 +177,21 @@ fn ps_quote(s: &str) -> String {
 
 /// Total VRAM in MiB from `nvidia-smi` when present (sum of GPUs).
 pub fn detect_vram_mb() -> Option<u32> {
+    detect_vram_usage().map(|u| u.total_mb)
+}
+
+/// Live VRAM snapshot from `nvidia-smi` (S17). Sums all GPUs.
+/// Returns `None` when nvidia-smi is missing or fails — callers must show honest `—`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VramUsage {
+    pub used_mb: u32,
+    pub total_mb: u32,
+}
+
+pub fn detect_vram_usage() -> Option<VramUsage> {
     let output = crate::util::hidden_command("nvidia-smi")
         .args([
-            "--query-gpu=memory.total",
+            "--query-gpu=memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -188,20 +200,36 @@ pub fn detect_vram_mb() -> Option<u32> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut used: u32 = 0;
     let mut total: u32 = 0;
     for line in stdout.lines() {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        let mb: u32 = t.parse().ok()?;
-        total = total.saturating_add(mb);
+        // "1234, 16384" or "1234,16384"
+        let mut parts = t.split(',').map(|p| p.trim());
+        let u: u32 = parts.next()?.parse().ok()?;
+        let tot: u32 = parts.next()?.parse().ok()?;
+        used = used.saturating_add(u);
+        total = total.saturating_add(tot);
     }
     if total == 0 {
         None
     } else {
-        Some(total)
+        Some(VramUsage {
+            used_mb: used,
+            total_mb: total,
+        })
     }
+}
+
+/// Catalog estimate for a loaded model id, if we know it.
+pub fn estimate_vram_gb_for_model(model_id: &str) -> Option<f32> {
+    catalog()
+        .iter()
+        .find(|e| e.id == model_id)
+        .map(|e| e.vram_gb)
 }
 
 /// Pure fit policy (unit-tested).
@@ -456,6 +484,13 @@ mod tests {
             assert!(e.url.starts_with("https://huggingface.co/"));
             assert!(e.filename.ends_with(".gguf"));
         }
+    }
+
+    #[test]
+    fn estimate_known_catalog_model() {
+        let id = catalog()[0].id;
+        assert_eq!(estimate_vram_gb_for_model(id), Some(catalog()[0].vram_gb));
+        assert!(estimate_vram_gb_for_model("not-a-real-model-id").is_none());
     }
 
     #[test]

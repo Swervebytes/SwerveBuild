@@ -1057,15 +1057,40 @@ struct LocalState {
     engine_version: String,
     server: local_llm::ServerStatus,
     models: Vec<providers::LocalModel>,
+    /// S17 resource plane — honest nulls when nvidia-smi is missing.
+    vram_total_mb: Option<u32>,
+    vram_used_mb: Option<u32>,
+    /// `"nvidia-smi"` or `"unavailable"`.
+    vram_source: String,
+    /// Catalog estimate for the loaded model, if known.
+    model_est_vram_gb: Option<f32>,
+    parallel_slots: u32,
+    ctx_tokens: u32,
 }
 
 impl LocalState {
     fn current() -> Self {
+        let server = local_llm::manager().status();
+        let usage = model_catalog::detect_vram_usage();
+        let (vram_used_mb, vram_total_mb, vram_source) = match usage {
+            Some(u) => (Some(u.used_mb), Some(u.total_mb), "nvidia-smi".to_string()),
+            None => (None, None, "unavailable".to_string()),
+        };
+        let model_est_vram_gb = server
+            .model_id
+            .as_deref()
+            .and_then(model_catalog::estimate_vram_gb_for_model);
         LocalState {
             engine_installed: local_llm::engine_installed(),
             engine_version: local_llm::ENGINE_TAG.to_string(),
-            server: local_llm::manager().status(),
+            server,
             models: providers::ProviderStore::load().local.models,
+            vram_total_mb,
+            vram_used_mb,
+            vram_source,
+            model_est_vram_gb,
+            parallel_slots: local_llm::PARALLEL_SLOTS,
+            ctx_tokens: local_llm::CTX_TOKENS,
         }
     }
 }
