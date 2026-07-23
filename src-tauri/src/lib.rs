@@ -1414,10 +1414,12 @@ fn publish_app_ui_state(state: app_ui::AppUiPublishedState) -> Result<app_ui::Ap
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Enable WebView2 remote debugging *before* any webview is created so MCP
-    // app_ui_* tools can attach CDP on localhost (grant-gated).
-    if let Err(e) = app_ui::prepare_webview_cdp() {
-        eprintln!("[swervebuild] prepare_webview_cdp: {e}");
+    // WebView2 remote debugging only when allowed (S21b): not unconditional in
+    // release. Must run before any webview is created.
+    match app_ui::prepare_webview_cdp() {
+        Ok(0) => { /* CDP off — expected in release without grant / opt-in */ }
+        Ok(port) => eprintln!("[swervebuild] CDP remote-debugging on 127.0.0.1:{port}"),
+        Err(e) => eprintln!("[swervebuild] prepare_webview_cdp: {e}"),
     }
 
     let acp = Arc::new(AcpManager::default());
