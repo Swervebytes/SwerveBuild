@@ -1,8 +1,10 @@
 mod acp;
 pub mod app_ui;
 mod app_ui_cdp;
+mod artifacts;
 pub mod browser_debug;
 mod chat_media;
+mod db;
 mod env_context;
 mod grok_config;
 mod jobs;
@@ -687,7 +689,29 @@ fn append_chat_message(
 
 #[tauri::command]
 fn save_pasted_image(data_url: String) -> Result<String, String> {
-    acp::save_image_base64(&data_url)
+    let path = acp::save_image_base64(&data_url)?;
+    artifacts::maybe_enforce_after_write();
+    Ok(path)
+}
+
+/// S23: artifact budget / per-kind usage (attachments + UI captures).
+#[tauri::command]
+fn artifact_store_status() -> artifacts::ArtifactStoreStatus {
+    artifacts::status()
+}
+
+/// S23: resync on-disk files into SQLite artifact registry.
+#[tauri::command]
+fn artifact_store_resync() -> Result<u32, String> {
+    db::init()?;
+    artifacts::resync_registry()
+}
+
+/// S23: prune oldest managed artifacts until under budget (`dry_run` = report only).
+#[tauri::command]
+fn artifact_store_prune(dry_run: Option<bool>) -> Result<artifacts::PruneResult, String> {
+    let _ = db::init();
+    artifacts::prune(dry_run.unwrap_or(true))
 }
 
 /// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
@@ -765,7 +789,9 @@ async fn generate_local_image(
 /// asset protocol can render them (S15). Non-images / oversize files are skipped.
 #[tauri::command]
 fn import_attachment_files(paths: Vec<String>) -> Result<Vec<String>, String> {
-    acp::import_attachment_files(&paths)
+    let out = acp::import_attachment_files(&paths)?;
+    artifacts::maybe_enforce_after_write();
+    Ok(out)
 }
 
 /// Scan an agent turn's text for image/video artifact paths (chat_media.rs),
@@ -1454,6 +1480,8 @@ pub fn run() {
         .manage(wf_mgr)
         .manage(term_mgr)
         .setup(move |app| {
+            // S23: SQLite skeleton + optional artifact registry (non-fatal).
+            db::init_best_effort();
             jobs::spawn_scheduler(app.handle().clone(), jobs_sched);
             workflows_tauri::spawn_scheduler(app.handle().clone(), wf_sched);
             if let Err(e) = terminal::serve(term_serve) {
@@ -1522,6 +1550,9 @@ pub fn run() {
             append_chat_message,
             save_pasted_image,
             import_attachment_files,
+            artifact_store_status,
+            artifact_store_resync,
+            artifact_store_prune,
             detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,

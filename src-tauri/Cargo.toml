@@ -1,6 +1,6 @@
 [package]
 name = "swerve-build"
-version = "0.3.9"
+version = "0.3.10"
 description = "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents"
 authors = ["Swerve Build Contributors"]
 license = "MIT"
@@ -46,3 +46,5 @@ swerve-workflows = { path = "crates/swerve-workflows" }
 # CDP client for app_ui drive (WebSocket to WebView2 remote-debugging-port).
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 ureq = { version = "2.12", features = ["json"] }
+# S23 — SQLite skeleton (artifacts now; chats migrate later). Bundled libsqlite.
+rusqlite = { version = "0.32", features = ["bundled"] }
