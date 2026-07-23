@@ -76,6 +76,12 @@ pub struct AppPreferences {
     /// ComfyUI HTTP base (S18). Models download via Comfy Manager, not Swerve.
     #[serde(default = "default_comfy_base_url")]
     pub comfy_base_url: String,
+    /// S23: max total bytes for managed artifact dirs (attachments + UI captures).
+    #[serde(default = "default_artifact_max_bytes")]
+    pub artifact_max_bytes: u64,
+    /// S23: keep at least this many newest files per artifact kind.
+    #[serde(default = "default_artifact_keep_per_kind")]
+    pub artifact_keep_per_kind: u32,
 }
 
 fn default_image_provider_id() -> String {
@@ -90,12 +96,23 @@ fn default_comfy_base_url() -> String {
     "http://127.0.0.1:8188".into()
 }
 
+/// 5 GiB default budget across managed artifact roots.
+fn default_artifact_max_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
+}
+
+fn default_artifact_keep_per_kind() -> u32 {
+    30
+}
+
 impl Default for AppPreferences {
     fn default() -> Self {
         AppPreferences {
             image_provider_id: default_image_provider_id(),
             video_provider_id: default_video_provider_id(),
             comfy_base_url: default_comfy_base_url(),
+            artifact_max_bytes: default_artifact_max_bytes(),
+            artifact_keep_per_kind: default_artifact_keep_per_kind(),
         }
     }
 }

@@ -90,6 +90,21 @@ pub fn attachments_dir() -> PathBuf {
     data_dir().join("attachments")
 }
 
+/// SQLite database (S23+). Chats remain in data.json until Phase B migration.
+pub fn db_file() -> PathBuf {
+    data_dir().join("swervebuild.db")
+}
+
+/// App UI screenshot artifacts (MCP drive).
+pub fn app_ui_artifacts_dir() -> PathBuf {
+    data_dir().join("app_ui_artifacts")
+}
+
+/// Browser debug pane capture artifacts.
+pub fn browser_debug_artifacts_dir() -> PathBuf {
+    data_dir().join("browser_debug_artifacts")
+}
+
 /// Automation definitions (triggered-agent orchestration). Separate from
 /// `data.json` so the background scheduler never races chat writes.
 pub fn automations_file() -> PathBuf {
