@@ -1,8 +1,14 @@
 //! App UI MCP surface (Roadmap Step 6) — grant, published state, CDP drive.
 //!
 //! Safety: all drive tools require the human Settings grant. CDP attaches to
-//! the main WebView2 via a localhost remote-debugging port enabled at app
-//! start (see [`prepare_webview_cdp`]).
+//! the main WebView2 via a localhost remote-debugging port when enabled
+//! (see [`prepare_webview_cdp`]).
+//!
+//! **S21b:** CDP is **not** enabled on every release launch. Unauthenticated
+//! remote-debugging + `--remote-allow-origins=*` was a privilege-boundary hole
+//! (any same-user process could Runtime.evaluate and invoke Tauri commands).
+//! Release enables CDP only with prior app_ui/browser grant or
+//! `SWERVE_ENABLE_CDP=1`. Debug builds still enable by default.
 
 use crate::app_ui_cdp;
 use serde::{Deserialize, Serialize};
@@ -175,6 +181,42 @@ fn publish_cdp_endpoint(port: u16) -> Result<AppUiCdpEndpoint, String> {
     Ok(ep)
 }
 
+/// Remove published CDP endpoint so attackers cannot use a stale port file.
+pub fn clear_cdp_endpoint() {
+    let path = cdp_path();
+    let _ = fs::remove_file(path);
+}
+
+/// Whether this process should open WebView2 remote debugging.
+///
+/// Release: off by default. On only if the human already enabled App UI or
+/// browser-agent grant (restart after toggling), or `SWERVE_ENABLE_CDP=1`.
+/// Debug: on by default; `SWERVE_DISABLE_CDP=1` forces off.
+pub fn cdp_should_enable() -> bool {
+    if std::env::var("SWERVE_DISABLE_CDP").ok().as_deref() == Some("1") {
+        return false;
+    }
+    if std::env::var("SWERVE_ENABLE_CDP").ok().as_deref() == Some("1") {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    {
+        return true;
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        // Grant files are the human opt-in. CDP cannot be started mid-run
+        // (WebView2 args are process-start only), so grant-on + restart.
+        if is_granted() {
+            return true;
+        }
+        if crate::browser_debug::load_grant().granted {
+            return true;
+        }
+        false
+    }
+}
+
 /// Whether the published CDP endpoint answers (app is up with debugging).
 pub fn drive_ready() -> bool {
     let Some(ep) = load_cdp_endpoint() else {
@@ -183,18 +225,26 @@ pub fn drive_ready() -> bool {
     app_ui_cdp::probe(&ep.host, ep.port)
 }
 
-/// Pick a free localhost port, set WebView2 browser args for remote debugging,
-/// and publish the endpoint file. Call **before** the WebView is created.
+/// Optionally enable WebView2 remote debugging and publish the endpoint file.
+/// Call **before** the WebView is created.
 ///
+/// Returns `0` when CDP is intentionally off (release default / disabled).
 /// On non-Windows targets this is a no-op (returns Ok(0)).
 pub fn prepare_webview_cdp() -> Result<u16, String> {
     #[cfg(windows)]
     {
+        if !cdp_should_enable() {
+            clear_cdp_endpoint();
+            // Ensure a previous launch's env does not leak into this process.
+            std::env::remove_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+            return Ok(0);
+        }
         let port = free_localhost_port()?;
         // Env overrides CoreWebView2EnvironmentOptions::AdditionalBrowserArguments,
         // so re-include wry's default --disable-features list.
+        // Do **not** set --remote-allow-origins=* (S21b: open origin check).
         let args = format!(
-            "--remote-debugging-port={port} --remote-allow-origins=* --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
+            "--remote-debugging-port={port} --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
         );
         // Once at process start, before any WebView threads exist.
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", &args);
@@ -203,6 +253,7 @@ pub fn prepare_webview_cdp() -> Result<u16, String> {
     }
     #[cfg(not(windows))]
     {
+        clear_cdp_endpoint();
         Ok(0)
     }
 }
@@ -221,12 +272,12 @@ fn free_localhost_port() -> Result<u16, String> {
 fn require_drive() -> Result<AppUiCdpEndpoint, String> {
     require_grant()?;
     let ep = load_cdp_endpoint().ok_or_else(|| {
-        "CDP endpoint not published. Restart SwerveBuild so it enables WebView2 remote debugging."
+        "CDP not enabled for this process. Turn on Agent UI control in Settings, then fully restart SwerveBuild (or set SWERVE_ENABLE_CDP=1)."
             .to_string()
     })?;
     if !app_ui_cdp::probe(&ep.host, ep.port) {
         return Err(format!(
-            "CDP not reachable at {}:{} (pid file claims {}). Is this SwerveBuild instance running with S08+ CDP?",
+            "CDP not reachable at {}:{} (pid file claims {}). Restart SwerveBuild after enabling Agent UI control.",
             ep.host, ep.port, ep.pid
         ));
     }
@@ -770,7 +821,7 @@ pub fn state_report() -> Value {
             s,
             s,
             s,
-            "No CDP endpoint file — app must call prepare_webview_cdp at start.",
+            "CDP off for this process (release default). Enable Agent UI control or browser agent grant, then restart — or set SWERVE_ENABLE_CDP=1.",
         )
     };
 
@@ -820,6 +871,26 @@ mod tests {
     // Serialize tests that touch the real data dir paths via env override is hard;
     // unit-test pure defaults + require_grant against default (usually false).
     static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cdp_disable_env_wins() {
+        let _g = LOCK.lock().unwrap();
+        // SAFETY: test process only; serialized by LOCK.
+        std::env::set_var("SWERVE_DISABLE_CDP", "1");
+        std::env::set_var("SWERVE_ENABLE_CDP", "1");
+        assert!(!cdp_should_enable());
+        std::env::remove_var("SWERVE_DISABLE_CDP");
+        std::env::remove_var("SWERVE_ENABLE_CDP");
+    }
+
+    #[test]
+    fn cdp_enable_env_allows() {
+        let _g = LOCK.lock().unwrap();
+        std::env::remove_var("SWERVE_DISABLE_CDP");
+        std::env::set_var("SWERVE_ENABLE_CDP", "1");
+        assert!(cdp_should_enable());
+        std::env::remove_var("SWERVE_ENABLE_CDP");
+    }
 
     #[test]
     fn default_grant_is_denied() {
