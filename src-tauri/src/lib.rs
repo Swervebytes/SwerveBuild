@@ -737,6 +737,12 @@ fn media_worker_capture_still() -> Result<media_worker::CaptureStillResult, Stri
     media_worker::capture_still()
 }
 
+/// S26: short silent MJPEG clip (from still or new capture) via FFmpeg in worker.
+#[tauri::command]
+fn media_worker_encode_clip(still_path: Option<String>) -> Result<media_worker::EncodeClipResult, String> {
+    media_worker::encode_clip(still_path)
+}
+
 /// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
 /// `prefs_only: true` skips network entirely (header summary on chat paint).
 /// Runs on a worker thread so Comfy timeouts never freeze the WebView.
@@ -1580,6 +1586,7 @@ pub fn run() {
             media_worker_start,
             media_worker_stop,
             media_worker_capture_still,
+            media_worker_encode_clip,
             detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,

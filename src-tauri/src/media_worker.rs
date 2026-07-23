@@ -345,7 +345,7 @@ fn status_locked(live: Option<&LiveWorker>, healthy: bool) -> SupervisorStatus {
                 .into()
         } else if healthy {
             format!(
-                "Media worker up (protocol v{PROTOCOL_VERSION}). Capability: still_png (primary display)."
+                "Media worker up (protocol v{PROTOCOL_VERSION}). Capabilities: still_png, clip_mjpeg."
             )
         } else {
             "Worker process present but health check failed.".into()
@@ -414,6 +414,112 @@ pub fn shutdown_on_exit() {
     let _ = stop();
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeClipResult {
+    pub ok: bool,
+    pub path: String,
+    pub bytes: u64,
+    pub duration_secs: f64,
+    pub still_path: String,
+    pub codec: String,
+}
+
+/// Capture a still (if needed) and encode a short silent clip via worker + FFmpeg.
+pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, String> {
+    let still = match still_path {
+        Some(p) if !p.trim().is_empty() => {
+            let path = PathBuf::from(p.trim());
+            if !path.is_file() {
+                return Err(format!("still not found: {}", path.display()));
+            }
+            CaptureStillResult {
+                ok: true,
+                path: path.display().to_string(),
+                bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                width: 0,
+                height: 0,
+            }
+        }
+        _ => capture_still()?,
+    };
+
+    let st = ensure_running()?;
+    if !st.healthy {
+        return Err(st
+            .last_error
+            .unwrap_or_else(|| "media worker not healthy".into()));
+    }
+    let g = LIVE.lock().map_err(|_| "media worker lock poisoned".to_string())?;
+    let live = g
+        .as_ref()
+        .ok_or_else(|| "media worker not running".to_string())?;
+    let ep = live.endpoint.clone();
+    drop(g);
+
+    let url = format!("http://{}:{}/v1/encode/clip", ep.host, ep.port);
+    let body_in = serde_json::json!({ "stillPath": still.path, "durationSecs": 2.0 });
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout(Duration::from_secs(120))
+        .build();
+    let resp = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", ep.token))
+        .set("Content-Type", "application/json")
+        .send_string(&body_in.to_string())
+        .map_err(|e| format!("encode clip: {e}"))?;
+    let body: EncodeClipResult = resp
+        .into_json()
+        .map_err(|e| format!("encode clip JSON: {e}"))?;
+    if !body.ok {
+        return Err("encode clip returned ok=false".into());
+    }
+    crate::artifacts::maybe_enforce_after_write();
+    let _ = crate::db::upsert_artifact(
+        &uuid::Uuid::new_v4().to_string(),
+        "attachment",
+        &body.path,
+        body.bytes,
+        &crate::store::Store::now(),
+        None,
+        Some("media_worker_clip"),
+    );
+    Ok(body)
+}
+
+/// Locate FFmpeg: PATH, then `~/.swervebuild/ffmpeg/ffmpeg.exe`.
+pub fn resolve_ffmpeg() -> Result<PathBuf, String> {
+    if let Ok(p) = which_ffmpeg_on_path() {
+        return Ok(p);
+    }
+    let local = crate::paths::data_dir().join("ffmpeg").join("ffmpeg.exe");
+    if local.is_file() {
+        return Ok(local);
+    }
+    Err(
+        "FFmpeg not found. Install FFmpeg on PATH (e.g. winget/scoop) or place ffmpeg.exe under ~/.swervebuild/ffmpeg/. LGPL builds preferred for shipping; PATH tools OK for personal use."
+            .into(),
+    )
+}
+
+fn which_ffmpeg_on_path() -> Result<PathBuf, String> {
+    let out = crate::util::hidden_command("where.exe")
+        .arg("ffmpeg")
+        .output()
+        .map_err(|e| format!("where ffmpeg: {e}"))?;
+    if !out.status.success() {
+        return Err("ffmpeg not on PATH".into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && Path::new(l).is_file())
+        .ok_or_else(|| "ffmpeg not on PATH".to_string())?;
+    Ok(PathBuf::from(line))
+}
+
 // ---------------------------------------------------------------------------
 // Worker process entry (used by bin/swervebuild_media.rs)
 // ---------------------------------------------------------------------------
@@ -473,7 +579,7 @@ pub fn worker_main(args: &[String]) -> i32 {
         "port": port,
         "protocol": PROTOCOL_VERSION,
         "pid": std::process::id(),
-        "capabilities": ["still_png"],
+        "capabilities": ["still_png", "clip_mjpeg"],
     });
     println!("{READY_PREFIX}{ready}");
     let _ = std::io::stdout().flush();
@@ -527,10 +633,11 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
             content_length = rest.trim().parse().unwrap_or(0);
         }
     }
-    // Drain body if any (POST may send `{}`).
+    // Drain body if any (POST may send JSON).
+    let mut body_bytes = Vec::new();
     if content_length > 0 && content_length < 1_000_000 {
-        let mut buf = vec![0u8; content_length];
-        let _ = reader.read_exact(&mut buf);
+        body_bytes.resize(content_length, 0);
+        let _ = reader.read_exact(&mut body_bytes);
     }
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -562,10 +669,46 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
             pid: std::process::id(),
             uptime_ms: uptime,
             role: "media-worker".into(),
-            capabilities: vec!["still_png".into()],
+            capabilities: vec!["still_png".into(), "clip_mjpeg".into()],
         };
         let body = serde_json::to_string(&health).unwrap_or_else(|_| "{}".into());
         let _ = write_http(&mut stream, 200, "application/json", &body);
+        return;
+    }
+
+    if method == "POST" && path == "/v1/encode/clip" {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EncodeReq {
+            still_path: Option<String>,
+            duration_secs: Option<f64>,
+        }
+        let req: EncodeReq = serde_json::from_slice(&body_bytes).unwrap_or(EncodeReq {
+            still_path: None,
+            duration_secs: Some(2.0),
+        });
+        let duration = req.duration_secs.unwrap_or(2.0).clamp(0.5, 10.0);
+        let still = match req.still_path.filter(|p| !p.trim().is_empty()) {
+            Some(p) => PathBuf::from(p),
+            None => match capture_primary_still(out_dir) {
+                Ok((p, _, _, _)) => p,
+                Err(e) => {
+                    let body = serde_json::json!({"ok": false, "error": e});
+                    let _ = write_http(&mut stream, 500, "application/json", &body.to_string());
+                    return;
+                }
+            },
+        };
+        match encode_still_mjpeg_clip(&still, out_dir, duration) {
+            Ok(result) => {
+                let s = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+                let _ = write_http(&mut stream, 200, "application/json", &s);
+            }
+            Err(e) => {
+                let body = serde_json::json!({"ok": false, "error": e});
+                let _ = write_http(&mut stream, 500, "application/json", &body.to_string());
+            }
+        }
         return;
     }
 
@@ -623,6 +766,47 @@ fn capture_primary_still(out_dir: &Path) -> Result<(PathBuf, u32, u32, u64), Str
         .map_err(|e| format!("save png: {e}"))?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     Ok((path, img.width(), img.height(), meta.len()))
+}
+
+/// Short silent clip from a still via FFmpeg MJPEG (S26) — avoids GPL x264 in app policy.
+fn encode_still_mjpeg_clip(
+    still: &Path,
+    out_dir: &Path,
+    duration_secs: f64,
+) -> Result<EncodeClipResult, String> {
+    if !still.is_file() {
+        return Err(format!("still missing: {}", still.display()));
+    }
+    let ffmpeg = resolve_ffmpeg()?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let out = out_dir.join(format!("clip-{}.avi", uuid::Uuid::new_v4()));
+    let dur = format!("{duration_secs:.2}");
+    let status = crate::util::hidden_command(&ffmpeg)
+        .args([
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            "2",
+            "-i",
+        ])
+        .arg(still.as_os_str())
+        .args(["-t", &dur, "-c:v", "mjpeg", "-q:v", "5", "-an"])
+        .arg(out.as_os_str())
+        .status()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed with {status}"));
+    }
+    let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
+    Ok(EncodeClipResult {
+        ok: true,
+        path: out.display().to_string(),
+        bytes: meta.len(),
+        duration_secs,
+        still_path: still.display().to_string(),
+        codec: "mjpeg".into(),
+    })
 }
 
 fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
