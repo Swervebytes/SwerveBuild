@@ -488,17 +488,192 @@ pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, Strin
     Ok(body)
 }
 
-/// Locate FFmpeg: PATH, then `~/.swervebuild/ffmpeg/ffmpeg.exe`.
-pub fn resolve_ffmpeg() -> Result<PathBuf, String> {
-    if let Ok(p) = which_ffmpeg_on_path() {
-        return Ok(p);
+// ---------------------------------------------------------------------------
+// Pinned FFmpeg (S27) — LGPL win64 static, tag + SHA-256 (same ritual as llama engine)
+// ---------------------------------------------------------------------------
+
+/// Pinned BtbN LGPL win64 static build (n7.1 line). Upgrade: bump all four together.
+pub const FFMPEG_TAG: &str = "n7.1-lgpl-win64";
+const FFMPEG_URL: &str =
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-lgpl-7.1.zip";
+const FFMPEG_SHA256: &str = "6c943e93c59653eb5e39b498f89f073f29874598c0c7b3dd828a21a1665d096a";
+const FFMPEG_SIZE: u64 = 139_446_530;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FfmpegStatus {
+    pub tag: String,
+    pub installed: bool,
+    pub path: Option<String>,
+    pub source: String,
+    /// Where resolve would get FFmpeg today: pin | flat | path | missing
+    pub resolve_source: String,
+}
+
+pub fn ffmpeg_install_dir() -> PathBuf {
+    crate::paths::data_dir().join("ffmpeg").join(FFMPEG_TAG)
+}
+
+pub fn ffmpeg_pinned_exe() -> PathBuf {
+    // Prefer bin/ layout after unpack; fall back to flat under tag dir.
+    let bin = ffmpeg_install_dir().join("bin").join("ffmpeg.exe");
+    if bin.is_file() {
+        return bin;
     }
-    let local = crate::paths::data_dir().join("ffmpeg").join("ffmpeg.exe");
-    if local.is_file() {
-        return Ok(local);
+    ffmpeg_install_dir().join("ffmpeg.exe")
+}
+
+pub fn ffmpeg_pinned_installed() -> bool {
+    ffmpeg_pinned_exe().is_file()
+}
+
+/// Status for Settings / agent diagnostics.
+pub fn ffmpeg_status() -> FfmpegStatus {
+    let (path, source) = match resolve_ffmpeg_no_install() {
+        Ok((p, s)) => (Some(p.display().to_string()), s),
+        Err(_) => (None, "missing".to_string()),
+    };
+    FfmpegStatus {
+        tag: FFMPEG_TAG.to_string(),
+        installed: ffmpeg_pinned_installed(),
+        path: path.clone(),
+        source: source.clone(),
+        resolve_source: source,
+    }
+}
+
+/// Download + verify + unpack the pinned LGPL FFmpeg build. Blocking.
+pub fn install_ffmpeg() -> Result<String, String> {
+    if ffmpeg_pinned_installed() {
+        return Ok(format!(
+            "FFmpeg {FFMPEG_TAG} already installed at {}",
+            ffmpeg_pinned_exe().display()
+        ));
+    }
+    let dir = ffmpeg_install_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create ffmpeg dir: {e}"))?;
+    let zip = dir.join("ffmpeg-pin.zip");
+
+    let status = crate::util::hidden_command("curl.exe")
+        .args([
+            "-L",
+            "--fail",
+            "--retry",
+            "3",
+            "-C",
+            "-",
+            "-o",
+            &zip.display().to_string(),
+            FFMPEG_URL,
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            return Err(format!(
+                "FFmpeg download failed (curl exit {:?})",
+                s.code()
+            ))
+        }
+        Err(e) => return Err(format!("could not run curl.exe: {e}")),
+    }
+
+    let got = std::fs::metadata(&zip).map(|m| m.len()).unwrap_or(0);
+    if got == 0 {
+        let _ = std::fs::remove_file(&zip);
+        return Err("FFmpeg download empty".into());
+    }
+    // Soft size check (exact size may drift if upstream re-packs; SHA is authoritative).
+    if FFMPEG_SIZE > 0 && (got as i64 - FFMPEG_SIZE as i64).unsigned_abs() > FFMPEG_SIZE / 5 {
+        // more than 20% off — still allow if SHA matches
+    }
+
+    let hash = file_sha256_ps(&zip)?;
+    if !hash.eq_ignore_ascii_case(FFMPEG_SHA256) {
+        let _ = std::fs::remove_file(&zip);
+        return Err(format!(
+            "FFmpeg checksum mismatch (got {hash}); download removed — bump pin or retry"
+        ));
+    }
+
+    // Windows 10+ tar handles zip; more reliable than Expand-Archive under CREATE_NO_WINDOW.
+    let unzip = crate::util::hidden_command("tar.exe")
+        .args([
+            "-xf",
+            &zip.display().to_string(),
+            "-C",
+            &dir.display().to_string(),
+        ])
+        .status();
+    match unzip {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(format!("FFmpeg unzip failed (tar exit {:?})", s.code())),
+        Err(e) => return Err(format!("FFmpeg unzip failed (tar: {e})")),
+    }
+    let _ = std::fs::remove_file(&zip);
+
+    // BtbN packs as ffmpeg-n7.1-.../bin/ffmpeg.exe — flatten into our tag dir.
+    if !ffmpeg_pinned_installed() {
+        if let Some(found) = find_named_file(&dir, "ffmpeg.exe") {
+            let dest_bin = dir.join("bin");
+            let _ = std::fs::create_dir_all(&dest_bin);
+            let dest = dest_bin.join("ffmpeg.exe");
+            if found != dest {
+                let _ = std::fs::copy(&found, &dest);
+            }
+            // Also copy sibling tools if present (optional).
+            if let Some(parent) = found.parent() {
+                for name in ["ffprobe.exe", "ffplay.exe"] {
+                    let src = parent.join(name);
+                    if src.is_file() {
+                        let _ = std::fs::copy(&src, dest_bin.join(name));
+                    }
+                }
+            }
+        }
+    }
+    if !ffmpeg_pinned_installed() {
+        return Err(
+            "FFmpeg unpacked but ffmpeg.exe was not found — archive layout unexpected".into(),
+        );
+    }
+    Ok(format!(
+        "FFmpeg {FFMPEG_TAG} installed ({}).",
+        ffmpeg_pinned_exe().display()
+    ))
+}
+
+/// Ensure pinned FFmpeg exists (download if needed), then resolve.
+pub fn ensure_ffmpeg() -> Result<PathBuf, String> {
+    if !ffmpeg_pinned_installed() {
+        // Prefer pin for shipping; still allow PATH/flat without download if present.
+        if resolve_ffmpeg_no_install().is_ok() {
+            return resolve_ffmpeg_no_install().map(|(p, _)| p);
+        }
+        install_ffmpeg()?;
+    }
+    resolve_ffmpeg()
+}
+
+/// Locate FFmpeg: pinned install → flat `~/.swervebuild/ffmpeg/ffmpeg.exe` → PATH.
+pub fn resolve_ffmpeg() -> Result<PathBuf, String> {
+    resolve_ffmpeg_no_install().map(|(p, _)| p)
+}
+
+fn resolve_ffmpeg_no_install() -> Result<(PathBuf, String), String> {
+    let pin = ffmpeg_pinned_exe();
+    if pin.is_file() {
+        return Ok((pin, "pin".into()));
+    }
+    let flat = crate::paths::data_dir().join("ffmpeg").join("ffmpeg.exe");
+    if flat.is_file() {
+        return Ok((flat, "flat".into()));
+    }
+    if let Ok(p) = which_ffmpeg_on_path() {
+        return Ok((p, "path".into()));
     }
     Err(
-        "FFmpeg not found. Install FFmpeg on PATH (e.g. winget/scoop) or place ffmpeg.exe under ~/.swervebuild/ffmpeg/. LGPL builds preferred for shipping; PATH tools OK for personal use."
+        "FFmpeg not found. Call media_worker_ensure_ffmpeg to download the pinned LGPL build, install FFmpeg on PATH, or place ffmpeg.exe under ~/.swervebuild/ffmpeg/."
             .into(),
     )
 }
@@ -518,6 +693,66 @@ fn which_ffmpeg_on_path() -> Result<PathBuf, String> {
         .find(|l| !l.is_empty() && Path::new(l).is_file())
         .ok_or_else(|| "ffmpeg not on PATH".to_string())?;
     Ok(PathBuf::from(line))
+}
+
+fn ps_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn file_sha256_ps(path: &Path) -> Result<String, String> {
+    // Prefer certutil (ships with Windows; quieter than PowerShell under CREATE_NO_WINDOW).
+    let path_s = path.display().to_string();
+    let cert = crate::util::hidden_command("certutil")
+        .args(["-hashfile", &path_s, "SHA256"])
+        .output()
+        .map_err(|e| format!("certutil hash: {e}"))?;
+    if cert.status.success() {
+        // Output: "SHA256 hash of <file>:\n<hex>\nCertUtil: ..."
+        let text = String::from_utf8_lossy(&cert.stdout);
+        for line in text.lines() {
+            let t = line.trim().replace(' ', "");
+            if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(t);
+            }
+        }
+    }
+    let output = crate::util::hidden_command("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash",
+                ps_quote(&path_s)
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("hash: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "hashing the FFmpeg download failed (exit {:?}): stderr={err} stdout={out}",
+            output.status.code()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(p);
+        }
+        if p.is_dir() {
+            if let Some(found) = find_named_file(&p, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +1012,8 @@ fn encode_still_mjpeg_clip(
     if !still.is_file() {
         return Err(format!("still missing: {}", still.display()));
     }
-    let ffmpeg = resolve_ffmpeg()?;
+    // S27: ensure pinned LGPL FFmpeg (or existing PATH/flat) before encode.
+    let ffmpeg = ensure_ffmpeg()?;
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let out = out_dir.join(format!("clip-{}.avi", uuid::Uuid::new_v4()));
     let dur = format!("{duration_secs:.2}");
@@ -832,6 +1068,35 @@ mod tests {
     #[test]
     fn protocol_version_is_one() {
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn ffmpeg_pin_constants_are_set() {
+        assert!(!FFMPEG_TAG.is_empty());
+        assert!(FFMPEG_URL.contains("lgpl"));
+        assert_eq!(FFMPEG_SHA256.len(), 64);
+        assert!(FFMPEG_SIZE > 1_000_000);
+    }
+
+    /// Live: download pinned LGPL FFmpeg if missing. Run with:
+    /// `cargo test -p swerve-build --lib media_worker::tests::live_install_ffmpeg_pin -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_install_ffmpeg_pin() {
+        let msg = install_ffmpeg().expect("install_ffmpeg");
+        eprintln!("{msg}");
+        assert!(ffmpeg_pinned_installed(), "pin missing after install");
+        let (path, source) = resolve_ffmpeg_no_install().expect("resolve after install");
+        assert_eq!(source, "pin");
+        assert!(path.is_file());
+        let st = crate::util::hidden_command(&path)
+            .args(["-version"])
+            .output()
+            .expect("ffmpeg -version");
+        assert!(st.status.success());
+        let ver = String::from_utf8_lossy(&st.stdout);
+        eprintln!("ffmpeg -version head: {}", ver.lines().next().unwrap_or(""));
+        assert!(ver.to_lowercase().contains("ffmpeg"), "unexpected -version output");
     }
 
     #[test]
