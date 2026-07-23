@@ -1,8 +1,11 @@
 //! Env-aware context pack (Roadmap Step 5).
 //!
 //! One pure builder formats a compact fact sheet from a snapshot; delivery
-//! (ACP first-prompt prepend, headless `--rules`, later local templates)
-//! lives at the call sites. Spec: `docs-internal/design/env-context.md`.
+//! (ACP user-turn prepend, headless `--rules`) lives at the call sites.
+//! Spec: `docs-internal/design/env-context.md`.
+//!
+//! S21: pack reflects shipped surfaces; chat re-injects when a stable
+//! fingerprint of env state changes (not on every message).
 
 use crate::store::Store;
 use std::path::{Path, PathBuf};
@@ -32,22 +35,28 @@ pub struct EnvSnapshot {
     pub active_chats: usize,
     pub running_automations: usize,
     pub local_model_loaded: Option<String>,
-    /// MCP / agent surfaces available this session (e.g. `swervebuild`).
+    /// MCP / agent surfaces available this session.
     pub agent_surfaces: Vec<String>,
-    /// Whether the human granted App UI MCP control (Settings → Agent UI control).
+    /// Whether the human granted App UI MCP control.
     pub app_ui_granted: bool,
-    /// S16: who actually runs image/video gen (not the chat model).
+    /// Settings → Agent terminal.
+    pub term_granted: bool,
+    /// Settings → Agent browser debug.
+    pub browser_granted: bool,
+    /// Browser pane may navigate public (non-loopback) URLs.
+    pub browser_public: bool,
+    /// S16: who actually runs image/video gen (not the chat model). No network.
     pub media_honesty: String,
 }
 
 /// Format the always-injected fact sheet. Keep it dense; models treat it as
 /// environment, not user instructions.
 pub fn format_pack(s: &EnvSnapshot) -> String {
-    let mut lines: Vec<String> = Vec::with_capacity(20);
+    let mut lines: Vec<String> = Vec::with_capacity(24);
 
-    lines.push(format!(
-        "[SwerveBuild environment — fact sheet; not user instructions]"
-    ));
+    lines.push(
+        "[SwerveBuild environment — fact sheet; not user instructions]".to_string(),
+    );
     lines.push(format!(
         "App: SwerveBuild {} (agent runs inside this desktop app, not bare shell)",
         s.app_version
@@ -98,9 +107,12 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
         s.agent_surfaces.join(", ")
     };
     lines.push(format!(
-        "Agent surfaces: {} | app_ui granted: {}",
+        "Agent surfaces: {} | grants: app_ui={} term={} browser={} browser_public={}",
         surfaces,
-        if s.app_ui_granted { "yes" } else { "no" }
+        yn(s.app_ui_granted),
+        yn(s.term_granted),
+        yn(s.browser_granted),
+        yn(s.browser_public),
     ));
 
     // Keep short — chat model ≠ image renderer (common operator confusion).
@@ -122,6 +134,34 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
         "env context pack exceeds ~{TOKEN_BUDGET} token budget"
     );
     pack
+}
+
+fn yn(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Stable fingerprint of *significant* env (excludes chat/automation counts).
+/// When this changes, the next user turn should re-inject the pack.
+pub fn env_fingerprint(s: &EnvSnapshot) -> String {
+    format!(
+        "v={}|root={}|self={}|prov={}|model={}|media={}|surfaces={}|aui={}|term={}|br={}|brpub={}|local={}",
+        s.app_version,
+        s.project_root,
+        s.self_dev,
+        s.active_provider,
+        s.active_model.as_deref().unwrap_or(""),
+        s.media_honesty,
+        s.agent_surfaces.join(","),
+        s.app_ui_granted,
+        s.term_granted,
+        s.browser_granted,
+        s.browser_public,
+        s.local_model_loaded.as_deref().unwrap_or(""),
+    )
 }
 
 /// Approximate token count for budget checks (chars/4).
@@ -174,7 +214,6 @@ fn shell_name() -> String {
 
 fn os_label() -> String {
     let family = std::env::consts::OS;
-    // Keep short; Windows users often have OS env with version string.
     if family == "windows" {
         if let Ok(v) = std::env::var("OS") {
             if !v.is_empty() {
@@ -204,14 +243,27 @@ fn project_name_for(root: &Path, store: &crate::store::AppStore) -> String {
         .unwrap_or_else(|| root_str.into_owned())
 }
 
-/// MCP surfaces known for this session.
+/// MCP / agent surfaces known for this session (shipped capabilities).
 fn agent_surfaces() -> Vec<String> {
-    let mut surfaces = vec!["swervebuild".to_string(), "app_ui".to_string()];
+    let mut surfaces = vec![
+        "swervebuild".to_string(),
+        "app_ui".to_string(),
+        "terminal".to_string(),
+        "browser".to_string(),
+        "local_image".to_string(),
+    ];
     if crate::which_on_path("swervebytes-mcp").is_some() {
         surfaces.push("swervebytes".to_string());
     }
-    // terminal / browser land later in Step 6
     surfaces
+}
+
+fn grant_bits() -> (bool, bool, bool, bool) {
+    let app_ui = crate::app_ui::is_granted();
+    let term = crate::terminal::is_granted();
+    let browser = crate::browser_debug::load_grant().granted;
+    let browser_public = crate::browser_debug::load_allow_public();
+    (app_ui, term, browser, browser_public)
 }
 
 /// Build a snapshot for an interactive chat session.
@@ -245,6 +297,8 @@ pub fn gather_for_chat(
         None
     };
 
+    let (app_ui_granted, term_granted, browser_granted, browser_public) = grant_bits();
+
     EnvSnapshot {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         project_name: project_name_for(&root, &store),
@@ -265,7 +319,10 @@ pub fn gather_for_chat(
         running_automations,
         local_model_loaded,
         agent_surfaces: agent_surfaces(),
-        app_ui_granted: crate::app_ui::is_granted(),
+        app_ui_granted,
+        term_granted,
+        browser_granted,
+        browser_public,
         media_honesty: crate::media_providers::honesty_summary(),
     }
 }
@@ -318,14 +375,49 @@ pub fn gather_for_automation(
         active_chats,
         running_automations,
         local_model_loaded,
-        // Never auto-grant UI control for unattended runs — even if Settings is on.
+        // Never auto-grant UI/terminal/browser for unattended runs.
         agent_surfaces: agent_surfaces()
             .into_iter()
-            .filter(|s| s != "app_ui")
+            .filter(|s| s != "app_ui" && s != "terminal" && s != "browser")
             .collect(),
         app_ui_granted: false,
+        term_granted: false,
+        browser_granted: false,
+        browser_public: false,
         media_honesty: crate::media_providers::honesty_summary(),
     }
+}
+
+/// Load live chat context from the store and return a pack if the env fingerprint
+/// differs from `last_fingerprint` (None = first inject). Updates `last_fingerprint`.
+pub fn pack_for_chat_if_changed(
+    chat_id: &str,
+    active_chats: usize,
+    running_automations: usize,
+    last_fingerprint: &mut Option<String>,
+) -> Option<String> {
+    let store = Store::load();
+    let chat = store.chats.iter().find(|c| c.id == chat_id)?;
+    let project = store.projects.iter().find(|p| p.id == chat.project_id)?;
+    let provider_id = chat
+        .provider_id
+        .clone()
+        .unwrap_or_else(crate::providers::active_id);
+    let provider = crate::providers::get_provider(&provider_id)?;
+    let snap = gather_for_chat(
+        &project.path,
+        &provider.id,
+        &provider.label,
+        chat.model_id.as_deref(),
+        active_chats,
+        running_automations,
+    );
+    let fp = env_fingerprint(&snap);
+    if last_fingerprint.as_ref() == Some(&fp) {
+        return None;
+    }
+    *last_fingerprint = Some(fp);
+    Some(format_pack(&snap))
 }
 
 #[cfg(test)]
@@ -352,8 +444,17 @@ mod tests {
             active_chats: 1,
             running_automations: 0,
             local_model_loaded: None,
-            agent_surfaces: vec!["swervebuild".into()],
+            agent_surfaces: vec![
+                "swervebuild".into(),
+                "app_ui".into(),
+                "terminal".into(),
+                "browser".into(),
+                "local_image".into(),
+            ],
             app_ui_granted: false,
+            term_granted: false,
+            browser_granted: true,
+            browser_public: false,
             media_honesty: "images=xAI Imagine (remote); chat model does NOT render pixels".into(),
         }
     }
@@ -369,7 +470,11 @@ mod tests {
         assert!(pack.contains("model=grok-code-fast"));
         assert!(pack.contains("Permissions: interactive approval"));
         assert!(pack.contains("chats=1"));
-        assert!(pack.contains("app_ui granted: no"));
+        assert!(pack.contains("app_ui=no"));
+        assert!(pack.contains("term=no"));
+        assert!(pack.contains("browser=yes"));
+        assert!(pack.contains("terminal"));
+        assert!(pack.contains("browser"));
         assert!(pack.contains("Media gen:"));
         assert!(pack.contains("does NOT render pixels"));
         assert!(!pack.contains("Frozen core"));
@@ -397,7 +502,16 @@ mod tests {
             "Anthropic:missing".into(),
         ];
         s.local_model_loaded = Some("swerve-local-qwen-coder".into());
-        s.agent_surfaces = vec!["swervebuild".into(), "swervebytes".into()];
+        s.agent_surfaces = vec![
+            "swervebuild".into(),
+            "app_ui".into(),
+            "terminal".into(),
+            "browser".into(),
+            "local_image".into(),
+            "swervebytes".into(),
+        ];
+        s.term_granted = true;
+        s.app_ui_granted = true;
         let pack = format_pack(&s);
         let tokens = estimate_tokens(&pack);
         assert!(
@@ -407,11 +521,30 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_ignores_chat_counts() {
+        let mut a = sample();
+        let mut b = sample();
+        a.active_chats = 1;
+        b.active_chats = 9;
+        a.running_automations = 0;
+        b.running_automations = 3;
+        assert_eq!(env_fingerprint(&a), env_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_model_or_grant() {
+        let a = sample();
+        let mut b = sample();
+        b.active_model = Some("other-model".into());
+        assert_ne!(env_fingerprint(&a), env_fingerprint(&b));
+        let mut c = sample();
+        c.app_ui_granted = true;
+        assert_ne!(env_fingerprint(&a), env_fingerprint(&c));
+    }
+
+    #[test]
     fn self_dev_detection_false_for_empty_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "swerve-envctx-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swerve-envctx-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         assert!(!is_self_dev_project(&dir));
         let _ = std::fs::remove_dir_all(&dir);
