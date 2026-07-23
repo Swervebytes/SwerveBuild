@@ -62,10 +62,10 @@ struct ActiveSession {
     child: Child,
     transport: Arc<SessionTransport>,
     last_accessed: Arc<AtomicU64>,
-    /// Env context pack (Step 5). Injected once on the first `session/prompt`
-    /// after spawn, then cleared. Not stored in chat history — wire-only so the
-    /// UI still shows the user's bare message.
-    env_context_pack: Mutex<Option<String>>,
+    /// Last injected env fingerprint (S21). When live env changes (model,
+    /// media provider, grants, …), the next user turn re-prepends a fresh pack.
+    /// Not stored in chat history — wire-only so the UI still shows the bare message.
+    env_fingerprint: Mutex<Option<String>>,
 }
 
 impl Default for AcpManager {
@@ -197,9 +197,9 @@ impl AcpManager {
         cwd: &str,
         chat_id: &str,
         stored_session_id: Option<&str>,
-        provider_id: &str,
-        model_id: Option<&str>,
-        running_automations: usize,
+        _provider_id: &str,
+        _model_id: Option<&str>,
+        _running_automations: usize,
     ) -> Result<String, String> {
         let mut command = crate::util::hidden_command(&launch.command);
         command
@@ -421,25 +421,14 @@ impl AcpManager {
             );
         });
 
-        // Snapshot env context at session start (Step 5). Active chat count
-        // includes this session once inserted; use list_active + 1 for spawn.
-        let active_chats = self.list_active().len() + 1;
-        let snap = crate::env_context::gather_for_chat(
-            cwd,
-            provider_id,
-            &launch.label,
-            model_id,
-            active_chats,
-            running_automations,
-        );
-        let env_pack = crate::env_context::format_pack(&snap);
-
+        // Env pack is built on send (S21) so mid-session model/media/grant
+        // changes re-inject. Fingerprint starts empty → first turn always injects.
         let mut active = ActiveSession {
             session_id: String::new(),
             child,
             transport: Arc::clone(&transport),
             last_accessed,
-            env_context_pack: Mutex::new(Some(env_pack)),
+            env_fingerprint: Mutex::new(None),
         };
 
         let agent_caps = active.transport.rpc(
@@ -577,6 +566,7 @@ impl AcpManager {
     }
 
     pub fn send_prompt(&self, chat_id: &str, text: &str, images: &[String]) -> Result<(), String> {
+        let active_chats = self.list_active().len().max(1);
         let (transport, session_id, env_pack) = {
             let mut guard = self
                 .sessions
@@ -586,11 +576,16 @@ impl AcpManager {
                 .get_mut(chat_id)
                 .ok_or_else(|| "No active session for this chat. Open the chat to connect.".to_string())?;
             active.bump_access();
-            let pack = active
-                .env_context_pack
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take());
+            // S21: re-inject when env fingerprint changes (model, media, grants, …).
+            // First turn: last fingerprint is None → always inject.
+            let pack = active.env_fingerprint.lock().ok().and_then(|mut last| {
+                crate::env_context::pack_for_chat_if_changed(
+                    chat_id,
+                    active_chats,
+                    0,
+                    &mut last,
+                )
+            });
             (
                 Arc::clone(&active.transport),
                 active.session_id.clone(),
@@ -603,9 +598,8 @@ impl AcpManager {
         // so agents that only understand prose still see the attachment.
         let mut blocks: Vec<Value> = Vec::new();
 
-        // Prepend env pack on first turn only. Delivery is a user-turn prefix
-        // because Grok ACP `session/new` does not expose a client system-prompt
-        // field we can rely on (design open item: verified via wire-prepend).
+        // Delivery is a user-turn prefix because Grok ACP `session/new` does not
+        // expose a client system-prompt field we can rely on.
         let mut body = text.trim().to_string();
         if let Some(pack) = env_pack {
             if body.is_empty() {
