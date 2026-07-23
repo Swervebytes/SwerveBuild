@@ -743,6 +743,23 @@ fn media_worker_encode_clip(still_path: Option<String>) -> Result<media_worker::
     media_worker::encode_clip(still_path)
 }
 
+/// S27: pinned LGPL FFmpeg status (tag, path, resolve source).
+#[tauri::command]
+fn media_worker_ffmpeg_status() -> media_worker::FfmpegStatus {
+    media_worker::ffmpeg_status()
+}
+
+/// S27: download + verify + unpack pinned LGPL FFmpeg if missing (blocking task).
+#[tauri::command]
+async fn media_worker_ensure_ffmpeg() -> Result<media_worker::FfmpegStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        media_worker::ensure_ffmpeg()?;
+        Ok(media_worker::ffmpeg_status())
+    })
+    .await
+    .map_err(|e| format!("ffmpeg ensure task failed: {e}"))?
+}
+
 /// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
 /// `prefs_only: true` skips network entirely (header summary on chat paint).
 /// Runs on a worker thread so Comfy timeouts never freeze the WebView.
@@ -1587,6 +1604,8 @@ pub fn run() {
             media_worker_stop,
             media_worker_capture_still,
             media_worker_encode_clip,
+            media_worker_ffmpeg_status,
+            media_worker_ensure_ffmpeg,
             detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,
