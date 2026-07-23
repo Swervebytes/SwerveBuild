@@ -1,6 +1,6 @@
 {
   "name": "swerve-build",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "description": "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents",
   "type": "module",
   "scripts": {
