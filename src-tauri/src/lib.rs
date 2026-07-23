@@ -10,6 +10,7 @@ mod grok_config;
 mod jobs;
 mod local_llm;
 pub mod local_image;
+pub mod media_worker;
 mod media_providers;
 mod model_catalog;
 pub mod paths;
@@ -712,6 +713,22 @@ fn artifact_store_resync() -> Result<u32, String> {
 fn artifact_store_prune(dry_run: Option<bool>) -> Result<artifacts::PruneResult, String> {
     let _ = db::init();
     artifacts::prune(dry_run.unwrap_or(true))
+}
+
+/// S24: media worker supervisor status (separate process shell).
+#[tauri::command]
+fn media_worker_status() -> media_worker::SupervisorStatus {
+    media_worker::status()
+}
+
+#[tauri::command]
+fn media_worker_start() -> Result<media_worker::SupervisorStatus, String> {
+    media_worker::ensure_running()
+}
+
+#[tauri::command]
+fn media_worker_stop() -> Result<media_worker::SupervisorStatus, String> {
+    media_worker::stop()
 }
 
 /// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
@@ -1553,6 +1570,9 @@ pub fn run() {
             artifact_store_status,
             artifact_store_resync,
             artifact_store_prune,
+            media_worker_status,
+            media_worker_start,
+            media_worker_stop,
             detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,
@@ -1633,6 +1653,7 @@ pub fn run() {
                 jobs_exit.cancel_all();
                 wf_exit.cancel_all();
                 term_exit.kill_all();
+                media_worker::shutdown_on_exit();
                 local_llm::manager().shutdown();
             }
         });

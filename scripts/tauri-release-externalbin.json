@@ -1,5 +1,8 @@
 {
   "bundle": {
-    "externalBin": ["binaries/swervebuild-mcp"]
+    "externalBin": [
+      "binaries/swervebuild-mcp",
+      "binaries/swervebuild-media"
+    ]
   }
 }

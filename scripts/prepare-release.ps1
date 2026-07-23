@@ -28,16 +28,25 @@ try {
     cargo build --release --bins
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit $LASTEXITCODE" }
 
+    $binDir = Join-Path $tauri "binaries"
+    New-Item -Force -ItemType Directory $binDir | Out-Null
+
     $mcpSrc = Join-Path $tauri "target\release\swervebuild-mcp.exe"
     if (-not (Test-Path $mcpSrc)) {
         throw "Missing $mcpSrc"
     }
-
-    $binDir = Join-Path $tauri "binaries"
-    New-Item -Force -ItemType Directory $binDir | Out-Null
     $mcpDest = Join-Path $binDir "swervebuild-mcp-$triple.exe"
     Copy-Item $mcpSrc $mcpDest -Force
     Write-Host "Staged sidecar: $mcpDest" -ForegroundColor Green
+
+    # S24 media worker process (health shell; capture later).
+    $mediaSrc = Join-Path $tauri "target\release\swervebuild-media.exe"
+    if (-not (Test-Path $mediaSrc)) {
+        throw "Missing $mediaSrc"
+    }
+    $mediaDest = Join-Path $binDir "swervebuild-media-$triple.exe"
+    Copy-Item $mediaSrc $mediaDest -Force
+    Write-Host "Staged media worker: $mediaDest" -ForegroundColor Green
     Pop-Location
 
     Write-Host "Running Tauri bundle (externalBin via overlay, conf untouched)..." -ForegroundColor Cyan

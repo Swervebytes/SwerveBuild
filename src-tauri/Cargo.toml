@@ -1,6 +1,6 @@
 [package]
 name = "swerve-build"
-version = "0.3.10"
+version = "0.3.11"
 description = "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents"
 authors = ["Swerve Build Contributors"]
 license = "MIT"
@@ -19,6 +19,11 @@ path = "src/bin/swervebuild_mcp.rs"
 [[bin]]
 name = "swervebuild-workflow"
 path = "src/bin/swervebuild_workflow.rs"
+
+# S24 — supervised media process (health shell; capture/encode later).
+[[bin]]
+name = "swervebuild-media"
+path = "src/bin/swervebuild_media.rs"
 
 [workspace]
 members = ["crates/swerve-workflows"]
