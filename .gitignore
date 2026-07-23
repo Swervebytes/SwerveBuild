@@ -27,3 +27,6 @@ Thumbs.db
 # Never commit user/runtime data
 *.auth.json
 **/data.json
+
+# Local dev scratch scripts (CDP diagnostics, live smoke, etc.)
+scripts/_*.py
