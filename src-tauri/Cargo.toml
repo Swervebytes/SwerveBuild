@@ -1,6 +1,6 @@
 [package]
 name = "swerve-build"
-version = "0.3.11"
+version = "0.3.12"
 description = "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents"
 authors = ["Swerve Build Contributors"]
 license = "MIT"
@@ -53,3 +53,6 @@ tungstenite = { version = "0.24", default-features = false, features = ["handsha
 ureq = { version = "2.12", features = ["json"] }
 # S23 — SQLite skeleton (artifacts now; chats migrate later). Bundled libsqlite.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# S25 — display still capture inside media worker process.
+xcap = "0.0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }

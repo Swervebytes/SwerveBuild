@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -173,9 +173,13 @@ pub fn ensure_running() -> Result<SupervisorStatus, String> {
 
     let bin = resolve_worker_binary()?;
     let token = uuid::Uuid::new_v4().to_string();
+    let out_dir = crate::paths::attachments_dir();
+    let _ = std::fs::create_dir_all(&out_dir);
     let mut child = crate::util::hidden_command(&bin)
         .arg("--token")
         .arg(&token)
+        .arg("--out-dir")
+        .arg(out_dir.as_os_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -337,16 +341,72 @@ fn status_locked(live: Option<&LiveWorker>, healthy: bool) -> SupervisorStatus {
         }),
         last_error: err,
         note: if live.is_none() {
-            "Worker not running. Call media_worker_start (shell only — no capture yet)."
+            "Worker not running. Call media_worker_start (S25: still capture available when up)."
                 .into()
         } else if healthy {
             format!(
-                "Media worker up (protocol v{PROTOCOL_VERSION}). Capabilities empty until capture lands."
+                "Media worker up (protocol v{PROTOCOL_VERSION}). Capability: still_png (primary display)."
             )
         } else {
             "Worker process present but health check failed.".into()
         },
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStillResult {
+    pub ok: bool,
+    pub path: String,
+    pub bytes: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Ensure worker is up, capture primary display to attachments as PNG.
+pub fn capture_still() -> Result<CaptureStillResult, String> {
+    let st = ensure_running()?;
+    if !st.healthy {
+        return Err(st
+            .last_error
+            .unwrap_or_else(|| "media worker not healthy".into()));
+    }
+    let g = LIVE.lock().map_err(|_| "media worker lock poisoned".to_string())?;
+    let live = g
+        .as_ref()
+        .ok_or_else(|| "media worker not running".to_string())?;
+    let ep = live.endpoint.clone();
+    drop(g);
+
+    let url = format!("http://{}:{}/v1/capture/still", ep.host, ep.port);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout(Duration::from_secs(30))
+        .build();
+    let resp = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", ep.token))
+        .set("Content-Type", "application/json")
+        .send_string("{}")
+        .map_err(|e| format!("capture still: {e}"))?;
+    let body: CaptureStillResult = resp
+        .into_json()
+        .map_err(|e| format!("capture still JSON: {e}"))?;
+    if !body.ok {
+        return Err("capture still returned ok=false".into());
+    }
+    // Budget enforcement after large binary write.
+    crate::artifacts::maybe_enforce_after_write();
+    let _ = crate::db::upsert_artifact(
+        &uuid::Uuid::new_v4().to_string(),
+        "attachment",
+        &body.path,
+        body.bytes,
+        &crate::store::Store::now(),
+        None,
+        Some("media_worker_still"),
+    );
+    Ok(body)
 }
 
 /// Kill worker on app exit.
@@ -360,14 +420,20 @@ pub fn shutdown_on_exit() {
 
 static WORKER_START: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Run the media worker main loop (blocks). Args: `--token <uuid>`.
+/// Run the media worker main loop (blocks).
+/// Args: `--token <uuid> --out-dir <path>`
 pub fn worker_main(args: &[String]) -> i32 {
     let mut token = None::<String>;
+    let mut out_dir = None::<PathBuf>;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--token" if i + 1 < args.len() => {
                 token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--out-dir" if i + 1 < args.len() => {
+                out_dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             other => {
@@ -377,9 +443,14 @@ pub fn worker_main(args: &[String]) -> i32 {
         }
     }
     let Some(token) = token.filter(|t| !t.is_empty()) else {
-        eprintln!("usage: swervebuild-media --token <uuid>");
+        eprintln!("usage: swervebuild-media --token <uuid> --out-dir <path>");
         return 2;
     };
+    let out_dir = out_dir.unwrap_or_else(|| std::env::temp_dir().join("swerve-media-out"));
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("out-dir: {e}");
+        return 1;
+    }
 
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
@@ -402,16 +473,19 @@ pub fn worker_main(args: &[String]) -> i32 {
         "port": port,
         "protocol": PROTOCOL_VERSION,
         "pid": std::process::id(),
+        "capabilities": ["still_png"],
     });
     println!("{READY_PREFIX}{ready}");
     let _ = std::io::stdout().flush();
 
+    let out_dir = std::sync::Arc::new(out_dir);
     let running = AtomicBool::new(true);
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let tok = token.clone();
-                thread::spawn(move || handle_client(stream, &tok));
+                let dir = std::sync::Arc::clone(&out_dir);
+                thread::spawn(move || handle_client(stream, &tok, &dir));
             }
             Err(e) => {
                 eprintln!("accept: {e}");
@@ -422,14 +496,15 @@ pub fn worker_main(args: &[String]) -> i32 {
     0
 }
 
-fn handle_client(mut stream: TcpStream, token: &str) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).ok().unwrap_or(0) == 0 {
         return;
     }
     let mut auth = None::<String>;
+    let mut content_length = 0usize;
     let mut headers = String::new();
     loop {
         headers.clear();
@@ -445,6 +520,17 @@ fn handle_client(mut stream: TcpStream, token: &str) {
         {
             auth = Some(rest.trim().to_string());
         }
+        if let Some(rest) = headers
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+        {
+            content_length = rest.trim().parse().unwrap_or(0);
+        }
+    }
+    // Drain body if any (POST may send `{}`).
+    if content_length > 0 && content_length < 1_000_000 {
+        let mut buf = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut buf);
     }
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -476,17 +562,38 @@ fn handle_client(mut stream: TcpStream, token: &str) {
             pid: std::process::id(),
             uptime_ms: uptime,
             role: "media-worker".into(),
-            capabilities: vec![],
+            capabilities: vec!["still_png".into()],
         };
         let body = serde_json::to_string(&health).unwrap_or_else(|_| "{}".into());
         let _ = write_http(&mut stream, 200, "application/json", &body);
         return;
     }
 
+    if method == "POST" && path == "/v1/capture/still" {
+        match capture_primary_still(out_dir) {
+            Ok((path, width, height, bytes)) => {
+                let body = CaptureStillResult {
+                    ok: true,
+                    path: path.display().to_string(),
+                    bytes,
+                    width,
+                    height,
+                };
+                let s = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
+                let _ = write_http(&mut stream, 200, "application/json", &s);
+            }
+            Err(e) => {
+                let body = serde_json::json!({"ok": false, "error": e});
+                let s = body.to_string();
+                let _ = write_http(&mut stream, 500, "application/json", &s);
+            }
+        }
+        return;
+    }
+
     if method == "POST" && path == "/v1/shutdown" {
         let body = r#"{"ok":true}"#;
         let _ = write_http(&mut stream, 200, "application/json", body);
-        // Exit process shortly after reply.
         thread::spawn(|| {
             thread::sleep(Duration::from_millis(50));
             std::process::exit(0);
@@ -496,6 +603,26 @@ fn handle_client(mut stream: TcpStream, token: &str) {
 
     let body = r#"{"ok":false,"error":"not_found"}"#;
     let _ = write_http(&mut stream, 404, "application/json", body);
+}
+
+/// Capture the primary monitor into `out_dir` as PNG (S25).
+fn capture_primary_still(out_dir: &Path) -> Result<(PathBuf, u32, u32, u64), String> {
+    use xcap::Monitor;
+    let monitors = Monitor::all().map_err(|e| format!("list monitors: {e}"))?;
+    let mon = monitors
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no monitors found".to_string())?;
+    let img = mon
+        .capture_image()
+        .map_err(|e| format!("capture_image: {e}"))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let name = format!("still-{}.png", uuid::Uuid::new_v4());
+    let path = out_dir.join(&name);
+    img.save(&path)
+        .map_err(|e| format!("save png: {e}"))?;
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    Ok((path, img.width(), img.height(), meta.len()))
 }
 
 fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {

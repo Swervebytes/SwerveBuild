@@ -731,6 +731,12 @@ fn media_worker_stop() -> Result<media_worker::SupervisorStatus, String> {
     media_worker::stop()
 }
 
+/// S25: primary-display still PNG via media worker → attachments dir.
+#[tauri::command]
+fn media_worker_capture_still() -> Result<media_worker::CaptureStillResult, String> {
+    media_worker::capture_still()
+}
+
 /// `refresh: true` forces a fresh Comfy probe (Probe button). Default uses cache.
 /// `prefs_only: true` skips network entirely (header summary on chat paint).
 /// Runs on a worker thread so Comfy timeouts never freeze the WebView.
@@ -1573,6 +1579,7 @@ pub fn run() {
             media_worker_status,
             media_worker_start,
             media_worker_stop,
+            media_worker_capture_still,
             detect_chat_media,
             start_chat_session,
             list_active_chat_sessions,
