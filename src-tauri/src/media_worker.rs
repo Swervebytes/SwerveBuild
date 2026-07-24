@@ -1,7 +1,8 @@
-//! Media worker process shell (S24 / Step 7 start).
+//! Media worker process shell (S24+ / Step 7).
 //!
-//! Separate process so future capture/encode crashes never take down chat.
-//! This session: **health + supervise only** — no capture, encode, or stream.
+//! Separate process so capture/encode crashes never take down chat.
+//! Still PNG + short MJPEG clip (S25–S26); pinned LGPL FFmpeg (S27); **optional
+//! dshow audio track on clip** (S28 — WASAPI not in the pinned LGPL build).
 //!
 //! IPC: loopback HTTP, versioned path `/v1/*`, Bearer token (same idea as
 //! terminal control server). Endpoint published under data dir.
@@ -345,7 +346,7 @@ fn status_locked(live: Option<&LiveWorker>, healthy: bool) -> SupervisorStatus {
                 .into()
         } else if healthy {
             format!(
-                "Media worker up (protocol v{PROTOCOL_VERSION}). Capabilities: still_png, clip_mjpeg."
+                "Media worker up (protocol v{PROTOCOL_VERSION}). Capabilities: still_png, clip_mjpeg, clip_audio."
             )
         } else {
             "Worker process present but health check failed.".into()
@@ -423,9 +424,23 @@ pub struct EncodeClipResult {
     pub duration_secs: f64,
     pub still_path: String,
     pub codec: String,
+    /// True when an audio track was muxed into the clip.
+    #[serde(default)]
+    pub has_audio: bool,
+    /// dshow device name used, if any.
+    #[serde(default)]
+    pub audio_device: Option<String>,
+    /// `dshow` | `silent` (more sources later if the pin gains wasapi).
+    #[serde(default = "default_audio_mode_label")]
+    pub audio_mode: String,
 }
 
-/// Capture a still (if needed) and encode a short silent clip via worker + FFmpeg.
+fn default_audio_mode_label() -> String {
+    "silent".into()
+}
+
+/// Capture a still (if needed) and encode a short clip via worker + FFmpeg.
+/// Audio: auto dshow mic when available; silent fallback (S28).
 pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, String> {
     let still = match still_path {
         Some(p) if !p.trim().is_empty() => {
@@ -458,7 +473,12 @@ pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, Strin
     drop(g);
 
     let url = format!("http://{}:{}/v1/encode/clip", ep.host, ep.port);
-    let body_in = serde_json::json!({ "stillPath": still.path, "durationSecs": 2.0 });
+    // audio: "auto" tries dshow capture; falls back to silent inside worker.
+    let body_in = serde_json::json!({
+        "stillPath": still.path,
+        "durationSecs": 2.0,
+        "audio": "auto",
+    });
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
         .timeout(Duration::from_secs(120))
@@ -814,7 +834,7 @@ pub fn worker_main(args: &[String]) -> i32 {
         "port": port,
         "protocol": PROTOCOL_VERSION,
         "pid": std::process::id(),
-        "capabilities": ["still_png", "clip_mjpeg"],
+        "capabilities": ["still_png", "clip_mjpeg", "clip_audio"],
     });
     println!("{READY_PREFIX}{ready}");
     let _ = std::io::stdout().flush();
@@ -904,7 +924,11 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
             pid: std::process::id(),
             uptime_ms: uptime,
             role: "media-worker".into(),
-            capabilities: vec!["still_png".into(), "clip_mjpeg".into()],
+            capabilities: vec![
+                "still_png".into(),
+                "clip_mjpeg".into(),
+                "clip_audio".into(),
+            ],
         };
         let body = serde_json::to_string(&health).unwrap_or_else(|_| "{}".into());
         let _ = write_http(&mut stream, 200, "application/json", &body);
@@ -917,12 +941,24 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
         struct EncodeReq {
             still_path: Option<String>,
             duration_secs: Option<f64>,
+            /// `auto` (default) | `none` | `dshow`
+            audio: Option<String>,
+            /// Optional exact DirectShow audio device name.
+            audio_device: Option<String>,
         }
         let req: EncodeReq = serde_json::from_slice(&body_bytes).unwrap_or(EncodeReq {
             still_path: None,
             duration_secs: Some(2.0),
+            audio: Some("auto".into()),
+            audio_device: None,
         });
         let duration = req.duration_secs.unwrap_or(2.0).clamp(0.5, 10.0);
+        let audio_pref = req
+            .audio
+            .as_deref()
+            .unwrap_or("auto")
+            .trim()
+            .to_ascii_lowercase();
         let still = match req.still_path.filter(|p| !p.trim().is_empty()) {
             Some(p) => PathBuf::from(p),
             None => match capture_primary_still(out_dir) {
@@ -934,7 +970,13 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
                 }
             },
         };
-        match encode_still_mjpeg_clip(&still, out_dir, duration) {
+        match encode_still_mjpeg_clip(
+            &still,
+            out_dir,
+            duration,
+            &audio_pref,
+            req.audio_device.as_deref(),
+        ) {
             Ok(result) => {
                 let s = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
                 let _ = write_http(&mut stream, 200, "application/json", &s);
@@ -1003,11 +1045,14 @@ fn capture_primary_still(out_dir: &Path) -> Result<(PathBuf, u32, u32, u64), Str
     Ok((path, img.width(), img.height(), meta.len()))
 }
 
-/// Short silent clip from a still via FFmpeg MJPEG (S26) — avoids GPL x264 in app policy.
+/// Short clip from a still via FFmpeg MJPEG (S26) + optional dshow audio (S28).
+/// Avoids GPL x264; pinned build has dshow but not wasapi.
 fn encode_still_mjpeg_clip(
     still: &Path,
     out_dir: &Path,
     duration_secs: f64,
+    audio_pref: &str,
+    audio_device: Option<&str>,
 ) -> Result<EncodeClipResult, String> {
     if !still.is_file() {
         return Err(format!("still missing: {}", still.display()));
@@ -1017,23 +1062,39 @@ fn encode_still_mjpeg_clip(
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let out = out_dir.join(format!("clip-{}.avi", uuid::Uuid::new_v4()));
     let dur = format!("{duration_secs:.2}");
-    let status = crate::util::hidden_command(&ffmpeg)
-        .args([
-            "-y",
-            "-loop",
-            "1",
-            "-framerate",
-            "2",
-            "-i",
-        ])
-        .arg(still.as_os_str())
-        .args(["-t", &dur, "-c:v", "mjpeg", "-q:v", "5", "-an"])
-        .arg(out.as_os_str())
-        .status()
-        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
-    if !status.success() {
-        return Err(format!("ffmpeg failed with {status}"));
+
+    let want_audio = !matches!(audio_pref, "none" | "off" | "silent" | "an");
+    let device = if want_audio {
+        resolve_dshow_audio_device(&ffmpeg, audio_device)
+    } else {
+        None
+    };
+
+    if let Some(ref dev) = device {
+        match run_ffmpeg_clip(&ffmpeg, still, &out, &dur, Some(dev.as_str())) {
+            Ok(()) => {
+                let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
+                return Ok(EncodeClipResult {
+                    ok: true,
+                    path: out.display().to_string(),
+                    bytes: meta.len(),
+                    duration_secs,
+                    still_path: still.display().to_string(),
+                    codec: "mjpeg+pcm_s16le".into(),
+                    has_audio: true,
+                    audio_device: Some(dev.clone()),
+                    audio_mode: "dshow".into(),
+                });
+            }
+            Err(e) => {
+                // Device busy / open failed → silent path (acceptance: silent still works).
+                eprintln!("media clip audio encode failed ({e}); falling back to silent");
+                let _ = std::fs::remove_file(&out);
+            }
+        }
     }
+
+    run_ffmpeg_clip(&ffmpeg, still, &out, &dur, None)?;
     let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
     Ok(EncodeClipResult {
         ok: true,
@@ -1042,7 +1103,133 @@ fn encode_still_mjpeg_clip(
         duration_secs,
         still_path: still.display().to_string(),
         codec: "mjpeg".into(),
+        has_audio: false,
+        audio_device: None,
+        audio_mode: "silent".into(),
     })
+}
+
+fn run_ffmpeg_clip(
+    ffmpeg: &Path,
+    still: &Path,
+    out: &Path,
+    duration: &str,
+    dshow_audio: Option<&str>,
+) -> Result<(), String> {
+    let mut cmd = crate::util::hidden_command(ffmpeg);
+    cmd.args(["-y", "-loop", "1", "-framerate", "2", "-i"])
+        .arg(still.as_os_str());
+    if let Some(dev) = dshow_audio {
+        // DirectShow audio input (pinned LGPL has dshow; no wasapi demuxer).
+        let input = format!("audio={dev}");
+        cmd.args(["-f", "dshow", "-i", &input]);
+        cmd.args([
+            "-t",
+            duration,
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "5",
+            "-c:a",
+            "pcm_s16le",
+            "-shortest",
+        ]);
+    } else {
+        cmd.args(["-t", duration, "-c:v", "mjpeg", "-q:v", "5", "-an"]);
+    }
+    cmd.arg(out.as_os_str());
+    let status = cmd
+        .status()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed with {status}"));
+    }
+    Ok(())
+}
+
+/// Pick a DirectShow audio capture device (explicit name or auto).
+fn resolve_dshow_audio_device(ffmpeg: &Path, explicit: Option<&str>) -> Option<String> {
+    if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(name.to_string());
+    }
+    let devices = list_dshow_audio_devices(ffmpeg).unwrap_or_default();
+    pick_dshow_audio_device(&devices)
+}
+
+/// Parse `ffmpeg -list_devices true -f dshow -i dummy` stderr for `(audio)` lines.
+pub fn parse_dshow_audio_devices(ffmpeg_stderr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in ffmpeg_stderr.lines() {
+        // Example: [dshow @ ...] "Microphone (Realtek)" (audio)
+        let Some(q0) = line.find('"') else {
+            continue;
+        };
+        let rest = &line[q0 + 1..];
+        let Some(q1) = rest.find('"') else {
+            continue;
+        };
+        let name = &rest[..q1];
+        let after = rest[q1 + 1..].to_ascii_lowercase();
+        if after.contains("(audio)") {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn list_dshow_audio_devices(ffmpeg: &Path) -> Result<Vec<String>, String> {
+    let output = crate::util::hidden_command(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .output()
+        .map_err(|e| format!("list dshow devices: {e}"))?;
+    // dshow always "fails" opening dummy; names are on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(parse_dshow_audio_devices(&stderr))
+}
+
+/// Prefer desktop-loopback-ish names, then real mics, then first device.
+/// Deprioritize virtual/cable noise sources when better options exist.
+pub fn pick_dshow_audio_device(devices: &[String]) -> Option<String> {
+    if devices.is_empty() {
+        return None;
+    }
+    let score = |name: &str| -> i32 {
+        let n = name.to_ascii_lowercase();
+        let mut s = 0i32;
+        if n.contains("stereo mix")
+            || n.contains("what u hear")
+            || n.contains("wave out mix")
+            || n.contains("loopback")
+            || n.contains("desktop")
+        {
+            s += 100;
+        }
+        if n.contains("microphone") || n.contains("mic ") || n.starts_with("mic") {
+            s += 50;
+        }
+        if n.contains("line ") || n.contains("line (") || n.contains("audiobox") {
+            s += 40;
+        }
+        if n.contains("headset") || n.contains("headphone") {
+            s += 30;
+        }
+        if n.contains("virtual") || n.contains("voicemod") || n.contains("cable") {
+            s -= 20;
+        }
+        s
+    };
+    devices
+        .iter()
+        .max_by_key(|d| score(d))
+        .cloned()
 }
 
 fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
@@ -1118,5 +1305,99 @@ mod tests {
     #[test]
     fn ready_prefix_stable() {
         assert!(READY_PREFIX.starts_with("SWERVE_MEDIA_READY"));
+    }
+
+    #[test]
+    fn parse_dshow_audio_devices_extracts_audio_only() {
+        let sample = r#"
+[dshow @ 0] "Camera (NVIDIA Broadcast)" (video)
+[dshow @ 0] "Microphone (Realtek(R) Audio)" (audio)
+[dshow @ 0] "Line (AudioBox Go)" (audio)
+[dshow @ 0] "Meld Studio Virtual Camera" (none)
+"#;
+        let devs = parse_dshow_audio_devices(sample);
+        assert_eq!(
+            devs,
+            vec![
+                "Microphone (Realtek(R) Audio)".to_string(),
+                "Line (AudioBox Go)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pick_dshow_prefers_loopback_then_mic_over_virtual() {
+        let devices = vec![
+            "CABLE Output (VB-Audio Virtual Cable)".into(),
+            "Microphone (Voicemod Virtual Audio Device (WDM))".into(),
+            "Microphone (Realtek(R) Audio)".into(),
+        ];
+        let pick = pick_dshow_audio_device(&devices).unwrap();
+        assert_eq!(pick, "Microphone (Realtek(R) Audio)");
+
+        let with_mix = vec![
+            "Microphone (Realtek(R) Audio)".into(),
+            "Stereo Mix (Realtek(R) Audio)".into(),
+        ];
+        assert_eq!(
+            pick_dshow_audio_device(&with_mix).unwrap(),
+            "Stereo Mix (Realtek(R) Audio)"
+        );
+
+        assert!(pick_dshow_audio_device(&[]).is_none());
+    }
+
+    #[test]
+    fn encode_clip_result_defaults_audio_fields() {
+        let raw = r#"{"ok":true,"path":"x.avi","bytes":1,"durationSecs":2.0,"stillPath":"s.png","codec":"mjpeg"}"#;
+        let r: EncodeClipResult = serde_json::from_str(raw).unwrap();
+        assert!(!r.has_audio);
+        assert!(r.audio_device.is_none());
+        assert_eq!(r.audio_mode, "silent");
+    }
+
+    /// Live: still + auto dshow audio (or silent fallback). Run with:
+    /// `cargo test -p swerve-build --lib media_worker::tests::live_encode_clip_audio -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_encode_clip_audio() {
+        let ffmpeg = ensure_ffmpeg().expect("ffmpeg");
+        let dir = std::env::temp_dir().join("swerve_s28_audio_smoke");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let still = dir.join("still.png");
+        let st = crate::util::hidden_command(&ffmpeg)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:d=1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&still)
+            .status()
+            .expect("make still");
+        assert!(st.success());
+
+        let with_audio =
+            encode_still_mjpeg_clip(&still, &dir, 2.0, "auto", None).expect("auto encode");
+        eprintln!(
+            "auto: has_audio={} mode={} device={:?} path={} bytes={}",
+            with_audio.has_audio,
+            with_audio.audio_mode,
+            with_audio.audio_device,
+            with_audio.path,
+            with_audio.bytes
+        );
+        assert!(PathBuf::from(&with_audio.path).is_file());
+
+        let silent =
+            encode_still_mjpeg_clip(&still, &dir, 2.0, "none", None).expect("silent encode");
+        assert!(!silent.has_audio);
+        assert_eq!(silent.audio_mode, "silent");
+        assert!(PathBuf::from(&silent.path).is_file());
+        eprintln!("silent ok bytes={}", silent.bytes);
     }
 }
