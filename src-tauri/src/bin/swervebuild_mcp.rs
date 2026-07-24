@@ -318,6 +318,35 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["prompt"]
             }),
         },
+        // --- Media worker hero path (S29): still + short clip via MCP ---
+        ToolDef {
+            name: "media_status".into(),
+            description: "Media worker + pinned FFmpeg status (running/healthy, capabilities still_png/clip_mjpeg/clip_audio, ffmpeg path). Does not require App UI grant.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "media_capture_still".into(),
+            description: "Capture the primary display to a PNG via the media worker (starts worker if needed). Returns path under ~/.swervebuild/attachments (or project swerve-media/ if project_id set). Hero-proof step 1.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Optional Swerve project id — also copy PNG into <project>/swerve-media/" }
+                }
+            }),
+        },
+        ToolDef {
+            name: "media_encode_clip".into(),
+            description: "Encode a short MJPEG clip (default 2s) from a still or a fresh display capture. Audio: auto dshow when available, silent fallback. Returns path, hasAudio, audioMode, codec. Optional project_id copies into <project>/swerve-media/. Hero-proof step 2.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "still_path": { "type": "string", "description": "Existing still PNG path; omit to capture first" },
+                    "duration_secs": { "type": "number", "description": "Clip length 0.5–10 (default 2)" },
+                    "audio": { "type": "string", "description": "auto | none | dshow (default auto)" },
+                    "project_id": { "type": "string", "description": "Optional project id — copy clip into <project>/swerve-media/" }
+                }
+            }),
+        },
     ]
 }
 
@@ -685,6 +714,36 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                 height.unwrap_or(512),
             )?;
             Ok(json!({ "path": path, "provider": "comfyui" }))
+        }
+        "media_status" | "swervebuild_media_status" => {
+            Ok(swerve_build_lib::media_worker::agent_status_report())
+        }
+        "media_capture_still" | "swervebuild_media_capture_still" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str());
+            let body = swerve_build_lib::media_worker::capture_still_opts(project_id)?;
+            Ok(serde_json::to_value(body).unwrap_or_else(|_| json!({ "ok": false })))
+        }
+        "media_encode_clip" | "swervebuild_media_encode_clip" => {
+            let still_path = args
+                .get("still_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let duration = args
+                .get("duration_secs")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(2.0);
+            let audio = args
+                .get("audio")
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto");
+            let project_id = args.get("project_id").and_then(|v| v.as_str());
+            let body = swerve_build_lib::media_worker::encode_clip_opts(
+                still_path,
+                duration,
+                audio,
+                project_id,
+            )?;
+            Ok(serde_json::to_value(body).unwrap_or_else(|_| json!({ "ok": false })))
         }
         _ => Err(format!("Unknown tool: {name}")),
     }
