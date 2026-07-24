@@ -81,6 +81,77 @@ fn clear_endpoint_file() {
     let _ = std::fs::remove_file(endpoint_path());
 }
 
+fn load_endpoint_file() -> Option<WorkerEndpoint> {
+    let path = endpoint_path();
+    if !path.is_file() {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+/// Prefer this process's worker, then a healthy endpoint published by the app
+/// (or another supervisor), else spawn our own. Lets MCP drive media without
+/// fighting a second worker when the desktop app is already up.
+fn resolve_endpoint() -> Result<WorkerEndpoint, String> {
+    if let Ok(g) = LIVE.lock() {
+        if let Some(live) = g.as_ref() {
+            if http_get_health(&live.endpoint).is_ok() {
+                return Ok(live.endpoint.clone());
+            }
+        }
+    }
+    if let Some(ep) = load_endpoint_file() {
+        if http_get_health(&ep).is_ok() {
+            return Ok(ep);
+        }
+    }
+    let st = ensure_running()?;
+    if !st.healthy {
+        return Err(st
+            .last_error
+            .unwrap_or_else(|| "media worker not healthy".into()));
+    }
+    let g = LIVE.lock().map_err(|_| "media worker lock poisoned".to_string())?;
+    g.as_ref()
+        .map(|l| l.endpoint.clone())
+        .ok_or_else(|| "media worker not running after ensure".into())
+}
+
+/// Copy a media file into `<project>/swerve-media/` (hero-proof project artifact).
+pub fn copy_to_project(src: &str, project_id: &str) -> Result<String, String> {
+    let id = project_id.trim();
+    if id.is_empty() {
+        return Err("project_id empty".into());
+    }
+    if id.contains("..") || id.contains('/') || id.contains('\\') {
+        return Err("invalid project_id".into());
+    }
+    let store = crate::store::Store::load();
+    let project = store
+        .projects
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| format!("project not found: {id}"))?;
+    let root = PathBuf::from(&project.path);
+    if !root.is_dir() {
+        return Err(format!("project path missing: {}", root.display()));
+    }
+    let dest_dir = root.join("swerve-media");
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("create swerve-media: {e}"))?;
+    let src_path = PathBuf::from(src);
+    if !src_path.is_file() {
+        return Err(format!("source missing: {src}"));
+    }
+    let name = src_path
+        .file_name()
+        .ok_or_else(|| "source has no file name".to_string())?;
+    let dest = dest_dir.join(name);
+    std::fs::copy(&src_path, &dest).map_err(|e| format!("copy to project: {e}"))?;
+    Ok(dest.display().to_string())
+}
+
 fn set_err(msg: impl Into<String>) {
     if let Ok(mut g) = LAST_ERR.lock() {
         *g = Some(msg.into());
@@ -366,19 +437,12 @@ pub struct CaptureStillResult {
 
 /// Ensure worker is up, capture primary display to attachments as PNG.
 pub fn capture_still() -> Result<CaptureStillResult, String> {
-    let st = ensure_running()?;
-    if !st.healthy {
-        return Err(st
-            .last_error
-            .unwrap_or_else(|| "media worker not healthy".into()));
-    }
-    let g = LIVE.lock().map_err(|_| "media worker lock poisoned".to_string())?;
-    let live = g
-        .as_ref()
-        .ok_or_else(|| "media worker not running".to_string())?;
-    let ep = live.endpoint.clone();
-    drop(g);
+    capture_still_opts(None)
+}
 
+/// Capture still; optional `project_id` also copies PNG into `<project>/swerve-media/`.
+pub fn capture_still_opts(project_id: Option<&str>) -> Result<CaptureStillResult, String> {
+    let ep = resolve_endpoint()?;
     let url = format!("http://{}:{}/v1/capture/still", ep.host, ep.port);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
@@ -390,11 +454,14 @@ pub fn capture_still() -> Result<CaptureStillResult, String> {
         .set("Content-Type", "application/json")
         .send_string("{}")
         .map_err(|e| format!("capture still: {e}"))?;
-    let body: CaptureStillResult = resp
+    let mut body: CaptureStillResult = resp
         .into_json()
         .map_err(|e| format!("capture still JSON: {e}"))?;
     if !body.ok {
         return Err("capture still returned ok=false".into());
+    }
+    if let Some(pid) = project_id.map(str::trim).filter(|s| !s.is_empty()) {
+        body.path = copy_to_project(&body.path, pid)?;
     }
     // Budget enforcement after large binary write.
     crate::artifacts::maybe_enforce_after_write();
@@ -442,6 +509,24 @@ fn default_audio_mode_label() -> String {
 /// Capture a still (if needed) and encode a short clip via worker + FFmpeg.
 /// Audio: auto dshow mic when available; silent fallback (S28).
 pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, String> {
+    encode_clip_opts(still_path, 2.0, "auto", None)
+}
+
+/// Encode options for MCP / hero path (S29).
+/// `audio`: `auto` | `none` | `dshow`. Optional `project_id` copies clip to project.
+pub fn encode_clip_opts(
+    still_path: Option<String>,
+    duration_secs: f64,
+    audio: &str,
+    project_id: Option<&str>,
+) -> Result<EncodeClipResult, String> {
+    let duration = duration_secs.clamp(0.5, 10.0);
+    let audio = if audio.trim().is_empty() {
+        "auto"
+    } else {
+        audio.trim()
+    };
+
     let still = match still_path {
         Some(p) if !p.trim().is_empty() => {
             let path = PathBuf::from(p.trim());
@@ -459,25 +544,12 @@ pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, Strin
         _ => capture_still()?,
     };
 
-    let st = ensure_running()?;
-    if !st.healthy {
-        return Err(st
-            .last_error
-            .unwrap_or_else(|| "media worker not healthy".into()));
-    }
-    let g = LIVE.lock().map_err(|_| "media worker lock poisoned".to_string())?;
-    let live = g
-        .as_ref()
-        .ok_or_else(|| "media worker not running".to_string())?;
-    let ep = live.endpoint.clone();
-    drop(g);
-
+    let ep = resolve_endpoint()?;
     let url = format!("http://{}:{}/v1/encode/clip", ep.host, ep.port);
-    // audio: "auto" tries dshow capture; falls back to silent inside worker.
     let body_in = serde_json::json!({
         "stillPath": still.path,
-        "durationSecs": 2.0,
-        "audio": "auto",
+        "durationSecs": duration,
+        "audio": audio,
     });
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
@@ -489,11 +561,14 @@ pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, Strin
         .set("Content-Type", "application/json")
         .send_string(&body_in.to_string())
         .map_err(|e| format!("encode clip: {e}"))?;
-    let body: EncodeClipResult = resp
+    let mut body: EncodeClipResult = resp
         .into_json()
         .map_err(|e| format!("encode clip JSON: {e}"))?;
     if !body.ok {
         return Err("encode clip returned ok=false".into());
+    }
+    if let Some(pid) = project_id.map(str::trim).filter(|s| !s.is_empty()) {
+        body.path = copy_to_project(&body.path, pid)?;
     }
     crate::artifacts::maybe_enforce_after_write();
     let _ = crate::db::upsert_artifact(
@@ -506,6 +581,26 @@ pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, Strin
         Some("media_worker_clip"),
     );
     Ok(body)
+}
+
+/// Combined status for agents (worker + FFmpeg).
+pub fn agent_status_report() -> serde_json::Value {
+    let worker = status();
+    let ff = ffmpeg_status();
+    serde_json::json!({
+        "workerRunning": worker.running,
+        "workerHealthy": worker.healthy,
+        "workerNote": worker.note,
+        "workerError": worker.last_error,
+        "capabilities": ["still_png", "clip_mjpeg", "clip_audio"],
+        "ffmpeg": {
+            "tag": ff.tag,
+            "installed": ff.installed,
+            "path": ff.path,
+            "resolveSource": ff.resolve_source,
+        },
+        "attachmentsDir": crate::paths::attachments_dir().display().to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,6 +1449,21 @@ mod tests {
         assert!(!r.has_audio);
         assert!(r.audio_device.is_none());
         assert_eq!(r.audio_mode, "silent");
+    }
+
+    #[test]
+    fn copy_to_project_rejects_traversal_ids() {
+        assert!(copy_to_project("x.png", "../evil").is_err());
+        assert!(copy_to_project("x.png", "a/b").is_err());
+        assert!(copy_to_project("x.png", "").is_err());
+    }
+
+    #[test]
+    fn agent_status_report_has_capabilities() {
+        let v = agent_status_report();
+        let caps = v.get("capabilities").and_then(|c| c.as_array()).unwrap();
+        assert!(caps.iter().any(|c| c.as_str() == Some("clip_audio")));
+        assert!(v.get("ffmpeg").is_some());
     }
 
     /// Live: still + auto dshow audio (or silent fallback). Run with:

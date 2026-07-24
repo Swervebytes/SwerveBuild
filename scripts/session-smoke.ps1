@@ -191,6 +191,26 @@ function Invoke-McpSmoke {
 }
 
 function Invoke-MediaSmoke {
+    # Prefer MCP hero path when installed MCP is new enough; fall back to cargo live test.
+    $mcp = $null
+    try {
+        $app = Resolve-SwerveAppExe -Override $AppExe
+        $mcp = Resolve-SwerveMcpExe -Override $McpExe -AppPath $app
+    } catch { }
+
+    if ($mcp -and (Test-Path -LiteralPath $mcp)) {
+        Write-Step "Media smoke via MCP ($mcp)" "Cyan"
+        # Release install may lag the branch; if tools unknown, fall through to cargo.
+        $env:SWERVE_MCP_EXE = $mcp
+        $pyScript = Join-Path $PSScriptRoot "session-smoke-mcp.py"
+        & python $pyScript --profile media
+        if ($LASTEXITCODE -eq 0) {
+            Write-Step "Media MCP smoke OK" "Green"
+            return
+        }
+        Write-Step "Media MCP smoke failed (exit $LASTEXITCODE); trying cargo live test..." "Yellow"
+    }
+
     Write-Step "Media smoke: live_encode_clip_audio (ignored cargo test)" "Cyan"
     Push-Location $root
     try {

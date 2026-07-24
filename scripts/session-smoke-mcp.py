@@ -144,6 +144,14 @@ CORE_STEPS: list[tuple[str, dict, float]] = [
     ("app_ui_screenshot", {}, 25),
 ]
 
+# S29 hero path — no App UI grant required; may start media worker.
+MEDIA_STEPS: list[tuple[str, dict, float]] = [
+    ("media_status", {}, 15),
+    ("media_capture_still", {}, 45),
+    ("media_encode_clip", {"audio": "auto", "duration_secs": 2}, 120),
+    ("media_encode_clip", {"audio": "none", "duration_secs": 1}, 90),
+]
+
 # Deeper drive (type/press) — optional; can leave dirty settings field if fail mid-way.
 DEEP_STEPS: list[tuple[str, dict, float]] = [
     ("app_ui_click", {"selector": "a[href='/settings']"}, 25),
@@ -160,9 +168,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="SwerveBuild MCP session smoke")
     ap.add_argument(
         "--profile",
-        choices=("core", "deep"),
+        choices=("core", "deep", "media", "full"),
         default="core",
-        help="core = status/nav/screenshot; deep adds type into settings",
+        help="core = UI; media = still+clip; deep = UI type; full = core+media",
     )
     args = ap.parse_args()
     mcp = resolve_mcp()
@@ -170,9 +178,13 @@ def main() -> int:
         print(f"FAIL: MCP binary not found: {mcp}", file=sys.stderr)
         return 2
 
-    steps = list(CORE_STEPS)
+    steps: list[tuple[str, dict, float]] = []
+    if args.profile in ("core", "deep", "full"):
+        steps.extend(CORE_STEPS)
     if args.profile == "deep":
         steps.extend(DEEP_STEPS)
+    if args.profile in ("media", "full"):
+        steps.extend(MEDIA_STEPS)
 
     print(f"MCP: {mcp}")
     print(f"profile: {args.profile} ({len(steps)} steps)")
