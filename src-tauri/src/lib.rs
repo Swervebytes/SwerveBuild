@@ -737,7 +737,8 @@ fn media_worker_capture_still() -> Result<media_worker::CaptureStillResult, Stri
     media_worker::capture_still()
 }
 
-/// S26: short silent MJPEG clip (from still or new capture) via FFmpeg in worker.
+/// S26/S28: short MJPEG clip (from still or new capture) via FFmpeg in worker.
+/// Audio: auto dshow when a device is available; silent fallback.
 #[tauri::command]
 fn media_worker_encode_clip(still_path: Option<String>) -> Result<media_worker::EncodeClipResult, String> {
     media_worker::encode_clip(still_path)
