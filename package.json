@@ -12,6 +12,7 @@
     "test:e2e": "powershell -NoProfile -ExecutionPolicy Bypass -File ./test-e2e.ps1",
     "release": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/prepare-release.ps1",
     "install:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-local.ps1",
+    "smoke:session": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/session-smoke.ps1",
     "version:check": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bump-version.ps1 -CheckOnly",
     "version:bump": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bump-version.ps1",
     "version:set": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/bump-version.ps1 -Set",

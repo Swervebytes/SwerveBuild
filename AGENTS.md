@@ -21,3 +21,4 @@ Read `.github/REPOSITORY_POLICY.md` before any git push or release.
 - Dev: `npm run tauri dev` (not raw `target/debug/*.exe`)
 - Release: `npm run release` → NSIS installer under `src-tauri/target/release/bundle/nsis/`
 - **Local ship (session-close):** if the desktop app changed, run `npm run install:local` so the installed app matches this session. Optional: `npm run install:local -- -Bump patch` (or `minor` / `major`) first. Versions must stay in sync across `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` (`npm run version:check`).
+- **Live smoke (session-close HARD):** after install (or when UI/MCP/media changed), run `npm run smoke:session` (minimized app + MCP/CDP + optional media encode; auto-quit). Do not close green on red smoke. Docs-only: `npm run smoke:session -- -Profile docs`.
