@@ -60,6 +60,40 @@
   let browserSaving = $state(false);
   let browserMessage = $state<string | null>(null);
 
+  // S31: calm screen-capture entry (still + short clip) — human path, not MCP-only.
+  type FfmpegStatus = {
+    tag: string;
+    installed: boolean;
+    path: string | null;
+    source: string;
+    resolveSource: string;
+  };
+  type CaptureStillResult = {
+    ok: boolean;
+    path: string;
+    bytes: number;
+    width: number;
+    height: number;
+  };
+  type EncodeClipResult = {
+    ok: boolean;
+    path: string;
+    bytes: number;
+    durationSecs: number;
+    stillPath: string;
+    codec: string;
+    hasAudio?: boolean;
+    audioDevice?: string | null;
+    audioMode?: string;
+  };
+  let ffmpegStatus = $state<FfmpegStatus | null>(null);
+  let mediaBusy = $state(false);
+  let mediaMessage = $state<string | null>(null);
+  let mediaError = $state(false);
+  let lastStillPath = $state<string | null>(null);
+  let lastClipPath = $state<string | null>(null);
+  let lastClipHasAudio = $state<boolean | null>(null);
+
   const themeOptions: { value: ThemePref; label: string; icon: IconName }[] = [
     { value: "system", label: "System", icon: "settings" },
     { value: "light", label: "Light", icon: "sun" },
@@ -109,7 +143,73 @@
       browserGranted = false;
       browserAllowPublic = false;
     }
+    await refreshFfmpegStatus();
   });
+
+  async function refreshFfmpegStatus() {
+    try {
+      ffmpegStatus = await invoke<FfmpegStatus>("media_worker_ffmpeg_status");
+    } catch {
+      ffmpegStatus = null;
+    }
+  }
+
+  async function captureStill() {
+    mediaBusy = true;
+    mediaMessage = null;
+    mediaError = false;
+    try {
+      const r = await invoke<CaptureStillResult>("media_worker_capture_still");
+      lastStillPath = r.path;
+      mediaMessage = `Still saved (${r.width}×${r.height})`;
+    } catch (e) {
+      mediaError = true;
+      mediaMessage = String(e);
+    } finally {
+      mediaBusy = false;
+    }
+  }
+
+  async function encodeClip() {
+    mediaBusy = true;
+    mediaMessage = null;
+    mediaError = false;
+    try {
+      const r = await invoke<EncodeClipResult>("media_worker_encode_clip", {
+        stillPath: lastStillPath,
+      });
+      lastClipPath = r.path;
+      lastClipHasAudio = !!r.hasAudio;
+      const audioNote = r.hasAudio
+        ? `audio: ${r.audioDevice ?? r.audioMode ?? "yes"}`
+        : "silent";
+      mediaMessage = `Clip saved (${audioNote})`;
+    } catch (e) {
+      mediaError = true;
+      mediaMessage = String(e);
+    } finally {
+      mediaBusy = false;
+      await refreshFfmpegStatus();
+    }
+  }
+
+  async function ensureFfmpeg() {
+    mediaBusy = true;
+    mediaMessage = null;
+    mediaError = false;
+    try {
+      ffmpegStatus = await invoke<FfmpegStatus>("media_worker_ensure_ffmpeg");
+      mediaMessage = ffmpegStatus?.path
+        ? `FFmpeg ready (${ffmpegStatus.resolveSource})`
+        : "FFmpeg install finished";
+    } catch (e) {
+      mediaError = true;
+      mediaMessage = String(e);
+    } finally {
+      mediaBusy = false;
+      await refreshFfmpegStatus();
+    }
+  }
 
   async function setAppUiGrant(next: boolean) {
     appUiSaving = true;
@@ -328,6 +428,73 @@
       <MediaPicker />
       <span class="media-hint mono-label">Also in the chat header next to agent model</span>
     </div>
+  </section>
+
+  <section class="card" data-testid="media-capture-section">
+    <div class="group-head">
+      <h2 class="group-title">Screen capture</h2>
+      <StatusPill
+        tone={ffmpegStatus?.path || ffmpegStatus?.installed ? "success" : "muted"}
+        label={ffmpegStatus?.path || ffmpegStatus?.installed ? "FFmpeg ready" : "FFmpeg"}
+      />
+    </div>
+    <p class="group-note">
+      Capture the primary display and encode a short clip (about 2s). Files land under
+      <code>~/.swervebuild/attachments</code>. Agents can do the same via
+      <code>media_capture_still</code> / <code>media_encode_clip</code>. Audio uses a system
+      device when available; otherwise the clip is silent.
+    </p>
+    <div class="capture-actions" data-testid="media-capture-actions">
+      <button
+        class="btn btn-sm"
+        type="button"
+        data-testid="media-capture-still"
+        disabled={mediaBusy}
+        onclick={captureStill}
+      >
+        {mediaBusy ? "Working…" : "Capture still"}
+      </button>
+      <button
+        class="btn btn-sm"
+        type="button"
+        data-testid="media-encode-clip"
+        disabled={mediaBusy}
+        onclick={encodeClip}
+      >
+        Short clip
+      </button>
+      {#if !ffmpegStatus?.path && !ffmpegStatus?.installed}
+        <button
+          class="btn btn-sm btn-ghost"
+          type="button"
+          data-testid="media-ensure-ffmpeg"
+          disabled={mediaBusy}
+          onclick={ensureFfmpeg}
+        >
+          Install FFmpeg
+        </button>
+      {/if}
+    </div>
+    {#if ffmpegStatus?.path}
+      <p class="grok-path mono-label" data-testid="media-ffmpeg-status">
+        FFmpeg ({ffmpegStatus.resolveSource}): {ffmpegStatus.path}
+      </p>
+    {/if}
+    {#if lastStillPath}
+      <p class="grok-path mono-label" data-testid="media-last-still">Still: {lastStillPath}</p>
+    {/if}
+    {#if lastClipPath}
+      <p class="grok-path mono-label" data-testid="media-last-clip">
+        Clip: {lastClipPath}{lastClipHasAudio === true
+          ? " · audio"
+          : lastClipHasAudio === false
+            ? " · silent"
+            : ""}
+      </p>
+    {/if}
+    {#if mediaMessage}
+      <p class="ep-msg" class:error={mediaError} data-testid="media-capture-msg">{mediaMessage}</p>
+    {/if}
   </section>
 
   <section class="card">
@@ -798,6 +965,12 @@
   }
   .media-hint {
     color: var(--text-faint);
+  }
+  .capture-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
   }
   .ids-block {
     margin-top: 1rem;

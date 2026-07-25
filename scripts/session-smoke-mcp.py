@@ -138,6 +138,9 @@ CORE_STEPS: list[tuple[str, dict, float]] = [
     ("app_ui_screenshot", {}, 25),
     ("app_ui_click", {"selector": "a[href='/settings']"}, 25),
     ("app_ui_wait", {"condition": "route:/settings", "timeout_ms": 8000}, 20),
+    # S31: calm Screen capture entry visible in Settings
+    ("app_ui_wait", {"condition": "[data-testid='media-capture-section']", "timeout_ms": 5000}, 20),
+    ("app_ui_wait", {"condition": "[data-testid='media-capture-still']", "timeout_ms": 3000}, 15),
     ("app_ui_state", {}, 15),
     ("app_ui_click", {"selector": "a[href='/']"}, 25),
     ("app_ui_wait", {"condition": "route:/", "timeout_ms": 8000}, 20),
