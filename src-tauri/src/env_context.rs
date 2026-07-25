@@ -114,6 +114,13 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
         yn(s.browser_granted),
         yn(s.browser_public),
     ));
+    // S30: make still+clip MCP tools discoverable in the always-on fact sheet.
+    if s.agent_surfaces.iter().any(|x| x == "media") {
+        lines.push(
+            "Media capture MCP (no App UI grant): media_status, media_capture_still, media_encode_clip (audio auto|none; optional project_id → <project>/swerve-media/)."
+                .to_string(),
+        );
+    }
 
     // Keep short — chat model ≠ image renderer (common operator confusion).
     if !s.media_honesty.is_empty() {
@@ -250,6 +257,7 @@ fn agent_surfaces() -> Vec<String> {
         "app_ui".to_string(),
         "terminal".to_string(),
         "browser".to_string(),
+        "media".to_string(), // S29+: media_status / media_capture_still / media_encode_clip
         "local_image".to_string(),
     ];
     if crate::which_on_path("swervebytes-mcp").is_some() {
@@ -449,6 +457,7 @@ mod tests {
                 "app_ui".into(),
                 "terminal".into(),
                 "browser".into(),
+                "media".into(),
                 "local_image".into(),
             ],
             app_ui_granted: false,
@@ -475,6 +484,9 @@ mod tests {
         assert!(pack.contains("browser=yes"));
         assert!(pack.contains("terminal"));
         assert!(pack.contains("browser"));
+        assert!(pack.contains("media"));
+        assert!(pack.contains("media_capture_still"));
+        assert!(pack.contains("media_encode_clip"));
         assert!(pack.contains("Media gen:"));
         assert!(pack.contains("does NOT render pixels"));
         assert!(!pack.contains("Frozen core"));
@@ -507,6 +519,7 @@ mod tests {
             "app_ui".into(),
             "terminal".into(),
             "browser".into(),
+            "media".into(),
             "local_image".into(),
             "swervebytes".into(),
         ];
