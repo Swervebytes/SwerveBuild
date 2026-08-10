@@ -30,3 +30,6 @@ Thumbs.db
 
 # Local dev scratch scripts (CDP diagnostics, live smoke, etc.)
 scripts/_*.py
+
+# Hero-proof / capture artifacts copied under the project (S30)
+/swerve-media/
