@@ -336,13 +336,13 @@ fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "media_encode_clip".into(),
-            description: "Encode a short MJPEG clip (default 2s) from a still or a fresh display capture. Audio: auto dshow when available, silent fallback. Returns path, hasAudio, audioMode, codec. Optional project_id copies into <project>/swerve-media/. Hero-proof step 2.".into(),
+            description: "Record a short screen clip (default 2s) to H.264 MP4 (NVENC, software fallback). Audio: desktop/system audio via WASAPI loopback when available, else a capture device, else silent. Returns path, hasAudio, audioMode (wasapi|dshow|silent), codec. Optional project_id copies into <project>/swerve-media/. Hero-proof step 2.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "still_path": { "type": "string", "description": "Existing still PNG path; omit to capture first" },
                     "duration_secs": { "type": "number", "description": "Clip length 0.5–10 (default 2)" },
-                    "audio": { "type": "string", "description": "auto | none | dshow (default auto)" },
+                    "audio": { "type": "string", "description": "auto | none | wasapi (desktop audio) | dshow (mic/capture device). Default auto = wasapi, then dshow, then silent." },
                     "project_id": { "type": "string", "description": "Optional project id — copy clip into <project>/swerve-media/" }
                 }
             }),
