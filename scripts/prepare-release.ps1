@@ -65,9 +65,19 @@ try {
     Write-Host "`nRelease artifacts: src-tauri/target/release/bundle/" -ForegroundColor Green
     if (Test-Path -LiteralPath $installer) {
         Write-Host "Installer: $installer" -ForegroundColor Green
+        # P3.4: ship unsigned -> the published SHA-256 is how users verify the
+        # download (README "SmartScreen" section). Emit it next to the installer
+        # so the release upload is a two-file copy, no manual hashing step.
+        $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+        $shaFile = "$installer.sha256"
+        # Standard sha256sum format: "<hash> *<filename>".
+        "$hash *Swerve Build_${version}_x64-setup.exe" | Set-Content -LiteralPath $shaFile -Encoding ascii
+        Write-Host "SHA-256:   $hash" -ForegroundColor Green
+        Write-Host "Checksum file: $shaFile (upload alongside the installer)" -ForegroundColor Green
     }
     Write-Host "Local install:  npm run install:local" -ForegroundColor DarkGray
     Write-Host "Tag path (after main is clean + CI green): git tag -a v$version -m `"v$version`"; git push origin main --tags" -ForegroundColor DarkGray
+    Write-Host "Full ritual: docs-internal/RELEASING.md" -ForegroundColor DarkGray
 } finally {
     Pop-Location
 }
