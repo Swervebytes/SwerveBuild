@@ -105,7 +105,8 @@ export type ProviderStatus = {
 
 export type PermissionRequest = {
   chatId: string;
-  requestId: number;
+  /** JSON-RPC id, round-tripped verbatim — ACP peers may use string ids (B9). */
+  requestId: number | string;
   params: {
     sessionId?: string;
     toolCall?: { title?: string; kind?: string; toolCallId?: string };
