@@ -89,11 +89,52 @@ pub(crate) fn which_on_path(command: &str) -> Option<PathBuf> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    let candidates: Vec<PathBuf> = stdout
         .lines()
-        .next()
         .map(|line| PathBuf::from(line.trim()))
         .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+
+    #[cfg(windows)]
+    {
+        // S37: npm installs BOTH an extensionless Unix shell script and a
+        // Windows shim (`.cmd`), and `where` lists the script FIRST. Spawning
+        // that script fails with "%1 is not a valid Win32 application"
+        // (os error 193) — which is exactly how the freshly-installed
+        // claude-code-acp / gemini providers died despite reporting "Available".
+        // Always prefer a genuinely executable extension.
+        if let Some(exe) = candidates.iter().find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat" | "com"))
+                .unwrap_or(false)
+        }) {
+            return Some(exe.clone());
+        }
+    }
+
+    candidates.into_iter().next()
+}
+
+/// Pick the spawnable path from `where` output (Windows prefers .cmd/.exe over
+/// npm's extensionless shell script). Split out so it is testable without PATH.
+#[cfg(windows)]
+pub(crate) fn prefer_executable(lines: &str) -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = lines
+        .lines()
+        .map(|l| PathBuf::from(l.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    candidates
+        .iter()
+        .find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat" | "com"))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn grok_version_at(path: &Path) -> Option<String> {
@@ -1406,6 +1447,175 @@ fn set_term_grant(granted: bool) -> Result<terminal::TermGrant, String> {
     terminal::set_granted(granted)
 }
 
+// ---- provider CLI install (S37) ----------------------------------------------
+
+/// Is npm on PATH, and where? `npm` is a `.cmd` shim on Windows, so it must be
+/// invoked through the shell rather than spawned directly.
+fn npm_version() -> Option<String> {
+    let out = if cfg!(windows) {
+        crate::util::hidden_command("cmd")
+            .args(["/C", "npm --version"])
+            .output()
+            .ok()?
+    } else {
+        crate::util::hidden_command("npm").arg("--version").output().ok()?
+    };
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// What the Providers UI needs to render install controls honestly.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderInstallInfo {
+    /// False for Grok (self-managed) and the HTTP rows.
+    installable: bool,
+    package: Option<String>,
+    version: Option<String>,
+    docs: Option<String>,
+    /// Shown verbatim so what the user copies is what we would have run.
+    install_command: Option<String>,
+    uninstall_command: Option<String>,
+    /// None when npm is missing — the UI disables the button and explains.
+    npm_version: Option<String>,
+    installed: bool,
+}
+
+#[tauri::command]
+fn provider_install_info(id: String) -> ProviderInstallInfo {
+    let cli = providers::installable_for(&id);
+    let installed = providers::provider_status(&id).installed;
+    match cli {
+        Some(c) => ProviderInstallInfo {
+            installable: true,
+            package: Some(c.package.to_string()),
+            version: Some(c.version.to_string()),
+            docs: Some(c.docs.to_string()),
+            install_command: Some(c.install_command()),
+            uninstall_command: Some(c.uninstall_command()),
+            npm_version: npm_version(),
+            installed,
+        },
+        None => ProviderInstallInfo {
+            installable: false,
+            package: None,
+            version: None,
+            docs: None,
+            install_command: None,
+            uninstall_command: None,
+            npm_version: npm_version(),
+            installed,
+        },
+    }
+}
+
+fn run_npm(command: &str) -> Result<String, String> {
+    let out = if cfg!(windows) {
+        crate::util::hidden_command("cmd")
+            .args(["/C", command])
+            .output()
+            .map_err(|e| format!("spawn npm: {e}"))?
+    } else {
+        crate::util::hidden_command("sh")
+            .args(["-c", command])
+            .output()
+            .map_err(|e| format!("spawn npm: {e}"))?
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(if stdout.is_empty() { stderr } else { stdout })
+    } else {
+        // npm puts the useful part on stderr.
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+/// Install a provider's CLI at the pinned version.
+#[tauri::command]
+async fn install_provider_cli(id: String) -> CommandResult {
+    let Some(cli) = providers::installable_for(&id) else {
+        return CommandResult {
+            success: false,
+            message: format!("{id} has no managed install."),
+        };
+    };
+    if npm_version().is_none() {
+        return CommandResult {
+            success: false,
+            message: format!(
+                "npm not found on PATH. Install Node.js, then run:\n{}",
+                cli.install_command()
+            ),
+        };
+    }
+    let cmd = cli.install_command();
+    match tauri::async_runtime::spawn_blocking(move || run_npm(&cmd)).await {
+        Ok(Ok(_)) => {
+            let ok = providers::provider_status(&id).installed;
+            CommandResult {
+                success: ok,
+                message: if ok {
+                    format!("{}@{} installed.", cli.package, cli.version)
+                } else {
+                    // npm succeeded but the binary is not resolvable — usually a
+                    // PATH that the app process has not picked up yet.
+                    format!(
+                        "{}@{} installed, but its command is not on this app's PATH yet — restart Swerve Build.",
+                        cli.package, cli.version
+                    )
+                },
+            }
+        }
+        Ok(Err(e)) => CommandResult {
+            success: false,
+            message: format!("npm install failed: {e}"),
+        },
+        Err(e) => CommandResult {
+            success: false,
+            message: format!("install task failed: {e}"),
+        },
+    }
+}
+
+/// Remove a provider's CLI. The UI confirms (naming the exact command) first.
+#[tauri::command]
+async fn uninstall_provider_cli(id: String) -> CommandResult {
+    let Some(cli) = providers::installable_for(&id) else {
+        return CommandResult {
+            success: false,
+            message: format!("{id} has no managed install."),
+        };
+    };
+    if npm_version().is_none() {
+        return CommandResult {
+            success: false,
+            message: format!(
+                "npm not found on PATH. To remove it by hand:\n{}",
+                cli.uninstall_command()
+            ),
+        };
+    }
+    let cmd = cli.uninstall_command();
+    match tauri::async_runtime::spawn_blocking(move || run_npm(&cmd)).await {
+        Ok(Ok(_)) => CommandResult {
+            success: true,
+            message: format!("{} removed.", cli.package),
+        },
+        Ok(Err(e)) => CommandResult {
+            success: false,
+            message: format!("npm uninstall failed: {e}"),
+        },
+        Err(e) => CommandResult {
+            success: false,
+            message: format!("uninstall task failed: {e}"),
+        },
+    }
+}
+
 // ---- secrets (S36): write-and-forget only ------------------------------------
 //
 // There is deliberately NO `secret_get` command. Every registered command is
@@ -1695,6 +1905,9 @@ pub fn run() {
             secret_status,
             secret_delete,
             stream_key_name,
+            provider_install_info,
+            install_provider_cli,
+            uninstall_provider_cli,
             set_browser_debug_grant,
             set_browser_public,
             browser_pane_set_bounds,
@@ -1735,6 +1948,38 @@ pub fn run() {
 #[cfg(test)]
 mod grok_install_tests {
     use super::*;
+
+    /// S37 regression: npm ships an extensionless Unix script alongside the
+    /// Windows `.cmd`, and `where` lists the script first. Spawning it gives
+    /// "%1 is not a valid Win32 application" (os error 193) — the exact failure
+    /// that made freshly-installed claude-code-acp / gemini unusable while the
+    /// UI still said "Available".
+    #[cfg(windows)]
+    #[test]
+    fn prefers_windows_shim_over_npm_shell_script() {
+        let npm_style = "C:\\Users\\x\\AppData\\Roaming\\npm\\claude-code-acp\n\
+             C:\\Users\\x\\AppData\\Roaming\\npm\\claude-code-acp.cmd\n\
+             C:\\Users\\x\\AppData\\Roaming\\npm\\claude-code-acp.ps1\n";
+        let picked = prefer_executable(npm_style).unwrap();
+        assert_eq!(
+            picked.extension().and_then(|e| e.to_str()),
+            Some("cmd"),
+            "must pick the .cmd shim, got {picked:?}"
+        );
+
+        // A plain .exe on PATH is still chosen.
+        let exe_only = "C:\\tools\\grok.exe\n";
+        assert_eq!(
+            prefer_executable(exe_only).unwrap().extension().and_then(|e| e.to_str()),
+            Some("exe")
+        );
+
+        // No executable extension anywhere → fall back to the first line
+        // rather than returning nothing.
+        let none = "C:\\tools\\weird-thing\n";
+        assert_eq!(prefer_executable(none).unwrap(), PathBuf::from("C:\\tools\\weird-thing"));
+        assert!(prefer_executable("").is_none());
+    }
 
     #[test]
     fn pin_constants_agree() {

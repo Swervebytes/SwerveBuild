@@ -383,8 +383,10 @@
     </div>
     <p class="group-note">
       Choose which agent backs your chats. Grok Build works out of the box after install and sign-in
-      on the home screen. Other ACP agents (Claude Code, Gemini) become available when their CLI is
-      on your PATH. HTTP / local-LLM providers are designed and coming soon.
+      on the home screen. Claude Code and Gemini can be installed (and removed) right here — each
+      needs its own sign-in the first time you use it. Ollama and OpenAI-compatible endpoints are
+      already covered by <strong>Local models</strong> and the <strong>Grok custom endpoint</strong>
+      below; Anthropic direct is not built yet.
     </p>
     <ProviderList />
     <div class="ids-block">

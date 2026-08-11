@@ -205,6 +205,14 @@ impl AcpManager {
         command
             .args(&launch.args)
             .envs(launch.env.iter().cloned())
+            // S37: if Swerve Build was itself launched from inside a Claude Code
+            // session (a terminal, an agent run), that session's `CLAUDECODE`
+            // marker is inherited — and `claude-code-acp` then refuses to start
+            // with "Claude Code cannot be launched inside another Claude Code
+            // session", surfacing as a permanent "Connecting…". Our agent is a
+            // separate session, so drop the inherited marker; unsetting it is
+            // exactly what that error message instructs.
+            .env_remove("CLAUDECODE")
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
