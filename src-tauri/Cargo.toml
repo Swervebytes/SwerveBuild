@@ -1,6 +1,6 @@
 [package]
 name = "swerve-build"
-version = "0.3.32"
+version = "0.3.33"
 description = "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents"
 authors = ["Swerve Build Contributors"]
 license = "MIT"
@@ -46,6 +46,8 @@ base64 = "0.22"
 url = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+# P4.2 — restore window size/position/maximized across launches.
+tauri-plugin-window-state = "2"
 toml_edit = "0.22"
 swerve-workflows = { path = "crates/swerve-workflows" }
 # CDP client for app_ui drive (WebSocket to WebView2 remote-debugging-port).

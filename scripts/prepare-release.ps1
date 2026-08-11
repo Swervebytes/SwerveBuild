@@ -68,7 +68,16 @@ try {
         # P3.4: ship unsigned -> the published SHA-256 is how users verify the
         # download (README "SmartScreen" section). Emit it next to the installer
         # so the release upload is a two-file copy, no manual hashing step.
-        $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+        # Raw .NET, not Get-FileHash: the cmdlet is missing in the constrained
+        # host install-local runs this under (broke the 0.3.33 first build).
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $stream = [System.IO.File]::OpenRead($installer)
+        try {
+            $hash = ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+            $sha.Dispose()
+        }
         $shaFile = "$installer.sha256"
         # Standard sha256sum format: "<hash> *<filename>".
         "$hash *Swerve Build_${version}_x64-setup.exe" | Set-Content -LiteralPath $shaFile -Encoding ascii

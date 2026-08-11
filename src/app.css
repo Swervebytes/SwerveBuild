@@ -297,7 +297,8 @@ p {
 .btn-accent {
   background: var(--sc-accent);
   border-color: var(--sc-accent);
-  color: #04060d;
+  /* P4.1: computed per accent (providers store) so dark accents keep contrast. */
+  color: var(--sc-accent-fg, #04060d);
   font-weight: 600;
 }
 
