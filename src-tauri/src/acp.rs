@@ -475,9 +475,7 @@ impl AcpManager {
             .and_then(|m| m.get("modelState"))
             .and_then(context_window_from_models);
 
-        let (session_id, mut context_window) = if let Some(stored) =
-            stored_session_id.filter(|_| can_load)
-        {
+        let session_result = if let Some(stored) = stored_session_id.filter(|_| can_load) {
             active
                 .transport
                 .suppress_updates
@@ -497,14 +495,36 @@ impl AcpManager {
                 .store(false, Ordering::SeqCst);
             match loaded {
                 // A resumed session restates the model set the same way.
-                Ok(v) => (
+                Ok(v) => Ok((
                     stored.to_string(),
                     v.get("models").and_then(context_window_from_models),
-                ),
-                Err(_) => Self::create_new_session(&mut active, cwd, &mcp_servers)?,
+                )),
+                Err(_) => Self::create_new_session(&mut active, cwd, &mcp_servers),
             }
         } else {
-            Self::create_new_session(&mut active, cwd, &mcp_servers)?
+            Self::create_new_session(&mut active, cwd, &mcp_servers)
+        };
+
+        // P1.1 (S-AUTH): a fresh install fails HERE with an auth error the user
+        // could previously only see as a cryptic session/new failure. Name the
+        // fix (Settings → Providers → Sign in) and tell the chat page so it can
+        // show the banner. Additive to this frozen file; classification lives in
+        // `provider_auth.rs`.
+        let (session_id, mut context_window) = match session_result {
+            Ok(pair) => pair,
+            Err(err) => {
+                if crate::provider_auth::is_auth_required_error(&err) {
+                    let _ = app.emit(
+                        "chat-auth-required",
+                        json!({ "chatId": chat_id, "provider": launch.label }),
+                    );
+                    return Err(format!(
+                        "{} isn't signed in on this machine. Open Settings → Providers and use Sign in, then send again. (Agent said: {err})",
+                        launch.label
+                    ));
+                }
+                return Err(err);
+            }
         };
 
         active.session_id = session_id.clone();

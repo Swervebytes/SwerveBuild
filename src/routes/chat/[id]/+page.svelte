@@ -38,6 +38,8 @@
   let sending = $state(false);
   let modelSwitching = $state(false);
   let error = $state<string | null>(null);
+  /** P1.1: provider label when the last send failed on sign-in; shows the banner. */
+  let authRequiredProvider = $state<string | null>(null);
   let activeSessionCount = $state(0);
   /** ACP-reported context window; stays empty until agent sends used+size. */
   let usage = $state<ChatUsage>(emptyUsage());
@@ -556,6 +558,8 @@
         (event) => {
           if (event.payload.chatId === $page.params.id) {
             sessionReady = true;
+            // A session came up — whatever auth problem we showed is resolved.
+            authRequiredProvider = null;
             // S35: the agent tells us the window up front, so the bar can show
             // a real percentage on the first turn instead of waiting for the
             // ~80%-full compaction notice. Size only — `used` stays unknown
@@ -575,6 +579,13 @@
         void finalizeAssistantMessage().then((saved) => {
           if (saved) workspaceStore.refresh();
         });
+      }),
+      subscribe<{ chatId: string; provider: string }>("chat-auth-required", (event) => {
+        // P1.1: session/new failed because the provider isn't signed in on this
+        // machine. The send's catch shows the error text; this banner adds the
+        // one-click route to the fix.
+        if (event.payload.chatId !== $page.params.id) return;
+        authRequiredProvider = event.payload.provider || "This provider";
       }),
       subscribe<{ chatId: string }>("chat-session-ended", (event) => {
         // Agent process died (crash, kill, clean exit). Backend already dropped
@@ -628,6 +639,15 @@
     />
   {:else}
     <div class="loading reading-col">Loading…</div>
+  {/if}
+
+  {#if authRequiredProvider}
+    <div class="reading-col">
+      <p class="error" data-testid="chat-auth-banner">
+        {authRequiredProvider} isn't signed in on this machine.
+        <a href="/settings">Open Settings → Providers</a> and use <b>Sign in</b>, then send again.
+      </p>
+    </div>
   {/if}
 
   {#if error}

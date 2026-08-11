@@ -89,6 +89,59 @@
     }
   }
 
+  // ---- sign-in (P1.1 / S-AUTH) ------------------------------------------
+  // Installing an agent does not sign it in. Probe asks the agent itself for
+  // its authMethods (ACP initialize); one method runs immediately, several
+  // render an inline chooser. The flows are the agent's own (browser OAuth or
+  // a visible terminal) — we never collect credentials in our UI.
+
+  type AuthMethod = { id: string; name: string; description: string };
+
+  let signingIn = $state<string | null>(null);
+  /** Provider id → methods, only while the inline chooser is open. */
+  let methodChoices = $state<Record<string, AuthMethod[]>>({});
+
+  async function signIn(id: string) {
+    signingIn = id;
+    methodChoices = { ...methodChoices, [id]: [] };
+    try {
+      const probe = await invoke<{ authMethods: AuthMethod[] }>("provider_auth_probe", {
+        providerId: id,
+      });
+      const methods = probe.authMethods;
+      if (methods.length === 0) {
+        results = {
+          ...results,
+          [id]: "This agent reports no sign-in method — it may already be signed in. Send a chat message to check.",
+        };
+      } else if (methods.length === 1) {
+        await runSignIn(id, methods[0].id);
+      } else {
+        methodChoices = { ...methodChoices, [id]: methods };
+      }
+    } catch (e) {
+      results = { ...results, [id]: String(e) };
+    } finally {
+      signingIn = null;
+    }
+  }
+
+  async function runSignIn(id: string, methodId: string) {
+    signingIn = id;
+    methodChoices = { ...methodChoices, [id]: [] };
+    try {
+      const r = await invoke<{ kind: string; message: string }>("provider_sign_in", {
+        providerId: id,
+        methodId,
+      });
+      results = { ...results, [id]: r.message };
+    } catch (e) {
+      results = { ...results, [id]: String(e) };
+    } finally {
+      signingIn = null;
+    }
+  }
+
   /// HTTP rows that shipped features already cover — say so instead of
   /// promising "soon" forever (S37).
   const COVERED_BY: Record<string, string> = {
@@ -129,6 +182,29 @@
             <code>{info[p.id]?.installCommand}</code>
           </span>
         {/if}
+        {#if (methodChoices[p.id] ?? []).length > 1}
+          <span class="confirm" data-testid="provider-method-choice">
+            Sign in with:
+            {#each methodChoices[p.id] as m (m.id)}
+              <button
+                class="btn btn-sm"
+                type="button"
+                data-testid="provider-method-{m.id}"
+                title={m.description}
+                onclick={() => runSignIn(p.id, m.id)}
+              >
+                {m.name}
+              </button>
+            {/each}
+            <button
+              class="btn btn-sm btn-ghost"
+              type="button"
+              onclick={() => (methodChoices = { ...methodChoices, [p.id]: [] })}
+            >
+              Cancel
+            </button>
+          </span>
+        {/if}
         {#if confirming === p.id}
           <span class="confirm" data-testid="provider-uninstall-confirm">
             Remove this CLI from your machine? Runs
@@ -167,6 +243,18 @@
               onclick={() => install(p.id)}
             >
               {busy === p.id ? "Installing…" : "Install"}
+            </button>
+          {/if}
+          {#if p.kind === "acp" && p.command && p.available}
+            <button
+              class="btn btn-sm"
+              type="button"
+              data-testid="provider-signin-{p.id}"
+              disabled={signingIn === p.id}
+              title="Run this agent's own sign-in flow (browser or terminal)"
+              onclick={() => signIn(p.id)}
+            >
+              {signingIn === p.id ? "Signing in…" : "Sign in"}
             </button>
           {/if}
           {#if info[p.id]?.installable && p.available}
