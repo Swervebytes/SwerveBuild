@@ -1269,7 +1269,11 @@ pub fn spawn_scheduler(app: AppHandle, jm: Arc<JobManager>) {
                                         file_snap: None,
                                     }),
                                 }
-                            } else if let Some(occ) = most_recent_occurrence(s, now) {
+                            } else if let Some(occ) =
+                                // P2.7: live OS offset so DST transitions don't
+                                // shift daily/weekly rules until a re-save.
+                                most_recent_occurrence_with(s, now, effective_tz_offset(s))
+                            {
                                 // A never-fired rule baselines off its creation time, so a
                                 // brand-new daily/weekly automation doesn't instantly "catch
                                 // up" on an occurrence that happened before it existed — it
@@ -1369,14 +1373,77 @@ fn created_secs(a: &Automation) -> u64 {
     a.created_at.parse::<u64>().unwrap_or(0)
 }
 
+/// UTC-minus-local offset in minutes right now, DST included, straight from
+/// the OS (`GetTimeZoneInformation`; same "UTC = local + bias" convention as
+/// JS `getTimezoneOffset`, which is what the webview stores on the trigger).
+///
+/// P2.7: the stored offset is captured at *save* time, so a DST transition
+/// used to shift every daily/weekly rule by an hour until it was re-saved.
+/// The scheduler now asks the OS at *fire-check* time and only falls back to
+/// the stored value if the call fails.
+#[cfg(windows)]
+fn current_tz_offset_minutes() -> Option<i32> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SystemTimeRaw([u16; 8]);
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTimeRaw,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTimeRaw,
+        daylight_bias: i32,
+    }
+    extern "system" {
+        fn GetTimeZoneInformation(lp: *mut TimeZoneInformation) -> u32;
+    }
+    // Effective bias = Bias + the bias of whichever phase is active.
+    unsafe {
+        let mut tzi = std::mem::zeroed::<TimeZoneInformation>();
+        match GetTimeZoneInformation(&mut tzi) {
+            0 => Some(tzi.bias),                     // no DST rule for this zone
+            1 => Some(tzi.bias + tzi.standard_bias), // standard time
+            2 => Some(tzi.bias + tzi.daylight_bias), // daylight time
+            _ => None,                               // TIME_ZONE_ID_INVALID
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn current_tz_offset_minutes() -> Option<i32> {
+    None
+}
+
+/// Live OS offset when sane, else the trigger's saved offset. Pure so the
+/// fallback rule is testable without faking the OS call.
+fn pick_tz_offset(live: Option<i32>, stored: i32) -> i32 {
+    match live {
+        // Real offsets span UTC-12..UTC+14.
+        Some(m) if (-14 * 60..=14 * 60).contains(&m) => m,
+        _ => stored,
+    }
+}
+
+fn effective_tz_offset(s: &ScheduleTrigger) -> i32 {
+    pick_tz_offset(current_tz_offset_minutes(), s.tz_offset_minutes)
+}
+
 /// Most recent scheduled occurrence (UTC secs) for a daily/weekly schedule, or
-/// None. Uses the webview-supplied tz offset for local-time math (std has no tz
-/// API). Walks back up to 8 days to find the matching weekday for weekly.
+/// None. Walks back up to 8 days to find the matching weekday for weekly.
+/// Uses the trigger's stored offset — the scheduler calls
+/// [`most_recent_occurrence_with`] with the live offset (P2.7); tests exercise
+/// the pure math through this stored-offset form.
 fn most_recent_occurrence(s: &ScheduleTrigger, now: u64) -> Option<u64> {
+    most_recent_occurrence_with(s, now, s.tz_offset_minutes)
+}
+
+fn most_recent_occurrence_with(s: &ScheduleTrigger, now: u64, offset_minutes: i32) -> Option<u64> {
     if s.every == "interval" {
         return None;
     }
-    let offset = s.tz_offset_minutes as i64 * 60; // UTC = local + offset
+    let offset = offset_minutes as i64 * 60; // UTC = local + offset
     let now_i = now as i64;
     let local_now = now_i - offset;
     for back in 0..8i64 {
@@ -1757,6 +1824,39 @@ mod tests {
             hour,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tz_offset_pick_prefers_sane_live_values() {
+        // P2.7: live offset wins…
+        assert_eq!(pick_tz_offset(Some(-420), 0), -420);
+        assert_eq!(pick_tz_offset(Some(0), 300), 0);
+        // …but an absent or absurd OS answer falls back to the stored one.
+        assert_eq!(pick_tz_offset(None, 300), 300);
+        assert_eq!(pick_tz_offset(Some(10_000), 300), 300);
+        assert_eq!(pick_tz_offset(Some(-10_000), 300), 300);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_reports_a_sane_tz_offset() {
+        let live = current_tz_offset_minutes().expect("GetTimeZoneInformation failed");
+        assert!(
+            (-14 * 60..=14 * 60).contains(&live),
+            "offset out of range: {live}"
+        );
+    }
+
+    #[test]
+    fn dst_shift_changes_the_occurrence_by_an_hour() {
+        // Same trigger, offsets an hour apart (standard vs daylight): the
+        // occurrence must move with the live offset — this is the drift the
+        // stored-offset math had until re-save.
+        let s = daily_at(9);
+        let now = JAN_1_2026 + 20 * 3600;
+        let std_occ = most_recent_occurrence_with(&s, now, 300).unwrap();
+        let dst_occ = most_recent_occurrence_with(&s, now, 240).unwrap();
+        assert_eq!(std_occ - dst_occ, 3600);
     }
 
     #[test]
