@@ -1,8 +1,13 @@
 //! Media worker process shell (S24+ / Step 7).
 //!
 //! Separate process so capture/encode crashes never take down chat.
-//! Still PNG + short MJPEG clip (S25–S26); pinned LGPL FFmpeg (S27); **optional
-//! dshow audio track on clip** (S28 — WASAPI not in the pinned LGPL build).
+//! Still PNG (S25); pinned LGPL FFmpeg (S27); optional dshow audio track
+//! (S28 — WASAPI not in the pinned LGPL build).
+//!
+//! **S32 recorder v2:** clips are now REAL screen recordings — `ddagrab`
+//! (Desktop Duplication) → H.264 (`h264_nvenc`, `libopenh264` fallback) → MP4,
+//! replacing the S26 looped-still MJPEG/AVI stopgap. Both encoders ship in the
+//! pinned `n7.1-lgpl` build; neither is GPL (NVENC needs only MIT headers).
 //!
 //! IPC: loopback HTTP, versioned path `/v1/*`, Bearer token (same idea as
 //! terminal control server). Endpoint published under data dir.
@@ -417,7 +422,7 @@ fn status_locked(live: Option<&LiveWorker>, healthy: bool) -> SupervisorStatus {
                 .into()
         } else if healthy {
             format!(
-                "Media worker up (protocol v{PROTOCOL_VERSION}). Capabilities: still_png, clip_mjpeg, clip_audio."
+                "Media worker up (protocol v{PROTOCOL_VERSION}). Capabilities: still_png, clip_mp4, clip_audio."
             )
         } else {
             "Worker process present but health check failed.".into()
@@ -592,7 +597,7 @@ pub fn agent_status_report() -> serde_json::Value {
         "workerHealthy": worker.healthy,
         "workerNote": worker.note,
         "workerError": worker.last_error,
-        "capabilities": ["still_png", "clip_mjpeg", "clip_audio"],
+        "capabilities": ["still_png", "clip_mp4", "clip_audio"],
         "ffmpeg": {
             "tag": ff.tag,
             "installed": ff.installed,
@@ -929,7 +934,7 @@ pub fn worker_main(args: &[String]) -> i32 {
         "port": port,
         "protocol": PROTOCOL_VERSION,
         "pid": std::process::id(),
-        "capabilities": ["still_png", "clip_mjpeg", "clip_audio"],
+        "capabilities": ["still_png", "clip_mp4", "clip_audio"],
     });
     println!("{READY_PREFIX}{ready}");
     let _ = std::io::stdout().flush();
@@ -1021,7 +1026,7 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
             role: "media-worker".into(),
             capabilities: vec![
                 "still_png".into(),
-                "clip_mjpeg".into(),
+                "clip_mp4".into(),
                 "clip_audio".into(),
             ],
         };
@@ -1065,7 +1070,7 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
                 }
             },
         };
-        match encode_still_mjpeg_clip(
+        match record_screen_clip(
             &still,
             out_dir,
             duration,
@@ -1140,22 +1145,100 @@ fn capture_primary_still(out_dir: &Path) -> Result<(PathBuf, u32, u32, u64), Str
     Ok((path, img.width(), img.height(), meta.len()))
 }
 
-/// Short clip from a still via FFmpeg MJPEG (S26) + optional dshow audio (S28).
-/// Avoids GPL x264; pinned build has dshow but not wasapi.
-fn encode_still_mjpeg_clip(
+/// Capture framerate for recorded clips (S32).
+const CLIP_FRAMERATE: u32 = 30;
+
+/// Video encoders tried in order, best first (S32 recorder v2).
+/// Both ship in the pinned `n7.1-lgpl` build; neither is GPL.
+/// `h264_nvenc` needs only MIT nv-codec-headers + the user's NVIDIA driver;
+/// `libopenh264` (BSD) is the no-GPU / driver-missing fallback.
+const CLIP_ENCODERS: [&str; 2] = ["h264_nvenc", "libopenh264"];
+
+/// Build FFmpeg args for a live screen recording (S32 recorder v2).
+///
+/// Video: `ddagrab` (Desktop Duplication API) → `hwdownload` → yuv420p → H.264,
+/// muxed to MP4 with `+faststart` (streamable) and CFR timing.
+/// Audio: optional DirectShow device as AAC; omitted entirely when `None`.
+///
+/// Pure/arg-only so the shape is unit-testable without spawning FFmpeg.
+/// Replaces the S26 looped-still MJPEG/AVI path (dead end: ~5-10x bitrate,
+/// no interframe compression, and RTMP later requires H.264 anyway).
+pub fn build_clip_args(
+    out: &str,
+    duration: &str,
+    dshow_audio: Option<&str>,
+    video_encoder: &str,
+    framerate: u32,
+) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
+
+    // Audio input first so it is input 0; video comes from the filter graph.
+    if let Some(dev) = dshow_audio {
+        a.extend([
+            "-f".into(),
+            "dshow".into(),
+            // Default dshow audio buffering is ~500ms; 50ms keeps A/V tight.
+            "-audio_buffer_size".into(),
+            "50".into(),
+            "-thread_queue_size".into(),
+            "1024".into(),
+            "-i".into(),
+            format!("audio={dev}"),
+        ]);
+    }
+
+    a.extend([
+        "-filter_complex".into(),
+        format!("ddagrab=framerate={framerate},hwdownload,format=bgra,format=yuv420p[v]"),
+        "-map".into(),
+        "[v]".into(),
+    ]);
+    if dshow_audio.is_some() {
+        a.extend(["-map".into(), "0:a".into()]);
+    }
+
+    a.extend([
+        "-t".into(),
+        duration.into(),
+        "-c:v".into(),
+        video_encoder.into(),
+    ]);
+    if video_encoder == "h264_nvenc" {
+        a.extend(["-preset".into(), "p5".into(), "-cq".into(), "23".into()]);
+    } else {
+        a.extend(["-b:v".into(), "6M".into()]);
+    }
+
+    if dshow_audio.is_some() {
+        a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
+    }
+
+    a.extend([
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        out.into(),
+    ]);
+    a
+}
+
+/// Record the live desktop to an MP4 clip (S32) + optional dshow audio (S28).
+///
+/// `still` is kept as a companion poster artifact (and for result-shape
+/// compatibility) — it is NOT the video source any more; video is captured live.
+/// Falls back encoder-wise (nvenc → openh264) and audio-wise (device → silent).
+fn record_screen_clip(
     still: &Path,
     out_dir: &Path,
     duration_secs: f64,
     audio_pref: &str,
     audio_device: Option<&str>,
 ) -> Result<EncodeClipResult, String> {
-    if !still.is_file() {
-        return Err(format!("still missing: {}", still.display()));
-    }
     // S27: ensure pinned LGPL FFmpeg (or existing PATH/flat) before encode.
     let ffmpeg = ensure_ffmpeg()?;
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
-    let out = out_dir.join(format!("clip-{}.avi", uuid::Uuid::new_v4()));
+    let out = out_dir.join(format!("clip-{}.mp4", uuid::Uuid::new_v4()));
     let dur = format!("{duration_secs:.2}");
 
     let want_audio = !matches!(audio_pref, "none" | "off" | "silent" | "an");
@@ -1165,81 +1248,76 @@ fn encode_still_mjpeg_clip(
         None
     };
 
-    if let Some(ref dev) = device {
-        match run_ffmpeg_clip(&ffmpeg, still, &out, &dur, Some(dev.as_str())) {
-            Ok(()) => {
-                let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
-                return Ok(EncodeClipResult {
-                    ok: true,
-                    path: out.display().to_string(),
-                    bytes: meta.len(),
-                    duration_secs,
-                    still_path: still.display().to_string(),
-                    codec: "mjpeg+pcm_s16le".into(),
-                    has_audio: true,
-                    audio_device: Some(dev.clone()),
-                    audio_mode: "dshow".into(),
-                });
+    let finish = |encoder: &str, dev: Option<&String>| -> Result<EncodeClipResult, String> {
+        let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
+        Ok(EncodeClipResult {
+            ok: true,
+            path: out.display().to_string(),
+            bytes: meta.len(),
+            duration_secs,
+            still_path: still.display().to_string(),
+            codec: if dev.is_some() {
+                format!("{encoder}+aac")
+            } else {
+                encoder.to_string()
+            },
+            has_audio: dev.is_some(),
+            audio_device: dev.cloned(),
+            audio_mode: if dev.is_some() { "dshow" } else { "silent" }.into(),
+        })
+    };
+
+    let mut last_err = String::from("no encoder attempted");
+    for encoder in CLIP_ENCODERS {
+        if let Some(ref dev) = device {
+            match run_ffmpeg_clip(&ffmpeg, &out, &dur, Some(dev.as_str()), encoder) {
+                Ok(()) => return finish(encoder, Some(dev)),
+                Err(e) => {
+                    // Device busy / open failed → silent path (silent must still work).
+                    // Logged only: the silent attempt below always sets last_err.
+                    eprintln!("media clip {encoder} with audio failed ({e}); trying silent");
+                    let _ = std::fs::remove_file(&out);
+                }
             }
+        }
+        match run_ffmpeg_clip(&ffmpeg, &out, &dur, None, encoder) {
+            Ok(()) => return finish(encoder, None),
             Err(e) => {
-                // Device busy / open failed → silent path (acceptance: silent still works).
-                eprintln!("media clip audio encode failed ({e}); falling back to silent");
+                eprintln!("media clip {encoder} silent failed ({e}); trying next encoder");
+                last_err = e;
                 let _ = std::fs::remove_file(&out);
             }
         }
     }
-
-    run_ffmpeg_clip(&ffmpeg, still, &out, &dur, None)?;
-    let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
-    Ok(EncodeClipResult {
-        ok: true,
-        path: out.display().to_string(),
-        bytes: meta.len(),
-        duration_secs,
-        still_path: still.display().to_string(),
-        codec: "mjpeg".into(),
-        has_audio: false,
-        audio_device: None,
-        audio_mode: "silent".into(),
-    })
+    Err(format!("clip record failed (all encoders): {last_err}"))
 }
 
 fn run_ffmpeg_clip(
     ffmpeg: &Path,
-    still: &Path,
     out: &Path,
     duration: &str,
     dshow_audio: Option<&str>,
+    video_encoder: &str,
 ) -> Result<(), String> {
-    let mut cmd = crate::util::hidden_command(ffmpeg);
-    cmd.args(["-y", "-loop", "1", "-framerate", "2", "-i"])
-        .arg(still.as_os_str());
-    if let Some(dev) = dshow_audio {
-        // DirectShow audio input (pinned LGPL has dshow; no wasapi demuxer).
-        let input = format!("audio={dev}");
-        cmd.args(["-f", "dshow", "-i", &input]);
-        cmd.args([
-            "-t",
-            duration,
-            "-c:v",
-            "mjpeg",
-            "-q:v",
-            "5",
-            "-c:a",
-            "pcm_s16le",
-            "-shortest",
-        ]);
-    } else {
-        cmd.args(["-t", duration, "-c:v", "mjpeg", "-q:v", "5", "-an"]);
-    }
-    cmd.arg(out.as_os_str());
-    let status = cmd
+    let args = build_clip_args(
+        &out.display().to_string(),
+        duration,
+        dshow_audio,
+        video_encoder,
+        CLIP_FRAMERATE,
+    );
+    let status = crate::util::hidden_command(ffmpeg)
+        .args(&args)
         .status()
         .map_err(|e| format!("spawn ffmpeg: {e}"))?;
     if !status.success() {
-        return Err(format!("ffmpeg failed with {status}"));
+        return Err(format!("ffmpeg {video_encoder} failed with {status}"));
     }
-    Ok(())
+    // A failed encoder can still exit 0-ish or leave a 0-byte file; verify.
+    match std::fs::metadata(out) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        _ => Err(format!("ffmpeg {video_encoder} produced no output")),
+    }
 }
 
 /// Pick a DirectShow audio capture device (explicit name or auto).
@@ -1444,11 +1522,63 @@ mod tests {
 
     #[test]
     fn encode_clip_result_defaults_audio_fields() {
-        let raw = r#"{"ok":true,"path":"x.avi","bytes":1,"durationSecs":2.0,"stillPath":"s.png","codec":"mjpeg"}"#;
+        let raw = r#"{"ok":true,"path":"x.mp4","bytes":1,"durationSecs":2.0,"stillPath":"s.png","codec":"h264_nvenc"}"#;
         let r: EncodeClipResult = serde_json::from_str(raw).unwrap();
         assert!(!r.has_audio);
         assert!(r.audio_device.is_none());
         assert_eq!(r.audio_mode, "silent");
+    }
+
+    /// S32: silent recording is live desktop capture → H.264 → MP4, no inputs.
+    #[test]
+    fn clip_args_silent_capture_live_desktop() {
+        let a = build_clip_args("out.mp4", "2.00", None, "h264_nvenc", 30);
+        let joined = a.join(" ");
+        // Live capture, not a looped still: ddagrab source, no -i / -loop input.
+        assert!(joined.contains("ddagrab=framerate=30"), "{joined}");
+        assert!(!a.iter().any(|s| s == "-i"), "silent path takes no input: {joined}");
+        assert!(!a.iter().any(|s| s == "-loop"), "no looped still: {joined}");
+        // H.264 to MP4, streamable + constant frame rate.
+        assert!(joined.contains("-c:v h264_nvenc"), "{joined}");
+        assert!(joined.contains("-movflags +faststart"), "{joined}");
+        assert!(joined.contains("-fps_mode cfr"), "{joined}");
+        assert_eq!(a.last().unwrap(), "out.mp4");
+        // No audio mapping/codec when silent.
+        assert!(!joined.contains("-c:a"), "{joined}");
+        assert!(!joined.contains("0:a"), "{joined}");
+    }
+
+    /// S32: dshow audio becomes input 0; video comes from the filter graph,
+    /// so both need explicit maps or FFmpeg drops one.
+    #[test]
+    fn clip_args_audio_maps_filter_video_and_device_audio() {
+        let a = build_clip_args("out.mp4", "2.00", Some("Line (AudioBox Go)"), "h264_nvenc", 30);
+        let joined = a.join(" ");
+        assert!(joined.contains("-f dshow"), "{joined}");
+        assert!(joined.contains("-i audio=Line (AudioBox Go)"), "{joined}");
+        assert!(joined.contains("-map [v]"), "{joined}");
+        assert!(joined.contains("-map 0:a"), "{joined}");
+        assert!(joined.contains("-c:a aac"), "{joined}");
+        // Tight dshow buffering keeps A/V from drifting.
+        assert!(joined.contains("-audio_buffer_size 50"), "{joined}");
+    }
+
+    /// S32: software fallback is rate-controlled, not NVENC's -cq.
+    #[test]
+    fn clip_args_software_encoder_uses_bitrate_not_cq() {
+        let sw = build_clip_args("out.mp4", "2.00", None, "libopenh264", 30).join(" ");
+        assert!(sw.contains("-c:v libopenh264"), "{sw}");
+        assert!(sw.contains("-b:v"), "{sw}");
+        assert!(!sw.contains("-cq"), "{sw}");
+        let gpu = build_clip_args("out.mp4", "2.00", None, "h264_nvenc", 30).join(" ");
+        assert!(gpu.contains("-cq 23"), "{gpu}");
+        assert!(gpu.contains("-preset p5"), "{gpu}");
+    }
+
+    /// Both candidates ship in the pinned LGPL build; order is GPU-first.
+    #[test]
+    fn clip_encoder_ladder_is_gpu_then_software() {
+        assert_eq!(CLIP_ENCODERS, ["h264_nvenc", "libopenh264"]);
     }
 
     #[test]
@@ -1464,6 +1594,24 @@ mod tests {
         let caps = v.get("capabilities").and_then(|c| c.as_array()).unwrap();
         assert!(caps.iter().any(|c| c.as_str() == Some("clip_audio")));
         assert!(v.get("ffmpeg").is_some());
+    }
+
+    /// Live: the software fallback encoder must work through the SAME arg
+    /// builder the ladder uses, so a box without NVENC still records (S32).
+    /// `cargo test -p swerve-build --lib media_worker::tests::live_software_encoder_records -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_software_encoder_records() {
+        let ffmpeg = ensure_ffmpeg().expect("ffmpeg");
+        let dir = std::env::temp_dir().join("swerve_s32_sw_smoke");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("sw.mp4");
+        run_ffmpeg_clip(&ffmpeg, &out, "1.50", None, "libopenh264")
+            .expect("software encoder must record without NVENC");
+        let bytes = std::fs::metadata(&out).unwrap().len();
+        assert!(bytes > 0, "software clip is empty");
+        eprintln!("libopenh264 fallback ok bytes={bytes}");
     }
 
     /// Live: still + auto dshow audio (or silent fallback). Run with:
@@ -1492,7 +1640,7 @@ mod tests {
         assert!(st.success());
 
         let with_audio =
-            encode_still_mjpeg_clip(&still, &dir, 2.0, "auto", None).expect("auto encode");
+            record_screen_clip(&still, &dir, 2.0, "auto", None).expect("auto encode");
         eprintln!(
             "auto: has_audio={} mode={} device={:?} path={} bytes={}",
             with_audio.has_audio,
@@ -1504,7 +1652,7 @@ mod tests {
         assert!(PathBuf::from(&with_audio.path).is_file());
 
         let silent =
-            encode_still_mjpeg_clip(&still, &dir, 2.0, "none", None).expect("silent encode");
+            record_screen_clip(&still, &dir, 2.0, "none", None).expect("silent encode");
         assert!(!silent.has_audio);
         assert_eq!(silent.audio_mode, "silent");
         assert!(PathBuf::from(&silent.path).is_file());
