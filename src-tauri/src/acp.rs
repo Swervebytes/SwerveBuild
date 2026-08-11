@@ -272,7 +272,7 @@ impl AcpManager {
                 };
 
                 if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-                    if method == "session/update" {
+                    if is_session_update_method(method) {
                         // Streaming counts as access so the LRU keeps a mid-turn
                         // session alive even if it hasn't been sent to recently.
                         last_accessed_reader.store(now_secs(), Ordering::SeqCst);
@@ -740,6 +740,18 @@ fn jsonrpc_id(value: &Value) -> Option<u64> {
         .or_else(|| id.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
 }
 
+/// Is this a session update we should forward to the UI?
+///
+/// Accepts the ACP-standard `session/update` **and** vendor-namespaced variants.
+/// Grok sends `_x.ai/session/update`, which carries `turn_completed` (token
+/// usage on every turn) and `auto_compact_started` (tokens_used +
+/// context_window). Matching only the bare method dropped 100% of Grok's usage
+/// telemetry before it reached the UI — the reason the context bar read `—`
+/// for Grok (S34 / ROADMAP open question 5).
+fn is_session_update_method(method: &str) -> bool {
+    method == "session/update" || method.ends_with("/session/update")
+}
+
 /// Extract a usage payload suitable for the UI from a `session/prompt` JSON-RPC
 /// response. Prefer objects that include both `used` and `size` (session context
 /// RFD). If only a nested `usage` object exists, forward it as-is so the client
@@ -1101,6 +1113,21 @@ mod tests {
         assert_eq!(err.0, -32002);
         assert!(!dir.join("x.txt").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// S34: Grok's usage only arrives on `_x.ai/session/update`. Forwarding
+    /// just the bare method silently discarded every token number it sent.
+    #[test]
+    fn session_update_matcher_accepts_vendor_namespaces() {
+        assert!(is_session_update_method("session/update"));
+        assert!(is_session_update_method("_x.ai/session/update"));
+        assert!(is_session_update_method("acme.dev/session/update"));
+        // Must not widen into other session methods or unrelated traffic.
+        assert!(!is_session_update_method("session/request_permission"));
+        assert!(!is_session_update_method("_x.ai/session/other"));
+        assert!(!is_session_update_method("session/updated"));
+        assert!(!is_session_update_method("initialize"));
     }
 
     #[test]

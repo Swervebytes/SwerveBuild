@@ -11,8 +11,10 @@
   import {
     type ChatUsage,
     emptyUsage,
+    mergeUsage,
     parseEndTurnUsage,
     parseUsageUpdate,
+    parseVendorUsage,
   } from "$lib/chatUsage";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
@@ -62,7 +64,9 @@
 
   function applyUsage(next: ChatUsage | null) {
     if (!next) return;
-    usage = next;
+    // Keep a window size we already learned when a later report omits it
+    // (S34) — remembering a real number, not inventing one.
+    usage = mergeUsage(usage, next);
   }
 
   function mergeStreamMedia(images: string[], videos: string[] = []) {
@@ -190,6 +194,14 @@
     // ACP session-usage RFD: sessionUpdate "usage_update" with used + size.
     if (sessionUpdate === "usage_update") {
       applyUsage(parseUsageUpdate(inner));
+      return;
+    }
+
+    // Vendor updates that carry real token numbers (S34). Grok sends these on
+    // `_x.ai/session/update`; acp.rs forwards any `*/session/update`.
+    if (sessionUpdate === "turn_completed" || sessionUpdate === "auto_compact_started") {
+      applyUsage(parseVendorUsage(inner));
+      // turn_completed has no renderable text; auto_compact is informational.
       return;
     }
 

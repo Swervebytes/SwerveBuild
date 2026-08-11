@@ -6,6 +6,7 @@
     type ChatUsage,
     formatTokens,
     hasKnownUsage,
+    hasKnownUsed,
     usagePercent,
     usageTone,
     usageTooltip,
@@ -38,6 +39,8 @@
   } = $props();
 
   const known = $derived(hasKnownUsage(usage));
+  /** Tokens reported but no window size — show the count, withhold the %. */
+  const usedOnly = $derived(!known && hasKnownUsed(usage));
   const pct = $derived(usage ? usagePercent(usage) : null);
   const tone = $derived(usageTone(usage));
   const tip = $derived(usageTooltip(usage));
@@ -69,7 +72,9 @@
       role="status"
       aria-label={known
         ? `Context usage ${formatTokens(usage!.used!)} of ${formatTokens(usage!.size!)}`
-        : "Context usage unknown"}
+        : usedOnly
+          ? `Context usage ${formatTokens(usage!.used!)} tokens, window size unknown`
+          : "Context usage unknown"}
     >
       {#if known && usage && pct != null}
         <span class="usage-nums"
@@ -79,6 +84,12 @@
           <span class="usage-fill" style="width: {pct}%"></span>
         </span>
         <span class="usage-pct">{Math.round(pct)}%</span>
+      {:else if usedOnly && usage}
+        <!-- Real token count, no window reported: show it, withhold the % -->
+        <span class="usage-nums" data-testid="chat-usage-used-only"
+          >{formatTokens(usage.used!)}</span
+        >
+        <span class="usage-hint">ctx</span>
       {:else}
         <span class="usage-unknown" aria-hidden="true">—</span>
         <span class="usage-hint">ctx</span>
