@@ -3,6 +3,7 @@
   import { subscribe } from "$lib/events";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { automationsStore } from "$lib/stores/automations.svelte";
+  import { providerStore } from "$lib/stores/providers.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import StatusPill from "$lib/components/ui/StatusPill.svelte";
@@ -52,9 +53,16 @@
   );
   const enabledCount = $derived(automations.filter((a) => a.enabled).length);
 
+  // P2.1: automations are grok-only by design (jobs.rs spawns the Grok CLI).
+  // When the chat provider is something else, say so instead of letting the
+  // user assume their active agent runs the rules.
+  const grokRow = $derived(providerStore.all.find((p) => p.id === "grok"));
+  const nonGrokActive = $derived(providerStore.active.id !== "grok");
+
   onMount(() => {
     (async () => {
       await workspaceStore.refresh();
+      await providerStore.load();
       await automationsStore.refresh();
       loading = false;
       try {
@@ -309,6 +317,17 @@
           {#if enabledCount > 0}· {enabledCount} enabled{/if}
           {#if runningCount > 0}· {runningCount} running{/if}
         </p>
+        {#if grokRow && !grokRow.available}
+          <p class="page-subtitle provider-note" data-testid="automations-grok-note">
+            Grok Build isn't installed, so automations can't run — install it from
+            the home screen first.
+          </p>
+        {:else if nonGrokActive}
+          <p class="page-subtitle provider-note" data-testid="automations-grok-note">
+            Automations always run on Grok Build — your active chat provider
+            ({providerStore.active.label}) doesn't apply here.
+          </p>
+        {/if}
       </div>
       <div class="header-actions">
         {#if automations.length > 0}
@@ -698,6 +717,12 @@
   }
   .page-header {
     margin-bottom: 1.25rem;
+  }
+  /* P2.1: grok-only honesty line under the subtitle. */
+  .provider-note {
+    margin-top: 0.3rem;
+    color: var(--accent, #d97757);
+    opacity: 0.85;
   }
   .header-row {
     display: flex;
