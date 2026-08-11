@@ -37,6 +37,17 @@ export function hasKnownUsage(u: ChatUsage | null | undefined): boolean {
   );
 }
 
+/**
+ * Tokens known but window size not (yet) known — still real data (S34).
+ *
+ * Several agents report what they consumed without ever stating the window.
+ * Showing that count is honest; only the percentage would be an invention,
+ * so callers render the number without a bar until a size is learned.
+ */
+export function hasKnownUsed(u: ChatUsage | null | undefined): boolean {
+  return !!u && u.used != null && Number.isFinite(u.used) && u.used >= 0;
+}
+
 export function usagePercent(u: ChatUsage): number | null {
   if (!hasKnownUsage(u) || u.size == null || u.used == null) return null;
   return Math.min(100, Math.max(0, (u.used / u.size) * 100));
@@ -121,8 +132,79 @@ export function parseEndTurnUsage(usage: unknown): ChatUsage | null {
   return null;
 }
 
+/**
+ * Vendor-namespaced session updates that carry real token numbers (S34).
+ *
+ * Grok sends these on `_x.ai/session/update` (not the ACP-standard method —
+ * see `acp.rs`, which forwards any vendor-namespaced `session/update`):
+ *
+ *  - `turn_completed`       → `usage.inputTokens` — context sent, EVERY turn
+ *  - `auto_compact_started` → `tokens_used` + `context_window` — both numbers,
+ *                             but only when compaction fires (~80% full)
+ *
+ * May return usage with a null `size`; the caller keeps any window size it has
+ * already learned for the session. Nothing here is ever estimated.
+ */
+export function parseVendorUsage(inner: Record<string, unknown>): ChatUsage | null {
+  const kind = typeof inner.sessionUpdate === "string" ? inner.sessionUpdate : "";
+
+  if (kind === "auto_compact_started") {
+    const used = asFiniteNumber(inner.tokens_used);
+    const size = asFiniteNumber(inner.context_window);
+    if (used == null || used < 0 || size == null || size <= 0) return null;
+    return {
+      used,
+      size,
+      costAmount: null,
+      costCurrency: null,
+      updatedAt: Date.now(),
+    };
+  }
+
+  if (kind === "turn_completed") {
+    const raw = inner.usage;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const u = raw as Record<string, unknown>;
+    // inputTokens is what was actually sent as context this turn. totalTokens
+    // adds the completion, which is not context-resident — prefer inputTokens.
+    const used = asFiniteNumber(u.inputTokens) ?? asFiniteNumber(u.totalTokens);
+    if (used == null || used < 0) return null;
+    const size = asFiniteNumber(u.contextWindow) ?? asFiniteNumber(u.context_window);
+    return {
+      used,
+      size: size != null && size > 0 ? size : null,
+      costAmount: null,
+      costCurrency: null,
+      updatedAt: Date.now(),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Merge a fresh (possibly partial) report over what we already know.
+ *
+ * A context window does not change mid-session, so a previously reported
+ * `size` is kept when a later update omits it — that is remembering a real
+ * number, not inventing one. `used` always comes from the newest report.
+ */
+export function mergeUsage(prev: ChatUsage, next: ChatUsage): ChatUsage {
+  return {
+    used: next.used ?? prev.used,
+    size: next.size ?? prev.size,
+    costAmount: next.costAmount ?? prev.costAmount,
+    costCurrency: next.costCurrency ?? prev.costCurrency,
+    updatedAt: next.updatedAt ?? prev.updatedAt,
+  };
+}
+
 export function usageTooltip(u: ChatUsage | null | undefined): string {
   if (!hasKnownUsage(u) || !u) {
+    // Tokens known, window not: say so plainly rather than showing nothing.
+    if (hasKnownUsed(u) && u) {
+      return `Context: ${u.used!.toLocaleString()} tokens used. This agent has not reported its context window size, so no percentage is shown (never estimated).`;
+    }
     return "Context usage not reported by this agent. Appears when the ACP agent sends usage_update (used / size tokens). Never estimated.";
   }
   const used = u.used!;
