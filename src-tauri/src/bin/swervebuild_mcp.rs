@@ -835,3 +835,46 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S38 go-live tier: the MCP surface must expose **no** way to start a
+    /// broadcast. This is the structural half of "going live is always a human
+    /// action" — `live.rs` refuses `Caller::Mcp` at runtime, and this makes sure
+    /// nobody ever wires a tool that would reach it in the first place.
+    ///
+    /// Read-only status is fine and stopping would be fine (fail-safe
+    /// direction); it is *starting* that must have no agent-reachable entry
+    /// point. Today there is no live tool at all, so assert the strong form.
+    #[test]
+    fn no_mcp_tool_can_start_a_broadcast() {
+        for tool in tools() {
+            let name = tool.name.to_ascii_lowercase();
+            for forbidden in ["live", "stream", "broadcast", "rtmp", "arm"] {
+                assert!(
+                    !name.contains(forbidden),
+                    "MCP tool `{}` looks like a broadcast entry point. Going live is human-only \
+                     (docs-internal/design/live-safety.md); if this tool is genuinely read-only \
+                     or a stop, widen this test deliberately rather than renaming around it.",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// Belt and braces: the dispatcher must not answer a broadcast-shaped name
+    /// even if one were somehow requested.
+    #[test]
+    fn call_tool_rejects_broadcast_shaped_names() {
+        for name in ["live_go", "go_live", "start_stream", "swervebuild_go_live"] {
+            let err = call_tool(name, &json!({}))
+                .expect_err("broadcast-shaped tool names must not dispatch");
+            assert!(
+                err.to_lowercase().contains("unknown tool") || err.to_lowercase().contains("not found"),
+                "unexpected error for `{name}`: {err}"
+            );
+        }
+    }
+}
