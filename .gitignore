@@ -33,3 +33,6 @@ scripts/_*.py
 
 # Hero-proof / capture artifacts copied under the project (S30)
 /swerve-media/
+
+# python cache from smoke-harness imports
+scripts/__pycache__/

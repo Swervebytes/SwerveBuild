@@ -16,6 +16,7 @@ mod media_providers;
 mod model_catalog;
 pub mod paths;
 mod providers;
+pub mod provider_auth;
 pub mod secrets;
 mod store;
 pub mod terminal;
@@ -1643,6 +1644,29 @@ fn stream_key_name(target: String) -> Result<String, String> {
     secrets::stream_key_name(&target)
 }
 
+// ---- provider sign-in (P1.1 / S-AUTH) ----------------------------------------
+//
+// Human-only surface: reachable from Settings, never exposed as an MCP tool.
+// Both are blocking (they spawn and drive an agent process), so they run on a
+// worker thread like the install commands above.
+
+#[tauri::command]
+async fn provider_auth_probe(provider_id: String) -> Result<provider_auth::AuthProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || provider_auth::probe(&provider_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn provider_sign_in(
+    provider_id: String,
+    method_id: String,
+) -> Result<provider_auth::SignInOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || provider_auth::sign_in(&provider_id, &method_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // ---- go-live approval tier (S38) ---------------------------------------------
 //
 // Every command here passes `Caller::Human` because the webview *is* the human
@@ -1985,6 +2009,8 @@ pub fn run() {
             provider_install_info,
             install_provider_cli,
             uninstall_provider_cli,
+            provider_auth_probe,
+            provider_sign_in,
             set_browser_debug_grant,
             set_browser_public,
             browser_pane_set_bounds,
