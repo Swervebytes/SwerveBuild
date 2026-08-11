@@ -41,6 +41,20 @@
   // inspector
   let inspector = $state<{ automationId: string; runId: string; name: string } | null>(null);
   let transcript = $state<TranscriptLine[]>([]);
+  /** Output that raced ahead of runNow's returned id (replayed, capped). */
+  let pendingOutput: RunOutput[] = [];
+
+  function appendTranscript(line: TranscriptLine) {
+    if (line.kind === "text") {
+      const last = transcript[transcript.length - 1];
+      if (last && last.kind === "text") {
+        last.text += line.text;
+        transcript = [...transcript];
+        return;
+      }
+    }
+    transcript = [...transcript, line];
+  }
   let inspectorStatus = $state<RunRecord["status"] | "running">("running");
   let inspectorError = $state<string | null>(null);
   let showRawError = $state(false);
@@ -74,17 +88,17 @@
 
     const offs = [
       subscribe<RunOutput>("automation-run-output", (e) => {
-        if (!inspector || e.payload.runId !== inspector.runId) return;
-        const line: TranscriptLine = { kind: e.payload.type, text: e.payload.text };
-        if (line.kind === "text") {
-          const last = transcript[transcript.length - 1];
-          if (last && last.kind === "text") {
-            last.text += line.text;
-            transcript = [...transcript];
-            return;
-          }
+        if (!inspector) return;
+        // Run-now race (audit D): output can arrive before the runNow invoke
+        // returns the run id. While the inspector is in that pending state
+        // (runId === ""), buffer instead of dropping — runNow() replays the
+        // buffer once it learns the id.
+        if (inspector.runId === "") {
+          if (pendingOutput.length < 500) pendingOutput.push(e.payload);
+          return;
         }
-        transcript = [...transcript, line];
+        if (e.payload.runId !== inspector.runId) return;
+        appendTranscript({ kind: e.payload.type, text: e.payload.text });
       }),
 
       subscribe<{ automationId: string; runId: string }>("automation-run-started", () => {
@@ -219,16 +233,26 @@
     }
     busy = a.id;
     transcript = [];
+    pendingOutput = [];
     inspectorStatus = "running";
     inspectorError = null;
     showRawError = false;
+    // Open the inspector in its pending state BEFORE the invoke so the output
+    // listener buffers early lines instead of dropping them (audit D race).
+    inspector = { automationId: a.id, runId: "", name: a.name };
     try {
       const runId = await automationsStore.runNow(a.id);
       inspector = { automationId: a.id, runId, name: a.name };
+      // Replay whatever raced ahead of the id.
+      for (const out of pendingOutput) {
+        if (out.runId === runId) appendTranscript({ kind: out.type, text: out.text });
+      }
+      pendingOutput = [];
     } catch (err) {
       inspector = { automationId: a.id, runId: "", name: a.name };
       inspectorStatus = "launchfailed";
       inspectorError = String(err);
+      pendingOutput = [];
     } finally {
       busy = null;
     }

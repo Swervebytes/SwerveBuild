@@ -29,6 +29,16 @@
   let scroller: HTMLDivElement | undefined = $state();
   let stick = true;
 
+  // Audit D: an unbounded list makes a months-old chat render thousands of
+  // bubbles. Render the newest window by default; one click expands fully
+  // (no virtualization — the cap keeps the common case cheap and simple).
+  const RENDER_CAP = 150;
+  let showAll = $state(false);
+  const visibleMessages = $derived(
+    showAll || messages.length <= RENDER_CAP ? messages : messages.slice(-RENDER_CAP),
+  );
+  const hiddenCount = $derived(messages.length - visibleMessages.length);
+
   function onScroll() {
     if (!scroller) return;
     const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
@@ -61,7 +71,17 @@
 
 <div class="scroll" bind:this={scroller} onscroll={onScroll}>
   <div class="reading-col list">
-    {#each messages as m (m.id)}
+    {#if hiddenCount > 0}
+      <button
+        class="show-earlier"
+        type="button"
+        data-testid="chat-show-earlier"
+        onclick={() => (showAll = true)}
+      >
+        Show {hiddenCount} earlier message{hiddenCount === 1 ? "" : "s"}
+      </button>
+    {/if}
+    {#each visibleMessages as m (m.id)}
       <!-- Saved reasoning/tool trail, rendered with the same components the live
            stream uses so a reloaded chat looks like the turn did when it ran. -->
       {#each m.parts ?? [] as part, i (i)}
@@ -122,5 +142,19 @@
     display: flex;
     flex-direction: column;
     gap: 0.4rem;
+  }
+  .show-earlier {
+    align-self: center;
+    margin-bottom: 0.5rem;
+    padding: 0.3rem 0.9rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    background: var(--bg-muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .show-earlier:hover {
+    color: var(--text);
   }
 </style>
