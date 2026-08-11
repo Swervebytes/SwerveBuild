@@ -29,7 +29,30 @@ const WRITE_APPROVAL_TIMEOUT_SECS: u64 = 600;
 const MAX_CONCURRENT_SESSIONS: usize = 3;
 
 type SessionMap = HashMap<String, ActiveSession>;
-type WriteApprovalMap = HashMap<(String, u64), mpsc::Sender<bool>>;
+/// Keyed by (chat_id, [`id_key`] of the JSON-RPC id) — the id is kept in its
+/// JSON form end-to-end (B9): an ACP peer may use string ids, and coercing to
+/// u64 either dropped its permission request or broke the reply id.
+type WriteApprovalMap = HashMap<(String, String), mpsc::Sender<bool>>;
+
+/// Canonical map/compare key for a JSON-RPC id of any legal shape. `5` and
+/// `"5"` stay distinct (`5` vs `"\"5\""`), matching JSON-RPC's identity rules.
+fn id_key(id: &Value) -> String {
+    id.to_string()
+}
+
+/// Reply to `session/request_permission`, echoing the id exactly as received.
+fn permission_reply(request_id: &Value, option_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id
+            }
+        }
+    })
+}
 
 pub struct AcpManager {
     /// Arc so the stdout reader can remove a dead session without holding
@@ -297,7 +320,11 @@ impl AcpManager {
                     }
 
                     if method == "session/request_permission" {
-                        if let Some(id) = jsonrpc_id(&value) {
+                        // B9: forward the id VERBATIM (number or string). The UI
+                        // round-trips it untouched into respond_permission, so a
+                        // string-id peer gets a correctly-addressed reply instead
+                        // of a silently dropped request.
+                        if let Some(id) = value.get("id").cloned().filter(|v| !v.is_null()) {
                             let _ = app_for_reader.emit(
                                 "chat-permission-request",
                                 json!({
@@ -580,14 +607,14 @@ impl AcpManager {
     pub fn respond_permission(
         &self,
         chat_id: &str,
-        request_id: u64,
+        request_id: &Value,
         option_id: &str,
     ) -> Result<(), String> {
         // Client-side write approvals are parked in write_approvals (not as an
         // agent permission RPC). Resolve those first so the reader can finish
         // the fs/write_text_file reply.
         if let Ok(mut map) = self.write_approvals.lock() {
-            if let Some(tx) = map.remove(&(chat_id.to_string(), request_id)) {
+            if let Some(tx) = map.remove(&(chat_id.to_string(), id_key(request_id))) {
                 let allowed = option_id.starts_with("allow");
                 let _ = tx.send(allowed);
                 return Ok(());
@@ -605,18 +632,7 @@ impl AcpManager {
             Arc::clone(&active.transport)
         };
 
-        let reply = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": option_id
-                }
-            }
-        });
-
-        transport.write_json_line(&reply)
+        transport.write_json_line(&permission_reply(request_id, option_id))
     }
 
     pub fn send_prompt(&self, chat_id: &str, text: &str, images: &[String]) -> Result<(), String> {
@@ -986,18 +1002,15 @@ fn handle_write_with_approval(
     let target = confine_to_cwd(path, cwd)
         .ok_or((-32001, format!("path outside project directory: {path}")))?;
 
-    let id = request_id
-        .as_u64()
-        .or_else(|| request_id.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
-        .or_else(|| request_id.as_str().and_then(|s| s.parse().ok()))
-        .ok_or((-32602, "invalid request id".to_string()))?;
+    // B9: the id stays in its JSON form; number and string ids both work.
+    let id = id_key(request_id);
 
     let (tx, rx) = mpsc::channel();
     {
         let mut map = write_approvals
             .lock()
             .map_err(|_| (-32000, "write approval lock poisoned".to_string()))?;
-        map.insert((chat_id.to_string(), id), tx);
+        map.insert((chat_id.to_string(), id.clone()), tx);
     }
 
     // Reuse the same event + modal as session/request_permission so background
@@ -1013,7 +1026,9 @@ fn handle_write_with_approval(
         "chat-permission-request",
         json!({
             "chatId": chat_id,
-            "requestId": id,
+            // Raw JSON id — the UI hands it back verbatim to respond_permission,
+            // which resolves this parked approval via the same id_key.
+            "requestId": request_id.clone(),
             "params": {
                 "toolCall": {
                     "title": title,
@@ -1033,7 +1048,7 @@ fn handle_write_with_approval(
         Err(_) => {
             // Timed out or sender dropped — drop our slot if still present.
             if let Ok(mut map) = write_approvals.lock() {
-                map.remove(&(chat_id.to_string(), id));
+                map.remove(&(chat_id.to_string(), id.clone()));
             }
             return Err((-32003, "write approval timed out or cancelled".to_string()));
         }
@@ -1157,6 +1172,48 @@ fn strip_verbatim(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- B9: JSON-RPC ids round-trip in their original form ----------------
+
+    #[test]
+    fn permission_reply_echoes_string_and_number_ids_verbatim() {
+        let s = permission_reply(&json!("req-abc-123"), "allow_once");
+        assert_eq!(s["id"], json!("req-abc-123"), "string id must stay a string");
+        assert_eq!(s["result"]["outcome"]["optionId"], "allow_once");
+
+        let n = permission_reply(&json!(42), "reject");
+        assert_eq!(n["id"], json!(42), "numeric id must stay a number");
+    }
+
+    #[test]
+    fn id_key_keeps_string_and_number_ids_distinct() {
+        // JSON-RPC identity: 5 and "5" are different ids. A map key that
+        // conflated them could resolve the wrong pending approval.
+        assert_ne!(id_key(&json!(5)), id_key(&json!("5")));
+        assert_eq!(id_key(&json!(5)), "5");
+        assert_eq!(id_key(&json!("5")), "\"5\"");
+    }
+
+    #[test]
+    fn write_approval_map_round_trips_a_string_id() {
+        // The exact flow a string-id peer exercises: park under id_key, then
+        // respond_permission's map lookup resolves it with the same key.
+        let approvals: Mutex<WriteApprovalMap> = Mutex::new(HashMap::new());
+        let request_id = json!("write-req-7f");
+        let (tx, rx) = mpsc::channel();
+        approvals
+            .lock()
+            .unwrap()
+            .insert(("chat-1".to_string(), id_key(&request_id)), tx);
+
+        let resolved = approvals
+            .lock()
+            .unwrap()
+            .remove(&("chat-1".to_string(), id_key(&request_id)));
+        assert!(resolved.is_some(), "string id must find its parked approval");
+        resolved.unwrap().send(true).unwrap();
+        assert!(rx.recv().unwrap());
+    }
 
     #[test]
     fn confine_rejects_parent_escape() {

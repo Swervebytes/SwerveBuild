@@ -1017,10 +1017,11 @@ fn close_chat_session(
 fn respond_chat_permission(
     acp: State<'_, Arc<AcpManager>>,
     chat_id: String,
-    request_id: u64,
+    // B9: raw JSON id (number or string), echoed back to the agent verbatim.
+    request_id: serde_json::Value,
     option_id: String,
 ) -> Result<(), String> {
-    acp.respond_permission(&chat_id, request_id, &option_id)
+    acp.respond_permission(&chat_id, &request_id, &option_id)
 }
 
 #[tauri::command]
