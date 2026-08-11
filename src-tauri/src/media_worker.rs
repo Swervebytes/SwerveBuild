@@ -1,8 +1,14 @@
 //! Media worker process shell (S24+ / Step 7).
 //!
 //! Separate process so capture/encode crashes never take down chat.
-//! Still PNG (S25); pinned LGPL FFmpeg (S27); optional dshow audio track
-//! (S28 — WASAPI not in the pinned LGPL build).
+//! Still PNG (S25); pinned LGPL FFmpeg (S27); dshow capture-device audio (S28).
+//!
+//! **S33 desktop audio:** system audio is captured in-process via **WASAPI
+//! loopback** (`cpal` on the default *render* device) and piped to FFmpeg as
+//! raw PCM on stdin. FFmpeg has no WASAPI input of its own (trac #9408, open
+//! since 2021) and the only dshow route is a third-party GPLv3 driver, so this
+//! removes the old "Stereo Mix must exist" dependency. Ladder: wasapi → dshow
+//! → silent, and `audio_mode` always reports which one actually ran.
 //!
 //! **S32 recorder v2:** clips are now REAL screen recordings — `ddagrab`
 //! (Desktop Duplication) → H.264 (`h264_nvenc`, `libopenh264` fallback) → MP4,
@@ -518,7 +524,8 @@ pub fn encode_clip(still_path: Option<String>) -> Result<EncodeClipResult, Strin
 }
 
 /// Encode options for MCP / hero path (S29).
-/// `audio`: `auto` | `none` | `dshow`. Optional `project_id` copies clip to project.
+/// `audio`: `auto` | `none` | `wasapi` (desktop) | `dshow` (mic/capture device).
+/// `auto` = wasapi → dshow → silent. Optional `project_id` copies clip to project.
 pub fn encode_clip_opts(
     still_path: Option<String>,
     duration_secs: f64,
@@ -1041,7 +1048,7 @@ fn handle_client(mut stream: TcpStream, token: &str, out_dir: &PathBuf) {
         struct EncodeReq {
             still_path: Option<String>,
             duration_secs: Option<f64>,
-            /// `auto` (default) | `none` | `dshow`
+            /// `auto` (default) | `none` | `wasapi` (desktop) | `dshow` (mic)
             audio: Option<String>,
             /// Optional exact DirectShow audio device name.
             audio_device: Option<String>,
@@ -1154,11 +1161,30 @@ const CLIP_FRAMERATE: u32 = 30;
 /// `libopenh264` (BSD) is the no-GPU / driver-missing fallback.
 const CLIP_ENCODERS: [&str; 2] = ["h264_nvenc", "libopenh264"];
 
-/// Build FFmpeg args for a live screen recording (S32 recorder v2).
+/// Where a clip's audio comes from (S33).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClipAudioArg<'a> {
+    /// No audio track.
+    None,
+    /// DirectShow capture device — a mic, or a "Stereo Mix"-class device on the
+    /// rare box that exposes one. Cannot capture desktop audio on its own.
+    Dshow(&'a str),
+    /// Raw PCM arriving on stdin, captured in-process via WASAPI loopback.
+    /// This is how desktop/system audio actually works (S33).
+    Pipe { fmt: &'a str, rate: u32, channels: u16 },
+}
+
+impl ClipAudioArg<'_> {
+    fn is_some(&self) -> bool {
+        !matches!(self, ClipAudioArg::None)
+    }
+}
+
+/// Build FFmpeg args for a live screen recording (S32 recorder v2 + S33 audio).
 ///
 /// Video: `ddagrab` (Desktop Duplication API) → `hwdownload` → yuv420p → H.264,
 /// muxed to MP4 with `+faststart` (streamable) and CFR timing.
-/// Audio: optional DirectShow device as AAC; omitted entirely when `None`.
+/// Audio: dshow device, or PCM on stdin (WASAPI loopback), or none.
 ///
 /// Pure/arg-only so the shape is unit-testable without spawning FFmpeg.
 /// Replaces the S26 looped-still MJPEG/AVI path (dead end: ~5-10x bitrate,
@@ -1166,25 +1192,42 @@ const CLIP_ENCODERS: [&str; 2] = ["h264_nvenc", "libopenh264"];
 pub fn build_clip_args(
     out: &str,
     duration: &str,
-    dshow_audio: Option<&str>,
+    audio: ClipAudioArg,
     video_encoder: &str,
     framerate: u32,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
 
     // Audio input first so it is input 0; video comes from the filter graph.
-    if let Some(dev) = dshow_audio {
-        a.extend([
-            "-f".into(),
-            "dshow".into(),
-            // Default dshow audio buffering is ~500ms; 50ms keeps A/V tight.
-            "-audio_buffer_size".into(),
-            "50".into(),
-            "-thread_queue_size".into(),
-            "1024".into(),
-            "-i".into(),
-            format!("audio={dev}"),
-        ]);
+    match audio {
+        ClipAudioArg::None => {}
+        ClipAudioArg::Dshow(dev) => {
+            a.extend([
+                "-f".into(),
+                "dshow".into(),
+                // Default dshow audio buffering is ~500ms; 50ms keeps A/V tight.
+                "-audio_buffer_size".into(),
+                "50".into(),
+                "-thread_queue_size".into(),
+                "1024".into(),
+                "-i".into(),
+                format!("audio={dev}"),
+            ]);
+        }
+        ClipAudioArg::Pipe { fmt, rate, channels } => {
+            a.extend([
+                "-f".into(),
+                fmt.into(),
+                "-ar".into(),
+                rate.to_string(),
+                "-ac".into(),
+                channels.to_string(),
+                "-thread_queue_size".into(),
+                "1024".into(),
+                "-i".into(),
+                "pipe:0".into(),
+            ]);
+        }
     }
 
     a.extend([
@@ -1193,7 +1236,7 @@ pub fn build_clip_args(
         "-map".into(),
         "[v]".into(),
     ]);
-    if dshow_audio.is_some() {
+    if audio.is_some() {
         a.extend(["-map".into(), "0:a".into()]);
     }
 
@@ -1209,7 +1252,7 @@ pub fn build_clip_args(
         a.extend(["-b:v".into(), "6M".into()]);
     }
 
-    if dshow_audio.is_some() {
+    if audio.is_some() {
         a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
     }
 
@@ -1221,6 +1264,45 @@ pub fn build_clip_args(
         out.into(),
     ]);
     a
+}
+
+/// A WASAPI loopback source resolved from the default render device (S33).
+#[derive(Debug, Clone)]
+pub struct LoopbackSpec {
+    pub device_name: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// FFmpeg raw-PCM demuxer name matching the device's sample format.
+    pub fmt: &'static str,
+}
+
+/// Resolve the default RENDER device for loopback capture.
+///
+/// WASAPI loopback = open an *output* device for input; cpal sets
+/// `AUDCLNT_STREAMFLAGS_LOOPBACK` when `build_input_stream` is called on one.
+/// FFmpeg itself has no WASAPI input (trac #9408, open since 2021) and the only
+/// dshow route is a third-party GPLv3 driver, so we capture in-process.
+pub fn resolve_loopback_spec() -> Result<LoopbackSpec, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let dev = host
+        .default_output_device()
+        .ok_or_else(|| "no default output device".to_string())?;
+    let name = dev.name().unwrap_or_else(|_| "unknown".into());
+    let cfg = dev
+        .default_output_config()
+        .map_err(|e| format!("default_output_config: {e}"))?;
+    let fmt = match cfg.sample_format() {
+        cpal::SampleFormat::F32 => "f32le",
+        cpal::SampleFormat::I16 => "s16le",
+        other => return Err(format!("unsupported loopback sample format: {other:?}")),
+    };
+    Ok(LoopbackSpec {
+        device_name: name,
+        sample_rate: cfg.sample_rate().0,
+        channels: cfg.channels(),
+        fmt,
+    })
 }
 
 /// Record the live desktop to an MP4 clip (S32) + optional dshow audio (S28).
@@ -1241,68 +1323,129 @@ fn record_screen_clip(
     let out = out_dir.join(format!("clip-{}.mp4", uuid::Uuid::new_v4()));
     let dur = format!("{duration_secs:.2}");
 
-    let want_audio = !matches!(audio_pref, "none" | "off" | "silent" | "an");
-    let device = if want_audio {
-        resolve_dshow_audio_device(&ffmpeg, audio_device)
-    } else {
-        None
-    };
+    // Audio sources to try, best first. `auto` prefers real desktop audio.
+    let mut plans: Vec<AudioPlan> = Vec::new();
+    match audio_pref {
+        "none" | "off" | "silent" | "an" => {}
+        "dshow" | "mic" => {
+            if let Some(d) = resolve_dshow_audio_device(&ffmpeg, audio_device) {
+                plans.push(AudioPlan::Dshow(d));
+            }
+        }
+        "wasapi" | "loopback" | "desktop" => match resolve_loopback_spec() {
+            Ok(s) => plans.push(AudioPlan::Wasapi(s)),
+            Err(e) => eprintln!("media clip loopback unavailable ({e})"),
+        },
+        _ => {
+            // auto: desktop audio is what a screen recorder should capture;
+            // only fall back to a capture device (mic / Stereo Mix) if it fails.
+            match resolve_loopback_spec() {
+                Ok(s) => plans.push(AudioPlan::Wasapi(s)),
+                Err(e) => eprintln!("media clip loopback unavailable ({e})"),
+            }
+            if let Some(d) = resolve_dshow_audio_device(&ffmpeg, audio_device) {
+                plans.push(AudioPlan::Dshow(d));
+            }
+        }
+    }
+    plans.push(AudioPlan::Silent);
 
-    let finish = |encoder: &str, dev: Option<&String>| -> Result<EncodeClipResult, String> {
+    let finish = |encoder: &str, mode: &str, dev: Option<String>| -> Result<EncodeClipResult, String> {
         let meta = std::fs::metadata(&out).map_err(|e| e.to_string())?;
+        let has_audio = mode != "silent";
         Ok(EncodeClipResult {
             ok: true,
             path: out.display().to_string(),
             bytes: meta.len(),
             duration_secs,
             still_path: still.display().to_string(),
-            codec: if dev.is_some() {
+            codec: if has_audio {
                 format!("{encoder}+aac")
             } else {
                 encoder.to_string()
             },
-            has_audio: dev.is_some(),
-            audio_device: dev.cloned(),
-            audio_mode: if dev.is_some() { "dshow" } else { "silent" }.into(),
+            has_audio,
+            audio_device: dev,
+            audio_mode: mode.into(),
         })
     };
 
     let mut last_err = String::from("no encoder attempted");
     for encoder in CLIP_ENCODERS {
-        if let Some(ref dev) = device {
-            match run_ffmpeg_clip(&ffmpeg, &out, &dur, Some(dev.as_str()), encoder) {
-                Ok(()) => return finish(encoder, Some(dev)),
+        for plan in &plans {
+            let attempt = match plan {
+                AudioPlan::Wasapi(spec) => {
+                    run_ffmpeg_clip_loopback(&ffmpeg, &out, &dur, spec, encoder)
+                }
+                AudioPlan::Dshow(dev) => {
+                    run_ffmpeg_clip(&ffmpeg, &out, &dur, ClipAudioArg::Dshow(dev), encoder)
+                }
+                AudioPlan::Silent => {
+                    run_ffmpeg_clip(&ffmpeg, &out, &dur, ClipAudioArg::None, encoder)
+                }
+            };
+            match attempt {
+                Ok(()) => {
+                    return match plan {
+                        AudioPlan::Wasapi(s) => {
+                            finish(encoder, "wasapi", Some(s.device_name.clone()))
+                        }
+                        AudioPlan::Dshow(d) => finish(encoder, "dshow", Some(d.clone())),
+                        AudioPlan::Silent => finish(encoder, "silent", None),
+                    }
+                }
                 Err(e) => {
-                    // Device busy / open failed → silent path (silent must still work).
-                    // Logged only: the silent attempt below always sets last_err.
-                    eprintln!("media clip {encoder} with audio failed ({e}); trying silent");
+                    eprintln!("media clip {encoder}/{} failed ({e})", plan.label());
+                    last_err = e;
                     let _ = std::fs::remove_file(&out);
                 }
             }
         }
-        match run_ffmpeg_clip(&ffmpeg, &out, &dur, None, encoder) {
-            Ok(()) => return finish(encoder, None),
-            Err(e) => {
-                eprintln!("media clip {encoder} silent failed ({e}); trying next encoder");
-                last_err = e;
-                let _ = std::fs::remove_file(&out);
-            }
+    }
+    Err(format!(
+        "clip record failed (all encoders + audio sources): {last_err}"
+    ))
+}
+
+/// One audio source attempt inside the record ladder (S33).
+enum AudioPlan {
+    /// Desktop/system audio via WASAPI loopback, piped in-process.
+    Wasapi(LoopbackSpec),
+    /// A DirectShow capture device (mic, or Stereo-Mix-class if present).
+    Dshow(String),
+    /// No audio track.
+    Silent,
+}
+
+impl AudioPlan {
+    fn label(&self) -> &'static str {
+        match self {
+            AudioPlan::Wasapi(_) => "wasapi",
+            AudioPlan::Dshow(_) => "dshow",
+            AudioPlan::Silent => "silent",
         }
     }
-    Err(format!("clip record failed (all encoders): {last_err}"))
+}
+
+fn verify_clip_output(out: &Path, tag: &str) -> Result<(), String> {
+    // A failed encoder can leave a 0-byte file behind; verify rather than trust.
+    match std::fs::metadata(out) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        _ => Err(format!("ffmpeg {tag} produced no output")),
+    }
 }
 
 fn run_ffmpeg_clip(
     ffmpeg: &Path,
     out: &Path,
     duration: &str,
-    dshow_audio: Option<&str>,
+    audio: ClipAudioArg,
     video_encoder: &str,
 ) -> Result<(), String> {
     let args = build_clip_args(
         &out.display().to_string(),
         duration,
-        dshow_audio,
+        audio,
         video_encoder,
         CLIP_FRAMERATE,
     );
@@ -1313,11 +1456,111 @@ fn run_ffmpeg_clip(
     if !status.success() {
         return Err(format!("ffmpeg {video_encoder} failed with {status}"));
     }
-    // A failed encoder can still exit 0-ish or leave a 0-byte file; verify.
-    match std::fs::metadata(out) {
-        Ok(m) if m.len() > 0 => Ok(()),
-        _ => Err(format!("ffmpeg {video_encoder} produced no output")),
+    verify_clip_output(out, video_encoder)
+}
+
+/// Record with DESKTOP audio (S33): FFmpeg reads raw PCM from stdin while this
+/// process pumps WASAPI loopback samples into it.
+///
+/// Loopback delivers a continuous stream (silence included) while the render
+/// device is active, so no silence-padding clock is needed — measured at
+/// exactly `rate * channels` samples/sec on an idle desktop.
+fn run_ffmpeg_clip_loopback(
+    ffmpeg: &Path,
+    out: &Path,
+    duration: &str,
+    spec: &LoopbackSpec,
+    video_encoder: &str,
+) -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::mpsc;
+
+    let args = build_clip_args(
+        &out.display().to_string(),
+        duration,
+        ClipAudioArg::Pipe {
+            fmt: spec.fmt,
+            rate: spec.sample_rate,
+            channels: spec.channels,
+        },
+        video_encoder,
+        CLIP_FRAMERATE,
+    );
+
+    let host = cpal::default_host();
+    let dev = host
+        .default_output_device()
+        .ok_or_else(|| "no default output device".to_string())?;
+    let cfg = dev
+        .default_output_config()
+        .map_err(|e| format!("default_output_config: {e}"))?;
+    let stream_cfg: cpal::StreamConfig = cfg.clone().into();
+
+    let mut child = crate::util::hidden_command(ffmpeg)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ffmpeg stdin unavailable".to_string())?;
+
+    // Audio callback must never block: hand bytes to a writer thread.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let err_fn = |e| eprintln!("loopback stream error: {e}");
+    let stream = match cfg.sample_format() {
+        cpal::SampleFormat::F32 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut buf = Vec::with_capacity(data.len() * 4);
+                for s in data {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = tx.send(buf);
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::I16 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                let mut buf = Vec::with_capacity(data.len() * 2);
+                for s in data {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = tx.send(buf);
+            },
+            err_fn,
+            None,
+        ),
+        other => return Err(format!("unsupported loopback sample format: {other:?}")),
     }
+    .map_err(|e| format!("build loopback stream: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("play loopback stream: {e}"))?;
+
+    let writer = thread::spawn(move || {
+        // Ends when FFmpeg closes the pipe (it stops itself at -t) or the
+        // stream is dropped below, which drops `tx` and closes the channel.
+        while let Ok(buf) = rx.recv() {
+            if stdin.write_all(&buf).is_err() {
+                break;
+            }
+        }
+    });
+
+    let status = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
+    drop(stream); // stop capture → drops tx → writer thread exits
+    let _ = writer.join();
+
+    if !status.success() {
+        return Err(format!(
+            "ffmpeg {video_encoder} (wasapi loopback) failed with {status}"
+        ));
+    }
+    verify_clip_output(out, video_encoder)
 }
 
 /// Pick a DirectShow audio capture device (explicit name or auto).
@@ -1532,7 +1775,7 @@ mod tests {
     /// S32: silent recording is live desktop capture → H.264 → MP4, no inputs.
     #[test]
     fn clip_args_silent_capture_live_desktop() {
-        let a = build_clip_args("out.mp4", "2.00", None, "h264_nvenc", 30);
+        let a = build_clip_args("out.mp4", "2.00", ClipAudioArg::None, "h264_nvenc", 30);
         let joined = a.join(" ");
         // Live capture, not a looped still: ddagrab source, no -i / -loop input.
         assert!(joined.contains("ddagrab=framerate=30"), "{joined}");
@@ -1552,7 +1795,7 @@ mod tests {
     /// so both need explicit maps or FFmpeg drops one.
     #[test]
     fn clip_args_audio_maps_filter_video_and_device_audio() {
-        let a = build_clip_args("out.mp4", "2.00", Some("Line (AudioBox Go)"), "h264_nvenc", 30);
+        let a = build_clip_args("out.mp4", "2.00", ClipAudioArg::Dshow("Line (AudioBox Go)"), "h264_nvenc", 30);
         let joined = a.join(" ");
         assert!(joined.contains("-f dshow"), "{joined}");
         assert!(joined.contains("-i audio=Line (AudioBox Go)"), "{joined}");
@@ -1566,11 +1809,11 @@ mod tests {
     /// S32: software fallback is rate-controlled, not NVENC's -cq.
     #[test]
     fn clip_args_software_encoder_uses_bitrate_not_cq() {
-        let sw = build_clip_args("out.mp4", "2.00", None, "libopenh264", 30).join(" ");
+        let sw = build_clip_args("out.mp4", "2.00", ClipAudioArg::None, "libopenh264", 30).join(" ");
         assert!(sw.contains("-c:v libopenh264"), "{sw}");
         assert!(sw.contains("-b:v"), "{sw}");
         assert!(!sw.contains("-cq"), "{sw}");
-        let gpu = build_clip_args("out.mp4", "2.00", None, "h264_nvenc", 30).join(" ");
+        let gpu = build_clip_args("out.mp4", "2.00", ClipAudioArg::None, "h264_nvenc", 30).join(" ");
         assert!(gpu.contains("-cq 23"), "{gpu}");
         assert!(gpu.contains("-preset p5"), "{gpu}");
     }
@@ -1579,6 +1822,48 @@ mod tests {
     #[test]
     fn clip_encoder_ladder_is_gpu_then_software() {
         assert_eq!(CLIP_ENCODERS, ["h264_nvenc", "libopenh264"]);
+    }
+
+    /// S33: desktop audio arrives as raw PCM on stdin, so FFmpeg needs the
+    /// demuxer + rate + channels declared or it cannot parse the stream.
+    #[test]
+    fn clip_args_wasapi_pipe_declares_raw_pcm_input() {
+        let a = build_clip_args(
+            "out.mp4",
+            "2.00",
+            ClipAudioArg::Pipe {
+                fmt: "f32le",
+                rate: 48000,
+                channels: 2,
+            },
+            "h264_nvenc",
+            30,
+        );
+        let joined = a.join(" ");
+        assert!(joined.contains("-f f32le"), "{joined}");
+        assert!(joined.contains("-ar 48000"), "{joined}");
+        assert!(joined.contains("-ac 2"), "{joined}");
+        assert!(joined.contains("-i pipe:0"), "{joined}");
+        // Same mapping contract as dshow: filter video + input-0 audio.
+        assert!(joined.contains("-map [v]"), "{joined}");
+        assert!(joined.contains("-map 0:a"), "{joined}");
+        assert!(joined.contains("-c:a aac"), "{joined}");
+        // Loopback is not a dshow device — must not emit dshow args.
+        assert!(!joined.contains("dshow"), "{joined}");
+    }
+
+    /// The three sources must stay distinguishable — `audio_mode` is the field
+    /// that tells the operator whether they got desktop audio or just a mic.
+    #[test]
+    fn clip_audio_arg_reports_presence() {
+        assert!(!ClipAudioArg::None.is_some());
+        assert!(ClipAudioArg::Dshow("x").is_some());
+        assert!(ClipAudioArg::Pipe {
+            fmt: "f32le",
+            rate: 48000,
+            channels: 2
+        }
+        .is_some());
     }
 
     #[test]
@@ -1596,6 +1881,71 @@ mod tests {
         assert!(v.get("ffmpeg").is_some());
     }
 
+    /// Live probe (S33): does WASAPI loopback open on the default RENDER
+    /// device, and does it deliver samples when nothing is playing?
+    /// `cargo test -p swerve-build --lib media_worker::tests::live_wasapi_loopback_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_wasapi_loopback_probe() {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let host = cpal::default_host();
+        let dev = host.default_output_device().expect("default output device");
+        eprintln!("device: {:?}", dev.name());
+        let cfg = dev.default_output_config().expect("default output config");
+        eprintln!("default_output_config: {cfg:?}");
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (n2, c2) = (n.clone(), calls.clone());
+        let stream = dev
+            .build_input_stream(
+                &cfg.clone().into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    n2.fetch_add(data.len(), Ordering::Relaxed);
+                    c2.fetch_add(1, Ordering::Relaxed);
+                },
+                |e| eprintln!("stream error: {e}"),
+                None,
+            )
+            .expect("build_input_stream on an OUTPUT device == WASAPI loopback");
+        stream.play().expect("play");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        eprintln!(
+            "SILENT-DESKTOP RESULT: {} samples in {} callbacks",
+            n.load(Ordering::Relaxed),
+            calls.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Live (S33): record with DESKTOP audio via WASAPI loopback and prove the
+    /// result is labelled honestly (`wasapi`, not `dshow`).
+    /// `cargo test -p swerve-build --lib media_worker::tests::live_wasapi_loopback_records -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_wasapi_loopback_records() {
+        let dir = std::env::temp_dir().join("swerve_s33_loopback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let still = dir.join("poster.png");
+        // Poster only — never the video source since S32.
+        std::fs::write(&still, b"").ok();
+
+        let r = record_screen_clip(&still, &dir, 2.0, "wasapi", None)
+            .expect("loopback record must succeed");
+        eprintln!(
+            "wasapi: mode={} device={:?} codec={} bytes={} path={}",
+            r.audio_mode, r.audio_device, r.codec, r.bytes, r.path
+        );
+        assert_eq!(r.audio_mode, "wasapi", "must not silently downgrade");
+        assert!(r.has_audio);
+        assert!(r.codec.ends_with("+aac"), "codec: {}", r.codec);
+        assert!(PathBuf::from(&r.path).is_file());
+        assert!(r.bytes > 0);
+    }
+
     /// Live: the software fallback encoder must work through the SAME arg
     /// builder the ladder uses, so a box without NVENC still records (S32).
     /// `cargo test -p swerve-build --lib media_worker::tests::live_software_encoder_records -- --ignored --nocapture`
@@ -1607,7 +1957,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("sw.mp4");
-        run_ffmpeg_clip(&ffmpeg, &out, "1.50", None, "libopenh264")
+        run_ffmpeg_clip(&ffmpeg, &out, "1.50", ClipAudioArg::None, "libopenh264")
             .expect("software encoder must record without NVENC");
         let bytes = std::fs::metadata(&out).unwrap().len();
         assert!(bytes > 0, "software clip is empty");
@@ -1650,6 +2000,22 @@ mod tests {
             with_audio.bytes
         );
         assert!(PathBuf::from(&with_audio.path).is_file());
+        // S33: auto prefers real desktop audio; dshow only if loopback failed.
+        assert!(
+            matches!(with_audio.audio_mode.as_str(), "wasapi" | "dshow"),
+            "unexpected auto mode: {}",
+            with_audio.audio_mode
+        );
+
+        // The mic / capture-device path must survive the S33 refactor.
+        let dshow = record_screen_clip(&still, &dir, 2.0, "dshow", None).expect("dshow encode");
+        eprintln!("dshow: mode={} device={:?}", dshow.audio_mode, dshow.audio_device);
+        assert!(
+            matches!(dshow.audio_mode.as_str(), "dshow" | "silent"),
+            "dshow pref must never report wasapi: {}",
+            dshow.audio_mode
+        );
+        assert!(PathBuf::from(&dshow.path).is_file());
 
         let silent =
             record_screen_clip(&still, &dir, 2.0, "none", None).expect("silent encode");
