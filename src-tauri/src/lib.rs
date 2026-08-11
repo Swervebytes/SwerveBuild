@@ -1124,7 +1124,8 @@ impl GrokEndpointView {
             model: endpoint.model,
             api_backend: endpoint.api_backend,
             context_window: endpoint.context_window,
-            has_api_key: !endpoint.api_key.is_empty(),
+            // P1.2: existence check spans keystore + not-yet-migrated plaintext.
+            has_api_key: providers::endpoint_api_key().is_some(),
             config_path: grok_config::config_file_display(),
         }
     }

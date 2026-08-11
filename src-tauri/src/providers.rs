@@ -297,8 +297,12 @@ impl ProviderStore {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return ProviderStore::default();
         };
-        match serde_json::from_str(&raw) {
-            Ok(store) => store,
+        match serde_json::from_str::<ProviderStore>(&raw) {
+            Ok(mut store) => {
+                // P1.2: drain any plaintext secrets into the OS keystore.
+                migrate_secrets(&mut store);
+                store
+            }
             Err(err) => {
                 if let Some(dest) =
                     crate::paths::quarantine_corrupt(&path, &crate::store::Store::now())
@@ -318,6 +322,63 @@ impl ProviderStore {
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::paths::write_atomic(&path, raw.as_bytes()).map_err(|e| e.to_string())
     }
+}
+
+// ---- secret storage (P1.2 / audit A3) ------------------------------------------
+//
+// providers.json historically held two secrets in plaintext: the custom-endpoint
+// API key and the local llama-server token. Both now live in the OS keystore
+// (S36 seam). The JSON fields stay for serde compatibility but are drained on
+// first load; the S36 rule holds — **no Tauri command returns either value**
+// (the UI already only ever saw `has_api_key`).
+
+/// Keystore entry for `GrokEndpoint.api_key`.
+pub const ENDPOINT_KEY_SECRET: &str = "endpoint.api-key";
+/// Keystore entry for `LocalConfig.api_token`.
+pub const LOCAL_TOKEN_SECRET: &str = "local.llama-token";
+
+/// Move any plaintext secrets into `set`, clearing each field **only after its
+/// write succeeds** — a locked/broken keystore must never lose the secret, so
+/// the old plaintext behavior remains the fallback. Returns whether the store
+/// changed (caller persists). Injected writer so tests run without a keystore.
+fn drain_plaintext_secrets(
+    store: &mut ProviderStore,
+    set: &mut dyn FnMut(&str, &str) -> Result<(), String>,
+) -> bool {
+    let mut changed = false;
+    if !store.endpoint.api_key.is_empty()
+        && set(ENDPOINT_KEY_SECRET, &store.endpoint.api_key).is_ok()
+    {
+        store.endpoint.api_key = String::new();
+        changed = true;
+    }
+    if let Some(token) = store.local.api_token.clone() {
+        if !token.is_empty() && set(LOCAL_TOKEN_SECRET, &token).is_ok() {
+            store.local.api_token = None;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// One-time migration hook. Cost after migration: two `is_empty` checks.
+fn migrate_secrets(store: &mut ProviderStore) {
+    let mut set = |name: &str, value: &str| crate::secrets::set(name, value);
+    if drain_plaintext_secrets(store, &mut set) {
+        if let Err(err) = store.save() {
+            eprintln!("providers.json save after secret migration failed: {err}");
+        }
+    }
+}
+
+/// The endpoint API key, wherever it currently lives (keystore, or the
+/// plaintext field on a machine whose keystore write failed). Rust-side only.
+pub fn endpoint_api_key() -> Option<String> {
+    if let Ok(Some(key)) = crate::secrets::get(ENDPOINT_KEY_SECRET) {
+        return Some(key);
+    }
+    let plain = ProviderStore::load().endpoint.api_key;
+    (!plain.is_empty()).then_some(plain)
 }
 
 // ---- queries ------------------------------------------------------------------
@@ -521,18 +582,27 @@ pub fn get_endpoint() -> GrokEndpoint {
 pub fn grok_endpoint_env() -> Vec<(String, String)> {
     let store = ProviderStore::load();
     let mut env = Vec::new();
-    if !store.endpoint.api_key.is_empty() {
-        env.push((
-            crate::grok_config::API_KEY_ENV.to_string(),
-            store.endpoint.api_key,
-        ));
+    // P1.2: secrets come from the keystore (with the plaintext fields as the
+    // not-yet-migrated fallback) — reading them here is Rust-side launch env,
+    // exactly what the S36 no-read-command rule permits.
+    if let Some(key) = endpoint_api_key() {
+        env.push((crate::grok_config::API_KEY_ENV.to_string(), key));
     }
-    if let Some(token) = store.local.api_token {
-        if !store.local.models.is_empty() {
+    if !store.local.models.is_empty() {
+        if let Some(token) = stored_local_token(&store) {
             env.push((crate::grok_config::LOCAL_API_KEY_ENV.to_string(), token));
         }
     }
     env
+}
+
+/// Current llama-server token, if one exists anywhere (keystore first, then the
+/// pre-migration plaintext field). Does not create one — see [`ensure_local_token`].
+fn stored_local_token(store: &ProviderStore) -> Option<String> {
+    if let Ok(Some(token)) = crate::secrets::get(LOCAL_TOKEN_SECRET) {
+        return Some(token);
+    }
+    store.local.api_token.clone().filter(|t| !t.is_empty())
 }
 
 /// Persist the endpoint config and reflect it into `~/.grok/config.toml`.
@@ -541,10 +611,26 @@ pub fn grok_endpoint_env() -> Vec<(String, String)> {
 pub fn save_endpoint(mut endpoint: GrokEndpoint, new_key: Option<String>) -> Result<(), String> {
     let mut store = ProviderStore::load();
 
-    endpoint.api_key = match new_key {
-        Some(key) => key,
-        None => store.endpoint.api_key.clone(),
-    };
+    // P1.2: the key's home is the keystore. `Some("")` clears; `Some(key)`
+    // replaces; `None` keeps whatever storage already holds. Only if the
+    // keystore write fails does the plaintext field carry the key (the
+    // pre-migration fallback, so BYOK keeps working on a broken keystore).
+    endpoint.api_key = String::new();
+    match new_key {
+        Some(key) if key.is_empty() => {
+            crate::secrets::delete(ENDPOINT_KEY_SECRET)?;
+        }
+        Some(key) => {
+            if let Err(err) = crate::secrets::set(ENDPOINT_KEY_SECRET, &key) {
+                eprintln!("keystore write failed ({err}); keeping endpoint key in providers.json");
+                endpoint.api_key = key;
+            }
+        }
+        None => {
+            // Keep a not-yet-migrated plaintext key if that's where it lives.
+            endpoint.api_key = store.endpoint.api_key.clone();
+        }
+    }
     // Carry forward the displaced-default memory before (re)applying.
     endpoint.previous_default = store.endpoint.previous_default.clone();
 
@@ -746,14 +832,21 @@ pub fn ensure_local_port() -> Result<u16, String> {
 
 /// Generated once; passed to llama-server as `--api-key` and to grok via env,
 /// so nothing else on the machine can quietly use the server.
+///
+/// P1.2: lives in the keystore. A keystore that cannot store the token falls
+/// back to the old plaintext field — a working local server beats purity, and
+/// the migration drains the field the moment the keystore recovers.
 pub fn ensure_local_token() -> Result<String, String> {
-    let mut store = ProviderStore::load();
-    if let Some(token) = store.local.api_token.clone() {
+    let store = ProviderStore::load();
+    if let Some(token) = stored_local_token(&store) {
         return Ok(token);
     }
     let token = crate::store::Store::new_id();
-    store.local.api_token = Some(token.clone());
-    store.save()?;
+    if crate::secrets::set(LOCAL_TOKEN_SECRET, &token).is_err() {
+        let mut store = store;
+        store.local.api_token = Some(token.clone());
+        store.save()?;
+    }
     Ok(token)
 }
 
@@ -846,6 +939,128 @@ fn sync_local_config(store: &ProviderStore) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P1.2: plaintext-secret drain --------------------------------------
+
+    fn store_with_secrets(key: &str, token: Option<&str>) -> ProviderStore {
+        let mut s = ProviderStore::default();
+        s.endpoint.api_key = key.to_string();
+        s.local.api_token = token.map(String::from);
+        s
+    }
+
+    #[test]
+    fn drain_moves_both_secrets_and_clears_fields() {
+        let mut store = store_with_secrets("sk-endpoint-123", Some("tok-local-456"));
+        let mut written: Vec<(String, String)> = Vec::new();
+        let changed = drain_plaintext_secrets(&mut store, &mut |name, value| {
+            written.push((name.to_string(), value.to_string()));
+            Ok(())
+        });
+        assert!(changed);
+        assert_eq!(
+            written,
+            vec![
+                (ENDPOINT_KEY_SECRET.to_string(), "sk-endpoint-123".to_string()),
+                (LOCAL_TOKEN_SECRET.to_string(), "tok-local-456".to_string()),
+            ]
+        );
+        assert!(store.endpoint.api_key.is_empty(), "plaintext key must be drained");
+        assert!(store.local.api_token.is_none(), "plaintext token must be drained");
+    }
+
+    #[test]
+    fn drain_is_a_noop_when_nothing_is_plaintext() {
+        // The steady state after migration: two cheap checks, zero writes.
+        let mut store = store_with_secrets("", None);
+        let mut calls = 0;
+        let changed = drain_plaintext_secrets(&mut store, &mut |_, _| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(!changed);
+        assert_eq!(calls, 0);
+        // An empty-string token must also not be "migrated".
+        let mut store = store_with_secrets("", Some(""));
+        assert!(!drain_plaintext_secrets(&mut store, &mut |_, _| panic!("no write expected")));
+    }
+
+    #[test]
+    fn keystore_failure_keeps_the_plaintext_copy() {
+        // A broken keystore must never lose the only copy of a secret.
+        let mut store = store_with_secrets("sk-keep-me", Some("tok-keep-me"));
+        let changed =
+            drain_plaintext_secrets(&mut store, &mut |_, _| Err("keystore locked".into()));
+        assert!(!changed, "failed writes must not mark the store dirty");
+        assert_eq!(store.endpoint.api_key, "sk-keep-me");
+        assert_eq!(store.local.api_token.as_deref(), Some("tok-keep-me"));
+    }
+
+    #[test]
+    fn drain_is_per_secret_not_all_or_nothing() {
+        // One secret landing in the keystore while the other write fails must
+        // drain exactly the one that landed.
+        let mut store = store_with_secrets("sk-ok", Some("tok-fails"));
+        let changed = drain_plaintext_secrets(&mut store, &mut |name, _| {
+            if name == ENDPOINT_KEY_SECRET { Ok(()) } else { Err("nope".into()) }
+        });
+        assert!(changed);
+        assert!(store.endpoint.api_key.is_empty());
+        assert_eq!(store.local.api_token.as_deref(), Some("tok-fails"));
+    }
+
+    /// Live proof of the A3 guarantee on this machine: seed plaintext secrets,
+    /// run the real migration, and canary-scan providers.json afterwards. The
+    /// real file is snapshot and restored even on panic.
+    /// `cargo test -p swerve-build --lib providers::tests::live_migration_leaves_no_plaintext -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_migration_leaves_no_plaintext() {
+        struct RestoreFile(PathBuf, Option<Vec<u8>>);
+        impl Drop for RestoreFile {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(bytes) => { let _ = std::fs::write(&self.0, bytes); }
+                    None => { let _ = std::fs::remove_file(&self.0); }
+                }
+            }
+        }
+
+        let path = ProviderStore::path();
+        let _restore = RestoreFile(path.clone(), std::fs::read(&path).ok());
+        let key_canary = "SWERVE-A3-KEY-CANARY-51c9d0";
+        let tok_canary = "SWERVE-A3-TOKEN-CANARY-51c9d0";
+        let _ = crate::secrets::delete(ENDPOINT_KEY_SECRET);
+        let _ = crate::secrets::delete(LOCAL_TOKEN_SECRET);
+
+        store_with_secrets(key_canary, Some(tok_canary))
+            .save()
+            .expect("seed providers.json");
+
+        // load() runs the migration and persists the drained store.
+        let migrated = ProviderStore::load();
+        assert!(migrated.endpoint.api_key.is_empty());
+        assert!(migrated.local.api_token.is_none());
+
+        let raw = std::fs::read_to_string(&path).expect("read providers.json");
+        assert!(!raw.contains(key_canary), "endpoint key leaked to disk");
+        assert!(!raw.contains(tok_canary), "local token leaked to disk");
+
+        assert_eq!(
+            crate::secrets::get(ENDPOINT_KEY_SECRET).unwrap().as_deref(),
+            Some(key_canary)
+        );
+        assert_eq!(
+            crate::secrets::get(LOCAL_TOKEN_SECRET).unwrap().as_deref(),
+            Some(tok_canary)
+        );
+        // Accessors resolve from the keystore.
+        assert_eq!(endpoint_api_key().as_deref(), Some(key_canary));
+
+        let _ = crate::secrets::delete(ENDPOINT_KEY_SECRET);
+        let _ = crate::secrets::delete(LOCAL_TOKEN_SECRET);
+        eprintln!("A3 migration round-trip OK — no plaintext left in providers.json");
+    }
 
     #[test]
     fn parse_models_single_default() {
