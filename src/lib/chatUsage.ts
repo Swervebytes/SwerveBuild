@@ -188,6 +188,26 @@ export function parseVendorUsage(inner: Record<string, unknown>): ChatUsage | nu
 }
 
 /**
+ * A window size learned before any tokens are reported (S35).
+ *
+ * Agents advertise the context window when a session opens (Grok returns it on
+ * `session/new`), so the bar can show a true percentage on the very first turn
+ * rather than waiting for a compaction notice. `used` stays null until the
+ * agent actually reports it — a window alone is not usage.
+ */
+export function sizeOnlyUsage(window: number | null | undefined): ChatUsage | null {
+  const size = asFiniteNumber(window);
+  if (size == null || size <= 0) return null;
+  return {
+    used: null,
+    size,
+    costAmount: null,
+    costCurrency: null,
+    updatedAt: Date.now(),
+  };
+}
+
+/**
  * Merge a fresh (possibly partial) report over what we already know.
  *
  * A context window does not change mid-session, so a previously reported

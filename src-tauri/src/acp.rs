@@ -461,7 +461,15 @@ impl AcpManager {
                 .and_then(|c| c.get("resume"))
                 .is_some();
 
-        let session_id = if let Some(stored) = stored_session_id.filter(|_| can_load) {
+        // Window advertised at initialize; session/new may restate it.
+        let init_window = agent_caps
+            .get("_meta")
+            .and_then(|m| m.get("modelState"))
+            .and_then(context_window_from_models);
+
+        let (session_id, mut context_window) = if let Some(stored) =
+            stored_session_id.filter(|_| can_load)
+        {
             active
                 .transport
                 .suppress_updates
@@ -480,7 +488,11 @@ impl AcpManager {
                 .suppress_updates
                 .store(false, Ordering::SeqCst);
             match loaded {
-                Ok(_) => stored.to_string(),
+                // A resumed session restates the model set the same way.
+                Ok(v) => (
+                    stored.to_string(),
+                    v.get("models").and_then(context_window_from_models),
+                ),
                 Err(_) => Self::create_new_session(&mut active, cwd, &mcp_servers)?,
             }
         } else {
@@ -490,9 +502,21 @@ impl AcpManager {
         active.session_id = session_id.clone();
         active.bump_access();
 
+        // Fall back to what initialize advertised if the session call omitted it.
+        if context_window.is_none() {
+            context_window = init_window;
+        }
+
+        // S35: hand the UI a real context window up front so the bar can show a
+        // true percentage from the first turn, instead of waiting for Grok's
+        // ~80%-full auto-compaction notice to reveal it.
         let _ = app.emit(
             "chat-session-ready",
-            json!({ "chatId": chat_id, "sessionId": session_id }),
+            json!({
+                "chatId": chat_id,
+                "sessionId": session_id,
+                "contextWindow": context_window,
+            }),
         );
 
         if let Ok(mut guard) = self.sessions.lock() {
@@ -506,7 +530,7 @@ impl AcpManager {
         active: &mut ActiveSession,
         cwd: &str,
         mcp_servers: &Value,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<u64>), String> {
         let result = active.transport.rpc(
             "session/new",
             json!({
@@ -516,11 +540,13 @@ impl AcpManager {
             CONNECT_TIMEOUT_SECS,
         )?;
 
-        result
+        let window = result.get("models").and_then(context_window_from_models);
+        let id = result
             .get("sessionId")
             .and_then(|id| id.as_str())
             .map(|id| id.to_string())
-            .ok_or_else(|| "ACP session/new did not return sessionId".to_string())
+            .ok_or_else(|| "ACP session/new did not return sessionId".to_string())?;
+        Ok((id, window))
     }
 
     pub fn respond_permission(
@@ -752,6 +778,31 @@ fn jsonrpc_id(value: &Value) -> Option<u64> {
 /// those events as `session/update`, which is misleading — the stdio wire
 /// method is `session_notification`. Confirmed with a minimal ACP client
 /// against `grok agent stdio`.
+/// Context window (tokens) the agent advertises for the session's current model.
+///
+/// Shape (Grok, on `session/new` and in `initialize._meta.modelState`):
+/// ```json
+/// { "currentModelId": "grok-4.5",
+///   "availableModels": [ { "modelId": "grok-4.5",
+///                          "_meta": { "totalContextTokens": 500000 } } ] }
+/// ```
+///
+/// **S35 — why this source and not a model catalog:** `usage.modelUsage` reports
+/// `grok-4.5-build`, an id that appears in NO catalog (`~/.grok/models_cache.json`
+/// only has `grok-4.5`), so matching a catalog entry would mean guessing that
+/// `-build` is a suffix to strip. This value comes straight from the agent for
+/// the session we are actually running, so it is authoritative, not inferred.
+fn context_window_from_models(models: &Value) -> Option<u64> {
+    let current = models.get("currentModelId").and_then(|v| v.as_str())?;
+    let list = models.get("availableModels").and_then(|v| v.as_array())?;
+    list.iter()
+        .find(|m| m.get("modelId").and_then(|v| v.as_str()) == Some(current))
+        .and_then(|m| m.get("_meta"))
+        .and_then(|meta| meta.get("totalContextTokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+}
+
 fn is_session_update_method(method: &str) -> bool {
     method == "session/update"
         || method.ends_with("/session/update")
@@ -1123,7 +1174,45 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// S35: the window must come from the agent, for the model actually in use.
     #[test]
+    fn context_window_read_from_current_model() {
+        let models = json!({
+            "currentModelId": "grok-4.5",
+            "availableModels": [
+                { "modelId": "other", "_meta": { "totalContextTokens": 111 } },
+                { "modelId": "grok-4.5", "_meta": { "totalContextTokens": 500000 } }
+            ]
+        });
+        assert_eq!(context_window_from_models(&models), Some(500000));
+    }
+
+    #[test]
+    fn context_window_absent_is_none_never_guessed() {
+        // Unknown current model → no window (do NOT fall back to the first entry).
+        let mismatch = json!({
+            "currentModelId": "grok-4.5-build",
+            "availableModels": [{ "modelId": "grok-4.5", "_meta": { "totalContextTokens": 500000 } }]
+        });
+        assert_eq!(context_window_from_models(&mismatch), None);
+        // Missing/zero/garbage shapes all yield None rather than a wrong number.
+        assert_eq!(context_window_from_models(&json!({})), None);
+        assert_eq!(
+            context_window_from_models(&json!({
+                "currentModelId": "m",
+                "availableModels": [{ "modelId": "m", "_meta": { "totalContextTokens": 0 } }]
+            })),
+            None
+        );
+        assert_eq!(
+            context_window_from_models(&json!({
+                "currentModelId": "m",
+                "availableModels": [{ "modelId": "m" }]
+            })),
+            None
+        );
+    }
+
     /// S34/S34b: Grok's usage arrives on `_x.ai/session_notification` — NOT on
     /// `session/update`, despite its own logs recording it that way. Verified
     /// against `grok agent stdio` with a minimal ACP client.
