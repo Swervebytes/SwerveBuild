@@ -321,7 +321,7 @@ fn tools() -> Vec<ToolDef> {
         // --- Media worker hero path (S29): still + short clip via MCP ---
         ToolDef {
             name: "media_status".into(),
-            description: "Media worker + pinned FFmpeg status (running/healthy, capabilities still_png/clip_mjpeg/clip_audio, ffmpeg path). Does not require App UI grant.".into(),
+            description: "Media worker + pinned FFmpeg status (running/healthy, capabilities still_png/clip_mp4/clip_audio, ffmpeg path). Does not require App UI grant.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
