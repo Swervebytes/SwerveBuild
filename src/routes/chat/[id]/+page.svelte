@@ -15,6 +15,7 @@
     parseEndTurnUsage,
     parseUsageUpdate,
     parseVendorUsage,
+    sizeOnlyUsage,
   } from "$lib/chatUsage";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
@@ -550,12 +551,20 @@
         if (event.payload.chatId !== $page.params.id) return;
         appendStream(event.payload.params);
       }),
-      subscribe<{ chatId: string }>("chat-session-ready", (event) => {
-        if (event.payload.chatId === $page.params.id) {
-          sessionReady = true;
-        }
-        refreshActiveSessions();
-      }),
+      subscribe<{ chatId: string; contextWindow?: number | null }>(
+        "chat-session-ready",
+        (event) => {
+          if (event.payload.chatId === $page.params.id) {
+            sessionReady = true;
+            // S35: the agent tells us the window up front, so the bar can show
+            // a real percentage on the first turn instead of waiting for the
+            // ~80%-full compaction notice. Size only — `used` stays unknown
+            // until the agent reports it.
+            applyUsage(sizeOnlyUsage(event.payload.contextWindow));
+          }
+          refreshActiveSessions();
+        },
+      ),
       subscribe<{ chatId: string; usage?: unknown }>("chat-turn-end", (event) => {
         // Arrives after the turn's last chunk event, so the saved reply includes
         // the tail that finalizing on the send's return could clip.
