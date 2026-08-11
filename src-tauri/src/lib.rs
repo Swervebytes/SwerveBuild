@@ -15,6 +15,7 @@ mod media_providers;
 mod model_catalog;
 pub mod paths;
 mod providers;
+pub mod secrets;
 mod store;
 pub mod terminal;
 mod util;
@@ -1405,6 +1406,40 @@ fn set_term_grant(granted: bool) -> Result<terminal::TermGrant, String> {
     terminal::set_granted(granted)
 }
 
+// ---- secrets (S36): write-and-forget only ------------------------------------
+//
+// There is deliberately NO `secret_get` command. Every registered command is
+// callable by any JS running in the main webview, so exposing a read would let
+// a single injected script exfiltrate a stream key — a live-broadcast takeover,
+// which `design/live-safety.md` treats as irreversible. Rust-side consumers
+// (the future RTMP sink) call `secrets::get` directly.
+
+/// Store a secret in the OS keystore (Windows Credential Manager).
+#[tauri::command]
+fn secret_set(name: String, value: String) -> Result<secrets::SecretStatus, String> {
+    secrets::set(&name, &value)?;
+    secrets::status(&name)
+}
+
+/// Does a secret exist? Never returns the value.
+#[tauri::command]
+fn secret_status(name: String) -> Result<secrets::SecretStatus, String> {
+    secrets::status(&name)
+}
+
+/// Remove a secret. Idempotent, so a "clear" button always succeeds.
+#[tauri::command]
+fn secret_delete(name: String) -> Result<secrets::SecretStatus, String> {
+    secrets::delete(&name)?;
+    secrets::status(&name)
+}
+
+/// Namespaced name for a stream destination's key, e.g. `stream.twitch`.
+#[tauri::command]
+fn stream_key_name(target: String) -> Result<String, String> {
+    secrets::stream_key_name(&target)
+}
+
 #[tauri::command]
 fn get_browser_debug_grant() -> browser_debug::BrowserDebugGrant {
     browser_debug::load_grant()
@@ -1656,6 +1691,10 @@ pub fn run() {
             get_term_grant,
             set_term_grant,
             get_browser_debug_grant,
+            secret_set,
+            secret_status,
+            secret_delete,
+            stream_key_name,
             set_browser_debug_grant,
             set_browser_public,
             browser_pane_set_bounds,

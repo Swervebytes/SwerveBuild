@@ -57,3 +57,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 xcap = "0.0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 cpal = "0.15"
+# S36 — OS keystore for stream secrets (Windows Credential Manager).
+# Windows-only build per VISION support matrix: default features pull the
+# macOS/Linux backends (security-framework, secret-service, zbus) we never use.
+# `v1` = the classic Entry API (required when default features are off).
+keyring = { version = "4.1.6", default-features = false, features = [
+    "v1",
+    "windows-native-keyring-store",
+] }
