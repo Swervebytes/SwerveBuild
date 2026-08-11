@@ -25,9 +25,15 @@ const FALLBACK_GROK: ProviderView = {
 let providers = $state<ProviderView[]>([FALLBACK_GROK]);
 let active = $state<ProviderView>(FALLBACK_GROK);
 
+import { accentForeground } from "$lib/accent";
+
 function applyAccent() {
   if (typeof document !== "undefined") {
     document.documentElement.style.setProperty("--sc-accent", active.accent);
+    document.documentElement.style.setProperty(
+      "--sc-accent-fg",
+      accentForeground(active.accent),
+    );
   }
 }
 

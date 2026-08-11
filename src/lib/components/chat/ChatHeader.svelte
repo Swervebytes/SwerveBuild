@@ -23,6 +23,7 @@
     modelSwitching = false,
     usage = null,
     onmodelchange,
+    onexport,
   }: {
     title: string;
     projectName?: string;
@@ -36,7 +37,26 @@
     /** ACP-reported context usage; null / incomplete → honest "—". */
     usage?: ChatUsage | null;
     onmodelchange?: (id: string | null) => void;
+    /** P4.3: export this chat as Markdown; resolves to the saved path. */
+    onexport?: () => Promise<string>;
   } = $props();
+
+  let exportState = $state<"idle" | "busy" | "done" | "error">("idle");
+  let exportTitle = $state("Export chat as Markdown");
+
+  async function runExport() {
+    if (!onexport || exportState === "busy") return;
+    exportState = "busy";
+    try {
+      const path = await onexport();
+      exportState = "done";
+      exportTitle = `Saved: ${path}`;
+    } catch (e) {
+      exportState = "error";
+      exportTitle = String(e);
+    }
+    setTimeout(() => (exportState = "idle"), 4000);
+  }
 
   const known = $derived(hasKnownUsage(usage));
   /** Tokens reported but no window size — show the count, withhold the %. */
@@ -123,6 +143,19 @@
         <path d="M1.75 8h12.5M8 1.75c1.9 2 1.9 10.5 0 12.5M8 1.75c-1.9 2-1.9 10.5 0 12.5" />
       </svg>
     </button>
+    {#if onexport}
+      <button
+        class="btn btn-ghost btn-sm"
+        type="button"
+        data-testid="chat-export-md"
+        title={exportTitle}
+        aria-label="Export chat as Markdown"
+        disabled={exportState === "busy"}
+        onclick={runExport}
+      >
+        {#if exportState === "done"}Saved ✓{:else if exportState === "error"}Export failed{:else}Export{/if}
+      </button>
+    {/if}
     <a class="btn btn-ghost btn-sm" href="/projects">All chats</a>
   </div>
 </header>

@@ -1646,6 +1646,35 @@ fn stream_key_name(target: String) -> Result<String, String> {
     secrets::stream_key_name(&target)
 }
 
+// ---- chat export (P4.3) ------------------------------------------------------
+
+/// Export one chat as Markdown into `~/.swervebuild/exports/` and return the
+/// path. Deliberately writes only inside our own data dir — the webview never
+/// supplies a path, so an injected script can't turn this into arbitrary file
+/// write (S21b rule).
+#[tauri::command]
+fn export_chat_markdown(chat_id: String) -> Result<String, String> {
+    let _guard = store::Store::lock();
+    let data = store::Store::load();
+    let chat = data
+        .chats
+        .iter()
+        .find(|c| c.id == chat_id)
+        .ok_or("chat not found")?;
+    let project = data
+        .projects
+        .iter()
+        .find(|p| p.id == chat.project_id)
+        .map(|p| p.name.as_str());
+    let md = store::Store::chat_to_markdown(chat, project);
+
+    let dir = paths::data_dir().join("exports");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join(format!("{}.md", store::Store::export_slug(&chat.title)));
+    paths::write_atomic(&file, md.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(file.display().to_string())
+}
+
 // ---- provider sign-in (P1.1 / S-AUTH) ----------------------------------------
 //
 // Human-only surface: reachable from Settings, never exposed as an MCP tool.
@@ -1859,6 +1888,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // P4.2: remember window size/position/maximized across launches.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(acp)
         .manage(job_mgr)
         .manage(wf_mgr)
@@ -2013,6 +2044,7 @@ pub fn run() {
             uninstall_provider_cli,
             provider_auth_probe,
             provider_sign_in,
+            export_chat_markdown,
             set_browser_debug_grant,
             set_browser_public,
             browser_pane_set_bounds,

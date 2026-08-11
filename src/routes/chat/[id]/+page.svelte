@@ -626,6 +626,7 @@
       {modelSwitching}
       {usage}
       onmodelchange={switchModel}
+      onexport={() => invoke<string>("export_chat_markdown", { chatId: $page.params.id })}
     />
   </div>
 

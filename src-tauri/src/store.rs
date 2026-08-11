@@ -225,6 +225,59 @@ impl Store {
         }
     }
 
+    /// Render a chat as portable Markdown (P4.3 export). Pure so tests don't
+    /// need a data dir. Tool/thought parts render as quotes/details blocks so
+    /// the export reads like the transcript did, and message content passes
+    /// through untouched (it already is Markdown).
+    pub fn chat_to_markdown(chat: &Chat, project: Option<&str>) -> String {
+        let mut md = format!("# {}\n\n", chat.title);
+        if let Some(p) = project {
+            md.push_str(&format!("Project: {p}  \n"));
+        }
+        md.push_str(&format!(
+            "Exported from Swerve Build · created {} · updated {}\n\n---\n",
+            chat.created_at, chat.updated_at
+        ));
+        for m in &chat.messages {
+            let who = if m.role == "user" { "You" } else { "Assistant" };
+            md.push_str(&format!("\n## {who}\n\n"));
+            for part in &m.parts {
+                if part.kind == "tool" {
+                    md.push_str(&format!("> tool: {}\n\n", part.text.trim()));
+                } else {
+                    md.push_str("<details><summary>Reasoning</summary>\n\n");
+                    md.push_str(part.text.trim());
+                    md.push_str("\n\n</details>\n\n");
+                }
+            }
+            md.push_str(m.content.trim());
+            md.push('\n');
+            for img in &m.images {
+                md.push_str(&format!("\n![attachment]({img})\n"));
+            }
+            for v in &m.videos {
+                md.push_str(&format!("\n[video]({v})\n"));
+            }
+        }
+        md
+    }
+
+    /// Filesystem-safe slug from a chat title, for export filenames.
+    pub fn export_slug(title: &str) -> String {
+        let slug: String = title
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        let mut slug = if slug.is_empty() { "chat".to_string() } else { slug };
+        slug.truncate(60);
+        slug
+    }
+
     pub fn chat_title_from_message(text: &str) -> String {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -243,6 +296,60 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_export_renders_roles_parts_and_media() {
+        let chat = Chat {
+            id: "c1".into(),
+            project_id: "p1".into(),
+            title: "Fix the parser".into(),
+            created_at: "2026-08-11T10:00:00Z".into(),
+            updated_at: "2026-08-11T11:00:00Z".into(),
+            grok_session_id: None,
+            model_id: None,
+            provider_id: None,
+            messages: vec![
+                ChatMessage {
+                    id: "m1".into(),
+                    role: "user".into(),
+                    content: "Why does this fail?".into(),
+                    images: vec!["C:\\att\\shot.png".into()],
+                    videos: vec![],
+                    parts: vec![],
+                    created_at: String::new(),
+                },
+                ChatMessage {
+                    id: "m2".into(),
+                    role: "assistant".into(),
+                    content: "Because of `X`.\n\n```rust\nfix();\n```".into(),
+                    images: vec![],
+                    videos: vec![],
+                    parts: vec![
+                        MessagePart { kind: "thought".into(), text: "consider Y".into() },
+                        MessagePart { kind: "tool".into(), text: "read_file parser.rs".into() },
+                    ],
+                    created_at: String::new(),
+                },
+            ],
+        };
+        let md = Store::chat_to_markdown(&chat, Some("SwerveBuild"));
+        assert!(md.starts_with("# Fix the parser\n"));
+        assert!(md.contains("Project: SwerveBuild"));
+        assert!(md.contains("## You"));
+        assert!(md.contains("## Assistant"));
+        assert!(md.contains("> tool: read_file parser.rs"));
+        assert!(md.contains("<details><summary>Reasoning</summary>"));
+        assert!(md.contains("```rust"), "message markdown must pass through untouched");
+        assert!(md.contains("![attachment](C:\\att\\shot.png)"));
+    }
+
+    #[test]
+    fn export_slugs_are_filesystem_safe() {
+        assert_eq!(Store::export_slug("Fix the parser!"), "fix-the-parser");
+        assert_eq!(Store::export_slug("  ??? "), "chat");
+        assert_eq!(Store::export_slug("a/b\\c:d"), "a-b-c-d");
+        assert!(Store::export_slug(&"x".repeat(200)).len() <= 60);
+    }
 
     #[test]
     fn message_parts_round_trip_through_json() {

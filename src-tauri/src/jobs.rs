@@ -1432,9 +1432,10 @@ fn effective_tz_offset(s: &ScheduleTrigger) -> i32 {
 
 /// Most recent scheduled occurrence (UTC secs) for a daily/weekly schedule, or
 /// None. Walks back up to 8 days to find the matching weekday for weekly.
-/// Uses the trigger's stored offset — the scheduler calls
-/// [`most_recent_occurrence_with`] with the live offset (P2.7); tests exercise
-/// the pure math through this stored-offset form.
+/// Stored-offset sugar for tests — production goes through
+/// [`most_recent_occurrence_with`] with the live offset (P2.7). `cfg(test)` so
+/// this can never silently become an untested second entry point (S38b lesson).
+#[cfg(test)]
 fn most_recent_occurrence(s: &ScheduleTrigger, now: u64) -> Option<u64> {
     most_recent_occurrence_with(s, now, s.tz_offset_minutes)
 }
