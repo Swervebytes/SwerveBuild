@@ -197,9 +197,14 @@
       return;
     }
 
-    // Vendor updates that carry real token numbers (S34). Grok sends these on
-    // `_x.ai/session/update`; acp.rs forwards any `*/session/update`.
-    if (sessionUpdate === "turn_completed" || sessionUpdate === "auto_compact_started") {
+    // Vendor updates that carry real token numbers (S34/S34b). Grok sends
+    // these on `_x.ai/session_notification` (NOT `session/update`, despite its
+    // own logs saying so); acp.rs forwards vendor session notifications.
+    if (
+      sessionUpdate === "turn_completed" ||
+      sessionUpdate === "response_completed" ||
+      sessionUpdate === "auto_compact_started"
+    ) {
       applyUsage(parseVendorUsage(inner));
       // turn_completed has no renderable text; auto_compact is informational.
       return;

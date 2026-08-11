@@ -161,13 +161,18 @@ export function parseVendorUsage(inner: Record<string, unknown>): ChatUsage | nu
     };
   }
 
-  if (kind === "turn_completed") {
+  // `turn_completed` is camelCase; `response_completed` arrives slightly
+  // earlier in snake_case. Both are real — accept either (S34b).
+  if (kind === "turn_completed" || kind === "response_completed") {
     const raw = inner.usage;
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
     const u = raw as Record<string, unknown>;
     // inputTokens is what was actually sent as context this turn. totalTokens
     // adds the completion, which is not context-resident — prefer inputTokens.
-    const used = asFiniteNumber(u.inputTokens) ?? asFiniteNumber(u.totalTokens);
+    const used =
+      asFiniteNumber(u.inputTokens) ??
+      asFiniteNumber(u.input_tokens) ??
+      asFiniteNumber(u.totalTokens);
     if (used == null || used < 0) return null;
     const size = asFiniteNumber(u.contextWindow) ?? asFiniteNumber(u.context_window);
     return {

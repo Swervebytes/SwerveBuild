@@ -743,13 +743,21 @@ fn jsonrpc_id(value: &Value) -> Option<u64> {
 /// Is this a session update we should forward to the UI?
 ///
 /// Accepts the ACP-standard `session/update` **and** vendor-namespaced variants.
-/// Grok sends `_x.ai/session/update`, which carries `turn_completed` (token
-/// usage on every turn) and `auto_compact_started` (tokens_used +
-/// context_window). Matching only the bare method dropped 100% of Grok's usage
-/// telemetry before it reached the UI — the reason the context bar read `—`
-/// for Grok (S34 / ROADMAP open question 5).
+///
+/// **S34b — verified on the wire, do not "simplify" this.** Grok's token usage
+/// does NOT ride on `session/update`. It arrives as
+/// **`_x.ai/session_notification`** carrying `turn_completed`
+/// (`usage.inputTokens`, `totalTokens`, `modelUsage`) and `response_completed`
+/// (snake_case `input_tokens`). Grok's own on-disk `updates.jsonl` records
+/// those events as `session/update`, which is misleading — the stdio wire
+/// method is `session_notification`. Confirmed with a minimal ACP client
+/// against `grok agent stdio`.
 fn is_session_update_method(method: &str) -> bool {
-    method == "session/update" || method.ends_with("/session/update")
+    method == "session/update"
+        || method.ends_with("/session/update")
+        // Vendor push notifications (Grok: `_x.ai/session_notification`).
+        || method == "session_notification"
+        || method.ends_with("/session_notification")
 }
 
 /// Extract a usage payload suitable for the UI from a `session/prompt` JSON-RPC
@@ -1116,17 +1124,22 @@ mod tests {
     }
 
     #[test]
-    /// S34: Grok's usage only arrives on `_x.ai/session/update`. Forwarding
-    /// just the bare method silently discarded every token number it sent.
+    /// S34/S34b: Grok's usage arrives on `_x.ai/session_notification` — NOT on
+    /// `session/update`, despite its own logs recording it that way. Verified
+    /// against `grok agent stdio` with a minimal ACP client.
     #[test]
     fn session_update_matcher_accepts_vendor_namespaces() {
         assert!(is_session_update_method("session/update"));
         assert!(is_session_update_method("_x.ai/session/update"));
         assert!(is_session_update_method("acme.dev/session/update"));
+        // The one that actually carries Grok's token usage on the wire.
+        assert!(is_session_update_method("_x.ai/session_notification"));
+        assert!(is_session_update_method("session_notification"));
         // Must not widen into other session methods or unrelated traffic.
         assert!(!is_session_update_method("session/request_permission"));
         assert!(!is_session_update_method("_x.ai/session/other"));
         assert!(!is_session_update_method("session/updated"));
+        assert!(!is_session_update_method("_x.ai/fs_notify"));
         assert!(!is_session_update_method("initialize"));
     }
 
