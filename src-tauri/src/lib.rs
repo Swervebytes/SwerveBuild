@@ -89,21 +89,34 @@ pub(crate) fn which_on_path(command: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let candidates: Vec<PathBuf> = stdout
+    prefer_executable(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pick the spawnable path out of `where` output.
+///
+/// S37: npm installs BOTH an extensionless Unix shell script and a Windows shim
+/// (`.cmd`), and `where` lists the script FIRST. Spawning that script fails with
+/// "%1 is not a valid Win32 application" (os error 193) — exactly how the
+/// freshly-installed claude-code-acp / gemini providers died while the UI still
+/// said "Available". So on Windows, prefer a genuinely executable extension.
+///
+/// Falls back to the first non-empty line, so a command with no recognised
+/// extension still resolves rather than vanishing.
+///
+/// S38b: this is now the **only** definition of that rule. `which_on_path` used
+/// to carry an inlined duplicate of it, which meant the S37 regression test was
+/// exercising this copy while production ran the other one — editing the inlined
+/// branch would have left the test green and reintroduced os error 193. Keep the
+/// delegation; do not re-inline.
+pub(crate) fn prefer_executable(lines: &str) -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = lines
         .lines()
-        .map(|line| PathBuf::from(line.trim()))
-        .filter(|path| !path.as_os_str().is_empty())
+        .map(|l| PathBuf::from(l.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
         .collect();
 
     #[cfg(windows)]
     {
-        // S37: npm installs BOTH an extensionless Unix shell script and a
-        // Windows shim (`.cmd`), and `where` lists the script FIRST. Spawning
-        // that script fails with "%1 is not a valid Win32 application"
-        // (os error 193) — which is exactly how the freshly-installed
-        // claude-code-acp / gemini providers died despite reporting "Available".
-        // Always prefer a genuinely executable extension.
         if let Some(exe) = candidates.iter().find(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
@@ -115,27 +128,6 @@ pub(crate) fn which_on_path(command: &str) -> Option<PathBuf> {
     }
 
     candidates.into_iter().next()
-}
-
-/// Pick the spawnable path from `where` output (Windows prefers .cmd/.exe over
-/// npm's extensionless shell script). Split out so it is testable without PATH.
-#[cfg(windows)]
-pub(crate) fn prefer_executable(lines: &str) -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = lines
-        .lines()
-        .map(|l| PathBuf::from(l.trim()))
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect();
-    candidates
-        .iter()
-        .find(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat" | "com"))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .or_else(|| candidates.into_iter().next())
 }
 
 fn grok_version_at(path: &Path) -> Option<String> {
@@ -2039,6 +2031,10 @@ mod grok_install_tests {
     /// "%1 is not a valid Win32 application" (os error 193) — the exact failure
     /// that made freshly-installed claude-code-acp / gemini unusable while the
     /// UI still said "Available".
+    ///
+    /// S38b: this now guards the shipping path. `which_on_path` delegates to
+    /// `prefer_executable`, so there is one implementation and this test cannot
+    /// drift away from it — until S38b it was asserting against a duplicate.
     #[cfg(windows)]
     #[test]
     fn prefers_windows_shim_over_npm_shell_script() {
@@ -2064,6 +2060,47 @@ mod grok_install_tests {
         let none = "C:\\tools\\weird-thing\n";
         assert_eq!(prefer_executable(none).unwrap(), PathBuf::from("C:\\tools\\weird-thing"));
         assert!(prefer_executable("").is_none());
+    }
+
+    /// The same guarantee against the REAL PATH, through the real entry point.
+    /// On this box `where claude-code-acp` still lists the extensionless Unix
+    /// script FIRST, so a resolver that took line 1 would hand os error 193 to
+    /// the ACP layer — which is precisely the S37 failure. Spawn-and-kill is
+    /// enough: 193 is raised at spawn, and not waiting avoids hanging on an ACP
+    /// server that would sit waiting for stdio.
+    ///
+    /// `cargo test -p swerve-build --lib grok_install_tests::live_npm_cli_resolves_spawnable -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn live_npm_cli_resolves_spawnable() {
+        let mut checked = 0;
+        for cli in ["claude-code-acp", "gemini"] {
+            let Some(path) = which_on_path(cli) else {
+                eprintln!("{cli}: not on PATH — skipped");
+                continue;
+            };
+            checked += 1;
+            eprintln!("{cli} -> {}", path.display());
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            assert!(
+                matches!(ext.as_deref(), Some("exe" | "cmd" | "bat" | "com")),
+                "{cli} resolved to {path:?}, which Windows cannot spawn"
+            );
+            let mut child = util::hidden_command(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap_or_else(|e| panic!("{cli} at {path:?} failed to spawn: {e}"));
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("{cli}: spawned OK (no os error 193)");
+        }
+        assert!(checked > 0, "no provider CLI on PATH — nothing was proven");
     }
 
     #[test]

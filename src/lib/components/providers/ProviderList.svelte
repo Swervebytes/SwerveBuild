@@ -150,6 +150,7 @@
             <button
               class="btn btn-sm"
               type="button"
+              data-testid="provider-activate-{p.id}"
               disabled={!p.available}
               onclick={() => activate(p.id, p.available)}
             >
