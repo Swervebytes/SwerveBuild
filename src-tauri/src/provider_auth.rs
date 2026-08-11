@@ -119,9 +119,19 @@ pub fn is_auth_required_error(err: &str) -> bool {
         }
     }
     let lower = err.to_ascii_lowercase();
-    ["authentication required", "auth required", "not authenticated", "please log in", "please login", "/login"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "authentication required",
+        "auth required",
+        "not authenticated",
+        "please log in",
+        "please login",
+        "/login",
+        // Gemini signed-out, verified on the wire (Q5 probe): session/new
+        // fails with "Gemini API key is missing or not configured."
+        "api key",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 // ------------------------------------------------------------- method plans
@@ -405,6 +415,10 @@ mod tests {
         // Text-only phrasings agents actually use.
         assert!(is_auth_required_error("Please run `claude /login` first"));
         assert!(is_auth_required_error("not authenticated"));
+        // Gemini's real signed-out error, captured on the wire (Q5 probe).
+        assert!(is_auth_required_error(
+            r#"{"code":-32603,"message":"Gemini API key is missing or not configured."}"#
+        ));
         // Ordinary failures must NOT be misread as sign-in problems.
         assert!(!is_auth_required_error(
             r#"{"code":-32603,"message":"internal error"}"#
