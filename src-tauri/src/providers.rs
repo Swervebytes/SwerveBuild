@@ -93,13 +93,117 @@ fn p(
     }
 }
 
+// ---- installable ACP CLIs (S37) ----------------------------------------------
+
+/// An agent CLI the app can install for you.
+///
+/// These ship on npm, unlike the Grok CLI (a pinned, checksummed binary — see
+/// `install_grok_pinned`). Two consequences we live with deliberately:
+///
+/// 1. **npm must already exist.** We never bundle Node — the README promises no
+///    Node/Rust for end users, and the app itself still honours that. Install is
+///    an opt-in convenience, so when npm is missing we say so and show the
+///    command rather than failing obscurely.
+/// 2. **Versions are pinned here.** Same rule as the Grok CLI pin (audit item
+///    A5): never install an unpinned `latest`. Bump via the DEPENDENCIES ritual.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallableCli {
+    pub provider_id: &'static str,
+    pub package: &'static str,
+    pub version: &'static str,
+    /// Where to send someone who has to do it by hand.
+    pub docs: &'static str,
+}
+
+pub const INSTALLABLE_CLIS: &[InstallableCli] = &[
+    InstallableCli {
+        provider_id: "claude-code",
+        package: "@zed-industries/claude-code-acp",
+        version: "0.16.2",
+        docs: "https://github.com/zed-industries/claude-code-acp",
+    },
+    InstallableCli {
+        provider_id: "gemini",
+        package: "@google/gemini-cli",
+        version: "0.54.4",
+        docs: "https://github.com/google-gemini/gemini-cli",
+    },
+];
+
+pub fn installable_for(provider_id: &str) -> Option<&'static InstallableCli> {
+    INSTALLABLE_CLIS
+        .iter()
+        .find(|c| c.provider_id == provider_id)
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    /// Never ship an unpinned `latest` — same rule as the Grok CLI pin (A5).
+    #[test]
+    fn install_commands_are_version_pinned() {
+        for c in INSTALLABLE_CLIS {
+            let cmd = c.install_command();
+            assert!(cmd.contains("npm install -g"), "{cmd}");
+            assert!(cmd.contains(&format!("{}@{}", c.package, c.version)), "{cmd}");
+            assert!(!cmd.contains("latest"), "unpinned install: {cmd}");
+            assert!(!c.version.is_empty());
+            // Uninstall is by package name only — versions are meaningless there.
+            assert_eq!(c.uninstall_command(), format!("npm uninstall -g {}", c.package));
+        }
+    }
+
+    /// Only the two npm-distributed ACP agents are app-managed. Grok has its own
+    /// pinned+checksummed installer; HTTP rows install nothing.
+    #[test]
+    fn only_npm_acp_agents_are_installable() {
+        assert!(installable_for("claude-code").is_some());
+        assert!(installable_for("gemini").is_some());
+        assert!(installable_for("grok").is_none(), "grok is self-managed");
+        assert!(installable_for("ollama").is_none());
+        assert!(installable_for("anthropic").is_none());
+        assert!(installable_for("nope").is_none());
+    }
+
+    /// The install target must match the provider's spawn command, or we would
+    /// install a package that never makes the row go Available.
+    #[test]
+    fn installable_ids_match_real_providers() {
+        let all = builtin_providers();
+        for c in INSTALLABLE_CLIS {
+            let p = all
+                .iter()
+                .find(|p| p.id == c.provider_id)
+                .unwrap_or_else(|| panic!("no provider for {}", c.provider_id));
+            assert!(matches!(p.kind, ProviderKind::Acp));
+            assert!(p.command.is_some(), "{} needs a command to resolve", p.id);
+        }
+    }
+}
+
+impl InstallableCli {
+    /// Exact command we run — and the one we show the user when npm is absent,
+    /// so what they copy is what we would have done.
+    pub fn install_command(&self) -> String {
+        format!("npm install -g {}@{}", self.package, self.version)
+    }
+
+    pub fn uninstall_command(&self) -> String {
+        format!("npm uninstall -g {}", self.package)
+    }
+}
+
 pub fn builtin_providers() -> Vec<Provider> {
     vec![
         // Default — behaves exactly like the old hardcoded path.
         p("grok", "Grok", ProviderKind::Acp, None, &["agent", "stdio"], "#6cb5ff", None),
         p("claude-code", "Claude Code", ProviderKind::Acp, Some("claude-code-acp"), &[], "#d97757", None),
         p("gemini", "Gemini", ProviderKind::Acp, Some("gemini"), &["--experimental-acp"], "#6c8cff", None),
-        // HTTP / local — designed, not yet spawnable.
+        // HTTP — not spawnable. Ollama and OpenAI-compatible are already
+        // covered by shipped features (managed llama-server / custom Grok
+        // endpoint), so they are labelled as covered rather than "coming soon"
+        // forever. Anthropic direct is the only genuinely new reach (S37).
         p("ollama", "Ollama", ProviderKind::Http, None, &[], "#cbd5e1", Some("http://localhost:11434")),
         p("openai-compatible", "OpenAI-compatible", ProviderKind::Http, None, &[], "#4dd2c0", Some("")),
         p("anthropic", "Anthropic", ProviderKind::Http, None, &[], "#d97757", Some("https://api.anthropic.com")),

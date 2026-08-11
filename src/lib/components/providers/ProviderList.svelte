@@ -6,8 +6,71 @@
 
   const providers = $derived(providerStore.all);
 
+  type InstallInfo = {
+    installable: boolean;
+    package: string | null;
+    version: string | null;
+    docs: string | null;
+    installCommand: string | null;
+    uninstallCommand: string | null;
+    npmVersion: string | null;
+    installed: boolean;
+  };
+
   let testing = $state<string | null>(null);
   let results = $state<Record<string, string>>({});
+  let info = $state<Record<string, InstallInfo>>({});
+  let busy = $state<string | null>(null);
+  /** Provider id awaiting uninstall confirmation. */
+  let confirming = $state<string | null>(null);
+
+  // Load install capability per provider so buttons reflect reality (is it
+  // managed by us? is npm even here?) rather than assuming.
+  $effect(() => {
+    for (const p of providers) {
+      if (info[p.id]) continue;
+      invoke<InstallInfo>("provider_install_info", { id: p.id })
+        .then((r) => (info = { ...info, [p.id]: r }))
+        .catch(() => {});
+    }
+  });
+
+  async function refreshInfo(id: string) {
+    try {
+      info = { ...info, [id]: await invoke<InstallInfo>("provider_install_info", { id }) };
+    } catch {
+      /* leave previous info */
+    }
+  }
+
+  async function install(id: string) {
+    busy = id;
+    try {
+      const r = await invoke<{ success: boolean; message: string }>("install_provider_cli", { id });
+      results = { ...results, [id]: r.message };
+      await providerStore.load();
+      await refreshInfo(id);
+    } catch (e) {
+      results = { ...results, [id]: String(e) };
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function uninstall(id: string) {
+    confirming = null;
+    busy = id;
+    try {
+      const r = await invoke<{ success: boolean; message: string }>("uninstall_provider_cli", { id });
+      results = { ...results, [id]: r.message };
+      await providerStore.load();
+      await refreshInfo(id);
+    } catch (e) {
+      results = { ...results, [id]: String(e) };
+    } finally {
+      busy = null;
+    }
+  }
 
   async function activate(id: string, available: boolean) {
     if (!available) return;
@@ -26,9 +89,17 @@
     }
   }
 
-  function availability(p: { available: boolean; kind: string }) {
+  /// HTTP rows that shipped features already cover — say so instead of
+  /// promising "soon" forever (S37).
+  const COVERED_BY: Record<string, string> = {
+    ollama: "Use Local models",
+    "openai-compatible": "Use Grok custom endpoint",
+  };
+
+  function availability(p: { id: string; available: boolean; kind: string }) {
     if (p.available) return { tone: "success" as const, label: "Available" };
-    if (p.kind === "http") return { tone: "muted" as const, label: "Designed — soon" };
+    if (COVERED_BY[p.id]) return { tone: "muted" as const, label: COVERED_BY[p.id] };
+    if (p.kind === "http") return { tone: "muted" as const, label: "Not built yet" };
     return { tone: "muted" as const, label: "Not installed" };
   }
 </script>
@@ -45,6 +116,31 @@
           {#if p.active}<span class="badge badge-accent">Active</span>{/if}
         </div>
         <span class="id">{p.id}{#if p.command} · {p.command}{/if}</span>
+        {#if COVERED_BY[p.id]}
+          <span class="note">
+            {p.id === "ollama"
+              ? "Local GGUF models already run in-app via the managed llama-server — see Local models below."
+              : "Any OpenAI-compatible endpoint already works via the Grok custom endpoint below."}
+          </span>
+        {/if}
+        {#if info[p.id]?.installable && !info[p.id]?.npmVersion}
+          <span class="note">
+            npm not found — install Node.js, then run
+            <code>{info[p.id]?.installCommand}</code>
+          </span>
+        {/if}
+        {#if confirming === p.id}
+          <span class="confirm" data-testid="provider-uninstall-confirm">
+            Remove this CLI from your machine? Runs
+            <code>{info[p.id]?.uninstallCommand}</code>
+            <button class="btn btn-sm" type="button" onclick={() => uninstall(p.id)}>
+              Yes, uninstall
+            </button>
+            <button class="btn btn-sm btn-ghost" type="button" onclick={() => (confirming = null)}>
+              Cancel
+            </button>
+          </span>
+        {/if}
         {#if results[p.id]}<span class="result">{results[p.id]}</span>{/if}
       </div>
       <div class="side">
@@ -58,6 +154,30 @@
               onclick={() => activate(p.id, p.available)}
             >
               Set active
+            </button>
+          {/if}
+          {#if info[p.id]?.installable && !p.available}
+            <button
+              class="btn btn-sm"
+              type="button"
+              data-testid="provider-install-{p.id}"
+              disabled={busy === p.id || !info[p.id]?.npmVersion}
+              title={info[p.id]?.installCommand ?? ""}
+              onclick={() => install(p.id)}
+            >
+              {busy === p.id ? "Installing…" : "Install"}
+            </button>
+          {/if}
+          {#if info[p.id]?.installable && p.available}
+            <button
+              class="btn btn-sm btn-ghost"
+              type="button"
+              data-testid="provider-uninstall-{p.id}"
+              disabled={busy === p.id}
+              title={info[p.id]?.uninstallCommand ?? ""}
+              onclick={() => (confirming = confirming === p.id ? null : p.id)}
+            >
+              {busy === p.id ? "Removing…" : "Uninstall"}
             </button>
           {/if}
           <button
@@ -141,6 +261,30 @@
     color: var(--text-secondary);
     margin-top: 0.2rem;
     word-break: break-word;
+  }
+  .note {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.2rem;
+    word-break: break-word;
+  }
+  .note code,
+  .confirm code {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    padding: 0.05rem 0.3rem;
+  }
+  .confirm {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-top: 0.35rem;
   }
   .side {
     display: flex;
