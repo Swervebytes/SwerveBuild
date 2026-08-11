@@ -8,6 +8,7 @@ mod db;
 mod env_context;
 mod grok_config;
 mod jobs;
+pub mod live;
 mod local_llm;
 pub mod local_image;
 pub mod media_worker;
@@ -1650,6 +1651,79 @@ fn stream_key_name(target: String) -> Result<String, String> {
     secrets::stream_key_name(&target)
 }
 
+// ---- go-live approval tier (S38) ---------------------------------------------
+//
+// Every command here passes `Caller::Human` because the webview *is* the human
+// surface. That is a claim, not proof — S21b showed injected JS can invoke any
+// command — so `live.rs` backs it with a physical-presence check the webview
+// cannot fake. Deliberately absent: any command that starts a stream in one
+// shot, and any MCP tool at all (see `bin/swervebuild_mcp.rs`).
+
+#[tauri::command]
+fn live_status() -> live::LiveStatus {
+    live::status()
+}
+
+#[tauri::command]
+fn get_live_grant() -> live::LiveGrant {
+    live::load_grant()
+}
+
+#[tauri::command]
+fn set_live_grant(granted: bool) -> Result<live::LiveGrant, String> {
+    live::set_granted(live::Caller::Human, granted)
+}
+
+/// Step 1 of arming: returns a single-use nonce the UI echoes back on confirm.
+#[tauri::command]
+fn live_request_arm() -> Result<String, String> {
+    live::request_arm(live::Caller::Human)
+}
+
+/// Step 2: confirm while physically holding the chord.
+#[tauri::command]
+fn live_confirm_arm(nonce: String) -> Result<live::LiveStatus, String> {
+    live::confirm_arm(live::Caller::Human, &nonce)
+}
+
+/// Step 3: on air. Re-runs the whole gate; arming is a second factor, not a
+/// bypass. The RTMP sink (S39) starts only after this returns `Ok`.
+#[tauri::command]
+fn live_go_live() -> Result<live::LiveStatus, String> {
+    live::go_live(live::Caller::Human)
+}
+
+/// Always allowed, cannot fail — no grant, no arming, no presence proof.
+#[tauri::command]
+fn live_stop(reason: Option<String>) -> live::LiveStatus {
+    live::stop(
+        live::Caller::Human,
+        reason.as_deref().unwrap_or("stopped from the UI"),
+    )
+}
+
+/// Panic button. Same fail-safe rules as `live_stop`.
+#[tauri::command]
+fn live_panic_cut() -> live::LiveStatus {
+    live::panic_cut(live::Caller::Human)
+}
+
+#[tauri::command]
+fn live_clear_privacy_cut() -> Result<live::LiveStatus, String> {
+    live::clear_privacy_cut(live::Caller::Human)
+}
+
+/// Per-stream opt-in for agent-driven scene changes (rules 2 and 3).
+#[tauri::command]
+fn live_set_agent_scene_control(allowed: bool) -> Result<live::LiveStatus, String> {
+    live::set_agent_scene_control(live::Caller::Human, allowed)
+}
+
+#[tauri::command]
+fn live_recent_events(limit: Option<usize>) -> Vec<serde_json::Value> {
+    live::recent_events(limit.unwrap_or(50))
+}
+
 #[tauri::command]
 fn get_browser_debug_grant() -> browser_debug::BrowserDebugGrant {
     browser_debug::load_grant()
@@ -1905,6 +1979,17 @@ pub fn run() {
             secret_status,
             secret_delete,
             stream_key_name,
+            live_status,
+            get_live_grant,
+            set_live_grant,
+            live_request_arm,
+            live_confirm_arm,
+            live_go_live,
+            live_stop,
+            live_panic_cut,
+            live_clear_privacy_cut,
+            live_set_agent_scene_control,
+            live_recent_events,
             provider_install_info,
             install_provider_cli,
             uninstall_provider_cli,
