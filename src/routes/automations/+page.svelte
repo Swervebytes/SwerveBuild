@@ -484,7 +484,7 @@
         <div class="row-fields">
           <label class="field">
             <span class="field-label">Watch folder</span>
-            <input class="input" bind:value={editing.trigger.path} placeholder="E:\\AgentInbox" />
+            <input class="input" bind:value={editing.trigger.path} placeholder="C:\\Path\\To\\WatchFolder" />
           </label>
           <label class="field">
             <span class="field-label">Match</span>

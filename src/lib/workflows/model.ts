@@ -106,11 +106,11 @@ export const PARAM_FORMS: Record<string, Field[]> = {
     },
   ],
   "trigger.git": [
-    { key: "cwd", label: "Repository folder", kind: "text", placeholder: "E:\\MyProject" },
+    { key: "cwd", label: "Repository folder", kind: "text", placeholder: "C:\\Path\\To\\Repo" },
     { key: "branch", label: "Branch", kind: "text", placeholder: "Blank for the current branch" },
   ],
   "trigger.file": [
-    { key: "path", label: "File or folder to watch", kind: "text", placeholder: "E:\\MyProject\\notes" },
+    { key: "path", label: "File or folder to watch", kind: "text", placeholder: "C:\\Path\\To\\WatchFolder" },
     { key: "glob", label: "Name filter", kind: "text", placeholder: "*.md" },
   ],
   "http.request": [
@@ -182,7 +182,7 @@ export const PARAM_FORMS: Record<string, Field[]> = {
   ],
   "agent.run": [
     { key: "prompt", label: "Prompt", kind: "expression", placeholder: "Summarize {{ $json.text }}" },
-    { key: "cwd", label: "Project folder", kind: "text", placeholder: "E:\\MyProject" },
+    { key: "cwd", label: "Project folder", kind: "text", placeholder: "C:\\Path\\To\\Project" },
     {
       key: "model",
       label: "Model",
@@ -194,7 +194,7 @@ export const PARAM_FORMS: Record<string, Field[]> = {
     { key: "timeout_secs", label: "Timeout seconds", kind: "number" },
     { key: "web_search", label: "Allow web search", kind: "toggle" },
   ],
-  "file.read": [{ key: "path", label: "File path", kind: "expression", placeholder: "E:\\data\\{{ $json.name }}.txt" }],
+  "file.read": [{ key: "path", label: "File path", kind: "expression", placeholder: "C:\\Path\\To\\{{ $json.name }}.txt" }],
   "file.write": [
     { key: "path", label: "File path", kind: "expression" },
     { key: "content", label: "Content", kind: "expression", placeholder: "{{ $json.text }}" },

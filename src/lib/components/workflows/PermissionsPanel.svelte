@@ -117,12 +117,12 @@
       <div class="perm-body two-col">
         <label class="mini-field">
           <span>Readable folders</span>
-          <textarea rows="2" value={lines(permissions.fs.read)} placeholder="E:\reports" spellcheck="false"
+          <textarea rows="2" value={lines(permissions.fs.read)} placeholder="C:\Path\To\Reports" spellcheck="false"
             oninput={(e) => setLines(permissions.fs.read, e.currentTarget.value)}></textarea>
         </label>
         <label class="mini-field">
           <span>Writable folders</span>
-          <textarea rows="2" value={lines(permissions.fs.write)} placeholder="E:\reports\out" spellcheck="false"
+          <textarea rows="2" value={lines(permissions.fs.write)} placeholder="C:\Path\To\Reports\out" spellcheck="false"
             oninput={(e) => setLines(permissions.fs.write, e.currentTarget.value)}></textarea>
         </label>
       </div>

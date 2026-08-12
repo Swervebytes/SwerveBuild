@@ -143,7 +143,7 @@ A real workflow — nightly repo digest: schedule trigger → shadow agent summa
   "permissions": {
     "network": { "enabled": false, "hosts": [], "private_ips": false },
     "code": false,
-    "fs": { "read": [], "write": ["E:/SwerveGrokBuild/reports"] },
+    "fs": { "read": [], "write": ["C:/Path/To/Repo/reports"] },
     "agent": true
   },
   "nodes": [
@@ -172,7 +172,7 @@ A real workflow — nightly repo digest: schedule trigger → shadow agent summa
       "on_error": "stop",
       "retry": { "attempts": 1, "backoff_secs": [30] },
       "params": {
-        "cwd": "E:/SwerveGrokBuild",
+        "cwd": "C:/Path/To/Repo",
         "prompt": "Summarize the commits made in the last 24 hours in this repo. Reply with exactly SILENT if there are none.",
         "max_turns": 15,
         "timeout_secs": 600,
@@ -210,7 +210,7 @@ A real workflow — nightly repo digest: schedule trigger → shadow agent summa
       "on_error": "stop",
       "retry": null,
       "params": {
-        "path": "E:/SwerveGrokBuild/reports/digest-{{ $run.started_at }}.md",
+        "path": "C:/Path/To/Repo/reports/digest-{{ $run.started_at }}.md",
         "content": "{{ $json.text }}",
         "mode": "overwrite"
       }
@@ -545,7 +545,7 @@ Per node, `on_error`:
 "permissions": {
   "network": { "enabled": false, "hosts": ["api.github.com", "*.roaringbytes.com"], "private_ips": false },
   "code": false,
-  "fs": { "read": ["E:/reports"], "write": ["E:/reports/out"] },
+  "fs": { "read": ["C:/Path/To/Reports"], "write": ["C:/Path/To/Reports/out"] },
   "agent": false
 }
 ```
