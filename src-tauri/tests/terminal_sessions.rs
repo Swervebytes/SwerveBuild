@@ -16,8 +16,15 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Ignored by default, `live_*` convention: `op_start` always resolves the
+/// most-recently-opened project (cwd is *confined* under it, never a substitute),
+/// so this cannot pass anywhere without a project in the store. A CI runner has
+/// an empty `~/.swervebuild`, so it fails there with "no project is open" while
+/// passing on any dev box. Run it with `cargo test -- --ignored` after opening a
+/// project.
 #[test]
-fn persistent_session_survives_execs_and_persists_state() {
+#[ignore]
+fn live_persistent_session_survives_execs_and_persists_state() {
     // Grant on for the duration; restore afterward so the dev machine stays clean.
     let prev = terminal::load_grant();
     terminal::set_granted(true).expect("grant on");
