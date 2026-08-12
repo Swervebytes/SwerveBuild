@@ -80,7 +80,7 @@
       aria-haspopup="menu"
       aria-expanded={open}
       disabled={disabled}
-      title="Agent (chat) model — text + tool decisions, not image pixels"
+      title="Agent (chat) model: text + tool decisions, not image pixels"
     >
       <Icon name="settings" size={12} />
       <span class="label mono">{disabled ? "switching…" : `agent · ${triggerLabel}`}</span>
@@ -96,7 +96,7 @@
     >
       <div class="menu-head mono-label">Agent model</div>
       <p class="honesty">
-        Runs chat and decides tools. Does not render images — use the image section for that.
+        Runs chat and decides tools. Does not render images; use the image section for that.
       </p>
       <button class="row" class:current={value === null} type="button" role="menuitem" onclick={() => choose(null)}>
         <span class="row-label">Default</span>
@@ -106,7 +106,7 @@
       {#if !loaded}
         <div class="empty">Loading models…</div>
       {:else if models.length === 0}
-        <div class="empty">No models found — is Grok installed?</div>
+        <div class="empty">No models found. Is Grok installed?</div>
       {:else}
         {#each models as m (m.id)}
           <button

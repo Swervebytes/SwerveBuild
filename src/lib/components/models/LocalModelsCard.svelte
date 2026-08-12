@@ -139,7 +139,7 @@
     try {
       local = await invoke<LocalState>("add_local_model", { path: selected });
       catalog = await invoke<CatalogState>("get_model_catalog");
-      message = "Model added — it now appears in every model picker.";
+      message = "Model added. It now appears in every model picker.";
     } catch (e) {
       message = String(e);
       isError = true;
@@ -331,7 +331,7 @@
         <span class="vram-pct mono">{vramPct}%</span>
       {:else}
         <span class="vram-unknown" title="Install NVIDIA drivers / nvidia-smi for live used/total VRAM"
-          >—</span
+          >–</span
         >
         <span class="sub">VRAM used / total not reported</span>
       {/if}
@@ -354,7 +354,7 @@
     <div class="leases">
       <span class="section-label soft">Holders</span>
       {#if leaseList.length === 0}
-        <span class="sub">No active leases — slot free to swap models</span>
+        <span class="sub">No active leases; slot free to swap models</span>
       {:else}
         <span class="sub mono-label">
           {chatLeases} chat · {autoLeases} automation
@@ -435,7 +435,7 @@
                 type="button"
                 disabled={downloadingId !== null}
                 title={e.fit === "too_big"
-                  ? "May not fit in VRAM — you can still download and try CPU/offload"
+                  ? "May not fit in VRAM. You can still download and try CPU/offload"
                   : "Download from Hugging Face (resumable)"}
                 onclick={() => downloadCatalog(e.id)}
               >
@@ -499,7 +499,7 @@
     </div>
   {:else}
     <p class="empty-note">
-      No local models yet. Download one above, or add any <code>.gguf</code> file — it becomes a
+      No local models yet. Download one above, or add any <code>.gguf</code> file; it becomes a
       model you can pick in any chat or automation, served entirely on this machine.
     </p>
   {/if}

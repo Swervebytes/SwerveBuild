@@ -116,7 +116,7 @@ export const recipes: Recipe[] = [
       a.trigger = { kind: "file", path: cwd, glob: "*.md", snapshot: null };
       a.min_interval_secs = 10;
       a.executor.prompt =
-        "A file just changed (see the trigger data). Read it and give a short, constructive review — clarity, correctness, anything missing. Comment only; change nothing.";
+        "A file just changed (see the trigger data). Read it and give a short, constructive review: clarity, correctness, anything missing. Comment only; change nothing.";
       return a;
     },
   },
@@ -212,7 +212,7 @@ export function statusLabel(status: RunStatus | null | undefined, silent = false
 export function friendlyError(status: RunStatus, error: string | null): string {
   switch (status) {
     case "launchfailed":
-      return "Grok couldn't start — check it's installed and signed in on the Home screen.";
+      return "Grok couldn't start. Check it's installed and signed in on the Home screen.";
     case "maxturns":
       return "Hit the max-turns limit before finishing. Raise Max turns in Advanced, or narrow the task.";
     case "timeout":

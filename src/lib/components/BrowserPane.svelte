@@ -109,7 +109,7 @@
         type="text"
         spellcheck="false"
         autocomplete="off"
-        placeholder="Type a URL — localhost or a website"
+        placeholder="Type a URL: localhost or a website"
         bind:value={urlValue}
         onfocus={() => (editing = true)}
         onblur={() => (editing = false)}

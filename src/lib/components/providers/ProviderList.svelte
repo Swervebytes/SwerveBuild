@@ -112,7 +112,7 @@
       if (methods.length === 0) {
         results = {
           ...results,
-          [id]: "This agent reports no sign-in method — it may already be signed in. Send a chat message to check.",
+          [id]: "This agent reports no sign-in method; it may already be signed in. Send a chat message to check.",
         };
       } else if (methods.length === 1) {
         await runSignIn(id, methods[0].id);
@@ -172,13 +172,13 @@
         {#if COVERED_BY[p.id]}
           <span class="note">
             {p.id === "ollama"
-              ? "Local GGUF models already run in-app via the managed llama-server — see Local models below."
+              ? "Local GGUF models already run in-app via the managed llama-server; see Local models below."
               : "Any OpenAI-compatible endpoint already works via the Grok custom endpoint below."}
           </span>
         {/if}
         {#if info[p.id]?.installable && !info[p.id]?.npmVersion}
           <span class="note">
-            npm not found — install Node.js, then run
+            npm not found. Install Node.js, then run
             <code>{info[p.id]?.installCommand}</code>
           </span>
         {/if}

@@ -55,7 +55,7 @@ export function usagePercent(u: ChatUsage): number | null {
 
 /** Compact token count: 53000 → "53k", 1500 → "1.5k", 999 → "999". */
 export function formatTokens(n: number): string {
-  if (!Number.isFinite(n)) return "—";
+  if (!Number.isFinite(n)) return "–";
   const abs = Math.abs(n);
   if (abs < 1000) return String(Math.round(n));
   if (abs < 10_000) {

@@ -195,7 +195,7 @@
   async function save() {
     if (!editing) return;
     if (!editing.executor.cwd.trim()) {
-      editorError = "Choose a project — an automation needs a folder to run in.";
+      editorError = "Choose a project. An automation needs a folder to run in.";
       return;
     }
     editorError = null;
@@ -337,18 +337,18 @@
       <div>
         <h1 class="page-title">Automations</h1>
         <p class="page-subtitle">
-          Run Grok headless on a trigger — read-only by default.
+          Run Grok headless on a trigger. Read-only by default.
           {#if enabledCount > 0}· {enabledCount} enabled{/if}
           {#if runningCount > 0}· {runningCount} running{/if}
         </p>
         {#if grokRow && !grokRow.available}
           <p class="page-subtitle provider-note" data-testid="automations-grok-note">
-            Grok Build isn't installed, so automations can't run — install it from
+            Grok Build isn't installed, so automations can't run. Install it from
             the home screen first.
           </p>
         {:else if nonGrokActive}
           <p class="page-subtitle provider-note" data-testid="automations-grok-note">
-            Automations always run on Grok Build — your active chat provider
+            Automations always run on Grok Build; your active chat provider
             ({providerStore.active.label}) doesn't apply here.
           </p>
         {/if}
@@ -375,7 +375,7 @@
     </div>
     {#if paused}
       <div class="notice warning">
-        All automations are paused — triggers won't fire. <strong>Run now</strong> still works.
+        All automations are paused, so triggers won't fire. <strong>Run now</strong> still works.
       </div>
     {/if}
   </header>
@@ -386,7 +386,7 @@
       <div class="editor-head">
         <h2>{editing.id ? "Edit automation" : "New automation"}</h2>
         <span class="shadow-note">
-          <StatusPill tone="accent" label="Shadow mode — read-only" />
+          <StatusPill tone="accent" label="Shadow mode (read-only)" />
         </span>
       </div>
 
@@ -396,7 +396,7 @@
       </label>
 
       <label class="field">
-        <span class="field-label">Project — the folder the agent runs in</span>
+        <span class="field-label">Project: the folder the agent runs in</span>
         <select
           class="input"
           value={editing.project_id ?? ""}
@@ -410,9 +410,9 @@
         {#if editing.executor.cwd}
           <span class="field-hint">Runs in <code>{editing.executor.cwd}</code></span>
         {:else if projects.length === 0}
-          <span class="field-hint warn">No projects yet — <a href="/projects">add a project folder</a> first.</span>
+          <span class="field-hint warn">No projects yet. <a href="/projects">Add a project folder</a> first.</span>
         {:else}
-          <span class="field-hint warn">Pick a project — an automation needs a folder to run in.</span>
+          <span class="field-hint warn">Pick a project. An automation needs a folder to run in.</span>
         {/if}
       </label>
 
@@ -559,7 +559,7 @@
           </label>
           <p class="field-hint">
             Shadow mode runs with read-only tools (read, grep, list, and read-only shell commands),
-            enforced in the app itself — the agent can look but not change files.
+            enforced in the app itself. The agent can look but not change files.
           </p>
         </div>
       {/if}
@@ -583,7 +583,7 @@
       <EmptyState
         icon="zap"
         title="No automations yet"
-        description="Automations run Grok headless on a trigger — a schedule, a git change, a file change, or on demand. New automations start in read-only shadow mode, so they can look but never touch your files."
+        description="Automations run Grok headless on a trigger: a schedule, a git change, a file change, or on demand. New automations start in read-only shadow mode, so they can look but never touch your files."
       >
         <button class="btn btn-primary" type="button" onclick={openNew}>
           <Icon name="plus" size={15} /> New automation
@@ -636,7 +636,7 @@
                     {#if hasFolder(a)}
                       <span class="folder" title={a.executor.cwd}><Icon name="folder" size={11} /> {folderLabel(a)}</span>
                     {:else}
-                      <span class="folder warn"><Icon name="folder" size={11} /> No project — won't run</span>
+                      <span class="folder warn"><Icon name="folder" size={11} /> No project, won't run</span>
                     {/if}
                     · {triggerSummary(a.trigger)} · {lastRunText(a)}
                   </p>
