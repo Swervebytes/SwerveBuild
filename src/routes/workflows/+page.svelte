@@ -150,7 +150,7 @@
   </header>
 
   {#if browserPreview}
-    <div class="preview-note">Browser preview — the engine lives in the desktop app, so data here is empty.</div>
+    <div class="preview-note">Browser preview: the engine lives in the desktop app, so data here is empty.</div>
   {/if}
 
   {#if loading}

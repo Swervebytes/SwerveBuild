@@ -450,7 +450,7 @@
       if (gen !== bootstrapGen) return;
       sessionReady = false;
       error =
-        "Live Grok session disconnected. Your saved messages are below — send a message to reconnect.";
+        "Live Grok session disconnected. Your saved messages are below; send a message to reconnect.";
       if (String(err).trim()) {
         error = `${error} (${String(err)})`;
       }
@@ -484,7 +484,7 @@
       await refreshActiveSessions();
     } catch (err) {
       sessionReady = false;
-      error = `Model switch failed: ${String(err)} — send a message to reconnect.`;
+      error = `Model switch failed: ${String(err)}. Send a message to reconnect.`;
     } finally {
       modelSwitching = false;
     }
@@ -593,14 +593,14 @@
         // cryptic pipe error on the next send.
         if (event.payload.chatId !== $page.params.id) return;
         sessionReady = false;
-        void finalizeAssistantMessage("Partial reply saved — agent disconnected").then(
+        void finalizeAssistantMessage("Partial reply saved (agent disconnected)").then(
           (saved) => {
             if (saved) workspaceStore.refresh();
           },
         );
         sending = false;
         error =
-          "Live agent session ended. Your saved messages are below — send a message to reconnect.";
+          "Live agent session ended. Your saved messages are below; send a message to reconnect.";
         refreshActiveSessions();
       }),
       // Agent (or human) drove the preview browser — auto-open the dock so the

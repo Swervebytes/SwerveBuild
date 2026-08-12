@@ -186,7 +186,7 @@
           }}
           role="button"
           tabindex="0"
-          aria-label="{n.a.name} — {n.a.enabled ? 'enabled' : 'disabled'}, {n.a.executor
+          aria-label="{n.a.name}: {n.a.enabled ? 'enabled' : 'disabled'}, {n.a.executor
             .mode} mode{n.a.state.last_status ? `, last run ${n.a.state.last_status}` : ''}"
         >
           <rect width={NW} height={NH} rx="11" class="node-card" />

@@ -164,7 +164,7 @@
       aria-expanded={open}
       disabled={busy}
       title={selected
-        ? `Image gen: ${selected.label} (${selected.locality}) — ${selected.note}`
+        ? `Image gen: ${selected.label} (${selected.locality}). ${selected.note}`
         : "Image generation provider"}
     >
       <Icon name="image" size={12} />
@@ -181,7 +181,7 @@
     >
       <div class="menu-head mono-label">Image generation</div>
       <p class="honesty">
-        Chat model only decides tools. Pixels come from the provider below — not from local Qwen /
+        Chat model only decides tools. Pixels come from the provider below, not from local Qwen /
         Grok chat weights. Local uses ComfyUI; install checkpoints in Comfy Manager (not GGUF catalog).
       </p>
       {#if error}

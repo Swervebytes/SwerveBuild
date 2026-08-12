@@ -154,7 +154,7 @@ export const browserPane = {
         { url: target },
       );
       url = res?.url || target;
-      if (res && res.ok === false) message = "load timed out — check the URL / server";
+      if (res && res.ok === false) message = "load timed out. Check the URL / server";
     } catch (e) {
       // Rust errors arrive as "…: message"; keep the human-readable tail.
       message = String(e).replace(/^.*?:\s*/, "");

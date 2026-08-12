@@ -38,7 +38,7 @@
 </script>
 
 <aside class="palette">
-  <div class="palette-head mono-label">Add nodes — click or drag</div>
+  <div class="palette-head mono-label">Add nodes: click or drag</div>
   <div class="groups">
     {#each groups as group (group.cat)}
       <div class="group">

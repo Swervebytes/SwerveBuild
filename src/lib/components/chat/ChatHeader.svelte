@@ -111,7 +111,7 @@
         >
         <span class="usage-hint">ctx</span>
       {:else}
-        <span class="usage-unknown" aria-hidden="true">—</span>
+        <span class="usage-unknown" aria-hidden="true">–</span>
         <span class="usage-hint">ctx</span>
       {/if}
     </div>
@@ -136,7 +136,7 @@
       onclick={() => browserPane.toggle()}
       aria-label="Toggle preview browser"
       aria-pressed={browserPane.open}
-      title="Preview browser — open a localhost or web page here"
+      title="Preview browser: open a localhost or web page here"
     >
       <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
         <circle cx="8" cy="8" r="6.25" />

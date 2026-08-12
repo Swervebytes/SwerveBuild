@@ -275,7 +275,7 @@
       browserAllowPublic = !!grant.allowPublic;
       browserMessage = browserAllowPublic
         ? "Public websites allowed. Private/LAN/cloud-metadata addresses stay blocked (SSRF guard)."
-        : "Public browsing off — localhost only.";
+        : "Public browsing off. Localhost only.";
     } catch (e) {
       browserMessage = String(e);
     } finally {
@@ -296,7 +296,7 @@
         .filter((m) => m.kind === "custom")
         .map((m) => m.id)
         .join(", ");
-      idsMessage = "Saved — these IDs now appear in the model pickers.";
+      idsMessage = "Saved. These IDs now appear in the model pickers.";
     } catch (e) {
       idsMessage = String(e);
     } finally {
@@ -322,8 +322,8 @@
       endpoint = await invoke<GrokEndpoint>("set_grok_endpoint", { input });
       apiKeyInput = "";
       epMessage = endpoint.enabled
-        ? "Saved — Grok now routes through your endpoint."
-        : "Saved — Grok uses its default hosted routing.";
+        ? "Saved. Grok now routes through your endpoint."
+        : "Saved. Grok uses its default hosted routing.";
     } catch (e) {
       epMessage = String(e);
       epError = true;
@@ -383,7 +383,7 @@
     </div>
     <p class="group-note">
       Choose which agent backs your chats. Grok Build works out of the box after install and sign-in
-      on the home screen. Claude Code and Gemini can be installed (and removed) right here — each
+      on the home screen. Claude Code and Gemini can be installed (and removed) right here; each
       needs its own sign-in the first time you use it. Ollama and OpenAI-compatible endpoints are
       already covered by <strong>Local models</strong> and the <strong>Grok custom endpoint</strong>
       below; Anthropic direct is not built yet.
@@ -423,7 +423,7 @@
       The chat/agent model (including local Qwen) only writes text and decides to call tools. Image
       tools use a <strong>media provider</strong>: <strong>xAI Imagine</strong> (remote) or
       <strong>Local (ComfyUI)</strong> when Comfy is running on loopback. Install checkpoints in
-      <strong>Comfy Manager</strong> — not the GGUF local-models catalog. Agents: prefer
+      <strong>Comfy Manager</strong>, not the GGUF local-models catalog. Agents: prefer
       <code>swervebuild__local_image_generate</code> when Local is selected.
     </p>
     <div class="media-row">
@@ -505,7 +505,7 @@
       <span class="mono-label">llama.cpp · runs on this machine · chat only</span>
     </div>
     <p class="group-note">
-      Run models entirely on this PC — no Ollama, no cloud, no sign-in. Swerve downloads its own
+      Run models entirely on this PC: no Ollama, no cloud, no sign-in. Swerve downloads its own
       inference engine once, then any <code>.gguf</code> you add becomes a model selectable in chats
       and automations. One local model is loaded at a time; the server listens on localhost only.
       Local models do <strong>not</strong> render Imagine images offline.
@@ -522,7 +522,7 @@
       />
     </div>
     <p class="group-note">
-      Point Grok Build at your own OpenAI-compatible inference — local, self-hosted, or a gateway — so
+      Point Grok Build at your own OpenAI-compatible inference (local, self-hosted, or a gateway) so
       your code never leaves the machine. Swerve writes a managed <code>[model.swerve-endpoint]</code>
       block to your <code>~/.grok/config.toml</code> (backed up first) and, while routing is on, sets it
       as Grok's default model. The API key is injected at launch, never written to the config file.
@@ -551,7 +551,7 @@
       <Field
         label="API key"
         hint={endpoint.has_api_key
-          ? "A key is saved — leave blank to keep it, or type a new one to replace."
+          ? "A key is saved. Leave blank to keep it, or type a new one to replace."
           : "Passed to your endpoint via env; stored locally, never sent to xAI."}
       >
         <input
@@ -694,14 +694,14 @@
       />
     </div>
     <p class="group-note">
-      Allow the in-app agent to run shell commands — <strong>one-shot</strong> (<code>term_run</code>)
+      Allow the in-app agent to run shell commands: <strong>one-shot</strong> (<code>term_run</code>)
       and <strong>persistent sessions</strong> (<code>term_start</code>/<code>term_exec</code>, which
       keep a live PowerShell where state persists across commands). Sessions start inside the open
       project and die with the app. Off by default. Never enabled for automations. Revoke anytime.
     </p>
     <Field
       label="Allow agent to run terminal commands"
-      hint="PowerShell. One-shot runs are cwd-confined; a persistent session can cd anywhere you can — the grant is the gate."
+      hint="PowerShell. One-shot runs are cwd-confined; a persistent session can cd anywhere you can. The grant is the gate."
       row
     >
       <div class="segmented" role="radiogroup" aria-label="Agent terminal grant">
@@ -744,7 +744,7 @@
       />
     </div>
     <p class="group-note">
-      A <strong>preview browser</strong> docked in the chat — open it from the globe in a chat's
+      A <strong>preview browser</strong> docked in the chat. Open it from the globe in a chat's
       header. The in-app agent can drive it via <code>browser_*</code> MCP tools (navigate, read the
       page, console, fetch/XHR, click, screenshot), and the pane <strong>auto-opens</strong> when the
       agent navigates. Agent access is off by default; every navigation is logged.
@@ -782,7 +782,7 @@
     </Field>
     <Field
       label="Allow public websites"
-      hint="Off = localhost only (safe default). On = the open web too — but private, LAN, and cloud-metadata addresses stay blocked (SSRF guard), and navigations are logged."
+      hint="Off = localhost only (safe default). On = the open web too, but private, LAN, and cloud-metadata addresses stay blocked (SSRF guard), and navigations are logged."
       row
     >
       <div class="segmented" role="radiogroup" aria-label="Public websites">
@@ -822,8 +822,8 @@
       <StatusPill tone="accent" label="Shadow mode default" />
     </div>
     <p class="group-note">
-      Automations run Grok headless on a trigger. By default they use read-only tools — enforced in
-      the app itself, not just the UI — so they can read and reason about your project but cannot
+      Automations run Grok headless on a trigger. By default they use read-only tools, enforced in
+      the app itself (not just the UI), so they can read and reason about your project but cannot
       change files. Grok's own approval prompts and the OS sandbox don't apply to background runs on
       Windows, so anything that could write is deliberately gated and confined to the automation's
       project folder. Up to 2 automations run at once, and they run while Swerve Build is open.
