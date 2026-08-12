@@ -218,7 +218,7 @@ fn file_sha256(path: &PathBuf) -> Result<String, String> {
 
 /// Escape a string for embedding inside a PowerShell single-quoted literal: a
 /// literal `'` becomes `''`. Without this, a data dir under a home path that
-/// contains an apostrophe (e.g. `C:\Users\O'Brien`) would break — or let content
+/// contains an apostrophe (e.g. `C:\Path\O'Connor`) would break — or let content
 /// break out of — the `Expand-Archive` / `Get-FileHash` command strings below.
 fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
