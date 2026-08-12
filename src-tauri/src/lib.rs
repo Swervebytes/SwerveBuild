@@ -152,17 +152,21 @@ fn is_authenticated() -> bool {
 // Never pipe a remote script to iex. Download the Windows binary at a fixed
 // version, SHA-256 verify, then place it under ~/.grok/bin. Bump all four
 // constants together via the DEPENDENCIES.md upgrade ritual.
-// Recorded 2026-07-20 from https://x.ai/cli/stable → 0.2.106.
+// Recorded 2026-08-11 from https://x.ai/cli/stable → 1.0.0 (S-GROK-1.0).
+// Hash verified two ways: computed from a fresh download of both URLs' artifact
+// AND byte-identical to the binary Grok's own auto-updater installed on this
+// machine. Wire-probed on 1.0.0: `_x.ai/session_notification` usage +
+// `totalContextTokens` (context bar, S34b/S35) both intact.
 // ---------------------------------------------------------------------------
 /// Pinned Grok CLI release tag (semver without `v`).
-pub const GROK_CLI_VERSION: &str = "0.2.106";
-const GROK_CLI_URL: &str = "https://x.ai/cli/grok-0.2.106-windows-x86_64.exe";
+pub const GROK_CLI_VERSION: &str = "1.0.0";
+const GROK_CLI_URL: &str = "https://x.ai/cli/grok-1.0.0-windows-x86_64.exe";
 /// Fallback when the Cloudflare-fronted x.ai host is unreachable (same artifact
 /// layout as the official install.ps1).
 const GROK_CLI_URL_FALLBACK: &str =
-    "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-0.2.106-windows-x86_64.exe";
-const GROK_CLI_SHA256: &str = "A6A25D55DAADCA0C2458A5ACEB4C1873EB7C76964EF307647D079E344C53969A";
-const GROK_CLI_SIZE: u64 = 130_120_520;
+    "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-1.0.0-windows-x86_64.exe";
+const GROK_CLI_SHA256: &str = "B238FE6B380074849C3A718B5989176559E698E4A8F5D27F11BFF936E92585D1";
+const GROK_CLI_SIZE: u64 = 139_913_032;
 
 #[tauri::command]
 fn get_grok_status() -> GrokStatus {
@@ -407,56 +411,78 @@ fn open_grok_login() -> CommandResult {
 
 #[tauri::command]
 fn check_grok_updates() -> CommandResult {
-    // Read grok's own version state from ~/.grok/version.json, which its
-    // background auto-updater keeps fresh. Spawning `grok update --check` returns
-    // "program not found" when launched from this app's process context (it works
-    // from a shell — an environment quirk we couldn't reproduce or pin down), so
-    // we read the authoritative file instead: instant, and no fragile subprocess.
-    if resolve_grok_executable().is_none() {
+    // S-GROK-1.0: this used to only read ~/.grok/version.json — Grok's own
+    // updater's cache — which meant the button reported Grok's LAST self-check,
+    // not a live answer, and a stalled updater would report "up to date"
+    // forever. Now: ask https://x.ai/cli/stable directly (the same endpoint the
+    // pin ritual reads), and fall back to the cache only when offline.
+    // (Spawning `grok update --check` still fails from this process context —
+    // "program not found", unreproducible from a shell — so we don't.)
+    let Some(exe) = resolve_grok_executable() else {
         return CommandResult {
             success: false,
             message: "Grok Build is not installed.".into(),
         };
-    }
-
-    let path = grok_home().join("version.json");
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(_) => {
-            // No cached file yet — report the installed version directly.
-            let installed = resolve_grok_executable()
-                .as_deref()
-                .and_then(grok_version_at)
-                .unwrap_or_else(|| "unknown version".to_string());
-            return CommandResult {
-                success: true,
-                message: format!("Installed: {installed}. Grok manages its own updates."),
-            };
-        }
     };
+    let installed = grok_version_at(&exe).unwrap_or_else(|| "unknown".to_string());
 
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return CommandResult {
+    match fetch_stable_version() {
+        Ok(latest) => CommandResult {
             success: true,
-            message: "Grok Build manages its own updates.".into(),
-        };
-    };
+            message: update_message(&installed, &latest),
+        },
+        Err(_) => {
+            // Offline: report the cache, but say that's what it is.
+            let cached = fs::read_to_string(grok_home().join("version.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|v| {
+                    v.get("stable_version")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                });
+            let message = match cached {
+                Some(latest) => format!(
+                    "{} (offline — using Grok's last self-check)",
+                    update_message(&installed, &latest)
+                ),
+                None => format!(
+                    "Installed: {installed}. Could not reach x.ai to check for updates."
+                ),
+            };
+            CommandResult {
+                success: true,
+                message,
+            }
+        }
+    }
+}
 
-    let current = v.get("version").and_then(|x| x.as_str()).unwrap_or("?");
-    let latest = v
-        .get("stable_version")
-        .and_then(|x| x.as_str())
-        .unwrap_or(current);
+/// Live stable version from x.ai — plain-text semver body.
+fn fetch_stable_version() -> Result<String, String> {
+    let body = ureq::get("https://x.ai/cli/stable")
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let v = body.trim().trim_start_matches('v').to_string();
+    // Guard against an error page: accept only digits-and-dots semver shapes.
+    if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(format!("unexpected stable response: {v:.40}"));
+    }
+    Ok(v)
+}
 
-    let message = if !latest.is_empty() && latest != "?" && latest != current {
-        format!("Update available: v{current} → v{latest}. Grok auto-updates; run `grok update` to apply it now.")
+/// Pure message builder so the compare logic is unit-testable. `installed` is
+/// raw `grok --version` output ("grok 1.0.0 (3cd0d0cbce) [stable]").
+fn update_message(installed: &str, latest: &str) -> String {
+    if version_matches_pin(installed, latest) {
+        format!("Grok Build is up to date — v{latest}.")
     } else {
-        format!("Grok Build is up to date — v{current}.")
-    };
-
-    CommandResult {
-        success: true,
-        message,
+        format!(
+            "Update available: {installed} → v{latest}. Grok updates itself in the background, or run `grok update` to apply it now."
+        )
     }
 }
 
@@ -2161,6 +2187,20 @@ mod grok_install_tests {
             eprintln!("{cli}: spawned OK (no os error 193)");
         }
         assert!(checked > 0, "no provider CLI on PATH — nothing was proven");
+    }
+
+    #[test]
+    fn update_messages_compare_versions_honestly() {
+        // Raw `grok --version` output vs a clean semver from x.ai/cli/stable.
+        let up_to_date = update_message("grok 1.0.0 (3cd0d0cbce) [stable]", "1.0.0");
+        assert!(up_to_date.contains("up to date"), "{up_to_date}");
+
+        let behind = update_message("grok 0.2.106 [stable]", "1.0.0");
+        assert!(behind.contains("Update available"), "{behind}");
+        assert!(behind.contains("v1.0.0"));
+
+        // "0.2.1060" must not read as matching "0.2.106" (tokenizer rule).
+        assert!(update_message("grok 0.2.1060", "0.2.106").contains("Update available"));
     }
 
     #[test]
