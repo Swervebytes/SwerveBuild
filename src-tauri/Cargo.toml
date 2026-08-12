@@ -48,7 +48,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 # P4.2 — restore window size/position/maximized across launches.
 tauri-plugin-window-state = "2"
-toml_edit = "0.22"
+toml_edit = "0.25"
 swerve-workflows = { path = "crates/swerve-workflows" }
 # CDP client for app_ui drive (WebSocket to WebView2 remote-debugging-port).
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
