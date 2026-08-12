@@ -36,3 +36,7 @@ scripts/_*.py
 
 # python cache from smoke-harness imports
 scripts/__pycache__/
+
+# Internal planning docs — local only, never published. (Previously excluded
+# only via .git/info/exclude, which does not travel with clones.)
+docs-internal/
