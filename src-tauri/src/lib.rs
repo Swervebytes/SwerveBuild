@@ -474,15 +474,89 @@ fn fetch_stable_version() -> Result<String, String> {
     Ok(v)
 }
 
+/// Run the installed Grok CLI's own updater (`grok update`). The resolved
+/// executable is spawned directly. A bare `grok` on PATH is not used, because
+/// that spawn has failed with "program not found" from this process.
+#[tauri::command]
+async fn apply_grok_update() -> CommandResult {
+    tauri::async_runtime::spawn_blocking(apply_grok_update_blocking)
+        .await
+        .unwrap_or_else(|e| CommandResult {
+            success: false,
+            message: format!("Update task failed: {e}"),
+        })
+}
+
+fn apply_grok_update_blocking() -> CommandResult {
+    let Some(exe) = resolve_grok_executable() else {
+        return CommandResult {
+            success: false,
+            message: "Grok Build is not installed.".into(),
+        };
+    };
+    let output = util::hidden_command(&exe)
+        .arg("update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match output {
+        Ok(out) => {
+            let detail = command_tail(&out.stdout, &out.stderr);
+            if out.status.success() {
+                let message = if detail.is_empty() {
+                    "Grok Build update finished.".to_string()
+                } else {
+                    format!("Grok Build update finished. {detail}")
+                };
+                CommandResult {
+                    success: true,
+                    message,
+                }
+            } else {
+                let code = out.status.code().unwrap_or(-1);
+                let message = if detail.is_empty() {
+                    format!("Grok update failed (exit {code}).")
+                } else {
+                    format!("Grok update failed (exit {code}). {detail}")
+                };
+                CommandResult {
+                    success: false,
+                    message,
+                }
+            }
+        }
+        Err(error) => CommandResult {
+            success: false,
+            message: format!("Failed to start Grok update: {error}"),
+        },
+    }
+}
+
+/// Last slice of a command's stdout, or stderr when stdout is empty.
+fn command_tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let raw = if stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        String::from_utf8_lossy(stdout)
+    } else {
+        String::from_utf8_lossy(stderr)
+    };
+    let trimmed = raw.trim();
+    const MAX: usize = 500;
+    if trimmed.chars().count() <= MAX {
+        trimmed.to_string()
+    } else {
+        let start = trimmed.chars().count() - MAX;
+        format!("…{}", trimmed.chars().skip(start).collect::<String>())
+    }
+}
+
 /// Pure message builder so the compare logic is unit-testable. `installed` is
 /// raw `grok --version` output ("grok 1.0.0 (3cd0d0cbce) [stable]").
 fn update_message(installed: &str, latest: &str) -> String {
     if version_matches_pin(installed, latest) {
         format!("Grok Build is up to date — v{latest}.")
     } else {
-        format!(
-            "Update available: {installed} → v{latest}. Grok updates itself in the background, or run `grok update` to apply it now."
-        )
+        format!("Update available: {installed} → v{latest}.")
     }
 }
 
@@ -1978,6 +2052,7 @@ pub fn run() {
             install_grok,
             open_grok_login,
             check_grok_updates,
+            apply_grok_update,
             read_memory,
             write_memory,
             list_skills,
@@ -2198,9 +2273,23 @@ mod grok_install_tests {
         let behind = update_message("grok 0.2.106 [stable]", "1.0.0");
         assert!(behind.contains("Update available"), "{behind}");
         assert!(behind.contains("v1.0.0"));
+        assert!(
+            !behind.contains("run `grok update`"),
+            "the app applies the update; the notice must not send the user to a terminal"
+        );
 
         // "0.2.1060" must not read as matching "0.2.106" (tokenizer rule).
         assert!(update_message("grok 0.2.1060", "0.2.106").contains("Update available"));
+    }
+
+    #[test]
+    fn command_tail_prefers_stdout_and_clips() {
+        assert_eq!(command_tail(b"  hello\n", b"err"), "hello");
+        assert_eq!(command_tail(b"   \n", b"from stderr"), "from stderr");
+        let long = "x".repeat(600);
+        let tail = command_tail(long.as_bytes(), b"");
+        assert!(tail.starts_with('…'));
+        assert_eq!(tail.chars().count(), 501);
     }
 
     #[test]

@@ -23,6 +23,8 @@
   let loading = $state(true);
   let busy = $state<string | null>(null);
   let notice = $state<string | null>(null);
+  /** Set when a check finds a newer Grok CLI. The Update button applies it. */
+  let pendingGrokUpdate = $state<string | null>(null);
   let signingIn = $state(false);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -47,8 +49,52 @@
     }
   }
 
+  function noteGrokCheck(result: CommandResult) {
+    if (result.success && result.message.startsWith("Update available")) {
+      pendingGrokUpdate = result.message;
+      return;
+    }
+    pendingGrokUpdate = null;
+    notice = result.message;
+  }
+
+  async function checkUpdates(quiet = false) {
+    if (!quiet) {
+      busy = "update";
+      notice = null;
+    }
+    try {
+      const result = await invoke<CommandResult>("check_grok_updates");
+      if (quiet && !result.message.startsWith("Update available")) return;
+      noteGrokCheck(result);
+    } catch (error) {
+      if (!quiet) notice = String(error);
+    } finally {
+      if (!quiet) busy = null;
+    }
+  }
+
+  async function applyUpdate() {
+    busy = "apply";
+    notice = null;
+    try {
+      const result = await invoke<CommandResult>("apply_grok_update");
+      notice = result.message;
+      if (result.success) {
+        pendingGrokUpdate = null;
+        await refresh(true);
+      }
+    } catch (error) {
+      notice = String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
   onMount(() => {
-    refresh();
+    refresh().then(() => {
+      if (status?.installed) void checkUpdates(true);
+    });
     return stopAuthPoll;
   });
 
@@ -159,11 +205,22 @@
             {signingIn ? "Waiting for browser…" : busy === "login" ? "Starting…" : "Sign In"}
           </button>
         {/if}
+        {#if pendingGrokUpdate}
+          <button
+            class="btn btn-primary"
+            type="button"
+            disabled={busy !== null}
+            onclick={applyUpdate}
+          >
+            <Icon name="refresh" size={15} />
+            {busy === "apply" ? "Updating…" : "Update"}
+          </button>
+        {/if}
         <button
           class="btn"
           type="button"
           disabled={busy !== null}
-          onclick={() => runAction("update", () => invoke<CommandResult>("check_grok_updates"))}
+          onclick={() => checkUpdates(false)}
         >
           <Icon name="refresh" size={15} />
           {busy === "update" ? "Checking…" : "Check for Updates"}
@@ -187,8 +244,11 @@
       </div>
     {/if}
 
+    {#if pendingGrokUpdate}
+      <p class="notice">{pendingGrokUpdate}</p>
+    {/if}
     {#if notice}
-      <p class="notice" class:ok={notice.includes("successfully")}>{notice}</p>
+      <p class="notice" class:ok={notice.includes("successfully") || notice.includes("update finished")}>{notice}</p>
     {/if}
   </section>
 

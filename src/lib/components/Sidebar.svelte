@@ -99,11 +99,15 @@
   </div>
 
   <footer class="sidebar-footer">
-    <div class="provider" title="Active provider">
+    <div class="foot-row" title="Active provider">
       <span class="swatch" style="--c: {providerStore.active.accent}"></span>
+      <span class="foot-kicker">Provider</span>
       <span class="provider-label">{providerStore.active.label}</span>
     </div>
-    <span class="version">v{appVersion}</span>
+    <div class="foot-row" title="Swerve Build version">
+      <span class="foot-kicker">App</span>
+      <span class="version">v{appVersion}</span>
+    </div>
   </footer>
 </aside>
 
@@ -270,17 +274,24 @@
 
   .sidebar-footer {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.5rem;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.35rem;
     padding: 0.7rem 1rem 0.85rem;
     border-top: 1px solid var(--border);
   }
-  .provider {
-    display: inline-flex;
+  .foot-row {
+    display: flex;
     align-items: center;
     gap: 0.45rem;
     min-width: 0;
+  }
+  .foot-kicker {
+    flex: none;
+    font-size: 0.625rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-faint);
   }
   .swatch {
     width: 9px;

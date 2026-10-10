@@ -132,6 +132,12 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
             "Frozen core: see docs-internal/FROZEN-CORE.md — flag any frozen-surface edit in your plan before changing it."
                 .to_string(),
         );
+        // Content line only (fingerprint already includes self_dev). The running
+        // process is the installed copy; editing this repo does not change it.
+        lines.push(
+            "Running copy: the installed app, separate from this repo. Edits apply after npm run install:local and a restart. This chat resumes."
+                .to_string(),
+        );
     }
 
     lines.push("[End SwerveBuild environment]".to_string());
@@ -500,6 +506,8 @@ mod tests {
         let pack = format_pack(&s);
         assert!(pack.contains("self-dev: yes"));
         assert!(pack.contains("FROZEN-CORE.md"));
+        assert!(pack.contains("Running copy: the installed app"));
+        assert!(pack.contains("install:local"));
     }
 
     #[test]
