@@ -8,9 +8,12 @@
 //! makes chats self-contained — the preview survives the project file moving.
 //!
 //! What is detected: path-looking tokens ending in a known image/video
-//! extension inside the turn's text (final prose + tool-chip text) — bare
-//! tokens without spaces, and quoted/backticked/markdown-linked paths which may
-//! contain spaces. Relative paths resolve against the chat's project folder.
+//! extension inside the text the caller passes. The chat page passes only the
+//! output of a capture tool (screenshot, still, clip, local image). Prose,
+//! thoughts, and other tool results are not passed, so a mentioned path such
+//! as `docs/hero.svg` is not a picture. Bare tokens without spaces, and
+//! quoted/backticked/markdown-linked paths which may contain spaces. Relative
+//! paths resolve against the chat's project folder.
 //! What is NOT detected: URLs, data URIs, paths without extensions, files
 //! larger than the caps.
 

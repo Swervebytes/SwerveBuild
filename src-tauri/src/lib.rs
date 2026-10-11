@@ -16,6 +16,7 @@ pub mod media_worker;
 mod media_providers;
 mod model_catalog;
 pub mod paths;
+mod project_card;
 mod providers;
 pub mod provider_auth;
 pub mod secrets;
@@ -791,39 +792,77 @@ fn get_chat(chat_id: String) -> Result<Chat, String> {
 
 #[tauri::command]
 fn append_chat_message(
+    acp: State<'_, Arc<AcpManager>>,
     chat_id: String,
     role: String,
     content: String,
     images: Vec<String>,
     videos: Option<Vec<String>>,
     parts: Option<Vec<MessagePart>>,
+    outcome: Option<String>,
 ) -> Result<ChatMessage, String> {
-    let _guard = Store::lock();
-    let mut store = Store::load();
-    let chat = store
-        .chats
-        .iter_mut()
-        .find(|c| c.id == chat_id)
-        .ok_or_else(|| "Chat not found".to_string())?;
+    let (message, record) = {
+        let _guard = Store::lock();
+        let mut store = Store::load();
+        let chat = store
+            .chats
+            .iter_mut()
+            .find(|c| c.id == chat_id)
+            .ok_or_else(|| "Chat not found".to_string())?;
 
-    let message = ChatMessage {
-        id: Store::new_id(),
-        role,
-        content,
-        images,
-        videos: videos.unwrap_or_default(),
-        parts: parts.unwrap_or_default(),
-        created_at: Store::now(),
+        let message = ChatMessage {
+            id: Store::new_id(),
+            role,
+            content,
+            images,
+            videos: videos.unwrap_or_default(),
+            parts: parts.unwrap_or_default(),
+            created_at: Store::now(),
+        };
+
+        if chat.title == "New chat" && message.role == "user" && !message.content.trim().is_empty()
+        {
+            chat.title = Store::chat_title_from_message(&message.content);
+        }
+
+        let record = (message.role == "assistant").then(|| {
+            let turn = if outcome.as_deref() == Some("error") {
+                "error"
+            } else {
+                "finished"
+            };
+            (chat_id.clone(), turn.to_string())
+        });
+
+        chat.messages.push(message.clone());
+        chat.updated_at = Store::now();
+        Store::save(&store)?;
+        (message, record)
     };
-
-    if chat.title == "New chat" && message.role == "user" && !message.content.trim().is_empty() {
-        chat.title = Store::chat_title_from_message(&message.content);
+    if let Some((id, turn)) = record {
+        // Git status runs outside the store lock.
+        if let Err(err) = project_card::record(&id, &turn, &acp.list_active()) {
+            eprintln!("[swervebuild] project card: {err}");
+        }
     }
-
-    chat.messages.push(message.clone());
-    chat.updated_at = Store::now();
-    Store::save(&store)?;
     Ok(message)
+}
+
+#[tauri::command]
+fn record_project_card(
+    acp: State<'_, Arc<AcpManager>>,
+    chat_id: String,
+    outcome: String,
+) -> Result<(), String> {
+    project_card::record(&chat_id, &outcome, &acp.list_active())
+}
+
+#[tauri::command]
+fn get_project_card(
+    acp: State<'_, Arc<AcpManager>>,
+    project_id: String,
+) -> Result<project_card::ProjectCard, String> {
+    project_card::load_or_build(&project_id, &acp.list_active())
 }
 
 #[tauri::command]
@@ -2111,6 +2150,8 @@ pub fn run() {
             rename_chat,
             get_chat,
             append_chat_message,
+            record_project_card,
+            get_project_card,
             save_pasted_image,
             import_attachment_files,
             artifact_store_status,

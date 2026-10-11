@@ -8,20 +8,14 @@
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { providerStore } from "$lib/stores/providers.svelte";
   import { imageSrc, saveAcpImageBlock } from "$lib/attachments";
-  import {
-    type ChatUsage,
-    emptyUsage,
-    mergeUsage,
-    parseEndTurnUsage,
-    parseUsageUpdate,
-    parseVendorUsage,
-    sizeOnlyUsage,
-  } from "$lib/chatUsage";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
   import ComposerDock from "$lib/components/chat/ComposerDock.svelte";
+  import ProjectStatus from "$lib/components/project/ProjectStatus.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
   import { browserPane } from "$lib/stores/browserPane.svelte";
+  import { isChatMediaTool, mediaScanText, rememberToolName } from "$lib/chatMedia";
+  import { clearChatDraft, loadChatDraft, saveChatDraft, shouldRecoverDraft } from "$lib/chatDraft";
 
   type StreamMessage = {
     id: string;
@@ -30,6 +24,8 @@
     kind?: string;
     /** ACP toolCallId — used to dedupe tool_call + tool_call_update into one chip. */
     toolCallId?: string;
+    /** Stable tool name. Later updates replace `title` with a summary. */
+    toolName?: string;
   };
 
   let chat = $state<Chat | null>(null);
@@ -42,8 +38,6 @@
   /** P1.1: provider label when the last send failed on sign-in; shows the banner. */
   let authRequiredProvider = $state<string | null>(null);
   let activeSessionCount = $state(0);
-  /** ACP-reported context window; stays empty until agent sends used+size. */
-  let usage = $state<ChatUsage>(emptyUsage());
   /** Agent images this turn (ACP blocks + live path-scan). Shown as thumbs while streaming. */
   let streamImages = $state<string[]>([]);
   let streamVideos = $state<string[]>([]);
@@ -54,6 +48,68 @@
   const chatProviderId = $derived(chat?.provider_id ?? providerStore.active?.id ?? "grok");
 
   let bootstrapGen = 0;
+  /** The connect already running for this chat, so Send can wait instead of starting another grok. */
+  let sessionStart: { chatId: string; gen: number; promise: Promise<void> } | null = null;
+
+  async function ensureLiveSession(chatId: string, gen: number): Promise<void> {
+    if (sessionReady && gen === bootstrapGen) return;
+    if (sessionStart && sessionStart.chatId === chatId && sessionStart.gen === gen) {
+      await sessionStart.promise;
+      return;
+    }
+    const promise = invoke<{ success: boolean; message: string }>("start_chat_session", {
+      chatId,
+    }).then(() => {
+      if (gen === bootstrapGen) sessionReady = true;
+    });
+    const tracked = promise.finally(() => {
+      if (sessionStart?.promise === tracked) sessionStart = null;
+    });
+    sessionStart = { chatId, gen, promise: tracked };
+    await tracked;
+  }
+
+  let draftTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function currentDraft() {
+    if (!chat) return null;
+    const content = streaming
+      .filter((item) => item.role === "assistant" && item.kind === "message")
+      .map((item) => item.content)
+      .join("");
+    const parts = streaming
+      .filter((item) => item.role === "tool" || item.kind === "thought")
+      .map((item) => ({
+        kind: item.role === "tool" ? ("tool" as const) : ("thought" as const),
+        text: item.content,
+      }));
+    if (!content.trim() && parts.length === 0 && streamImages.length === 0 && streamVideos.length === 0) {
+      return null;
+    }
+    return {
+      chatId: chat.id,
+      content,
+      parts,
+      images: [...streamImages],
+      videos: [...streamVideos],
+      updatedAt: Date.now(),
+    };
+  }
+
+  function persistDraftNow() {
+    const draft = currentDraft();
+    if (!draft) return;
+    saveChatDraft(draft);
+  }
+
+  function scheduleDraft() {
+    // Do not reset the timer on every token. A steady stream must still save.
+    if (draftTimer) return;
+    draftTimer = setTimeout(() => {
+      draftTimer = null;
+      persistDraftNow();
+    }, 700);
+  }
 
   function resetStream() {
     streaming = [];
@@ -64,13 +120,6 @@
       clearTimeout(pathDetectTimer);
       pathDetectTimer = null;
     }
-  }
-
-  function applyUsage(next: ChatUsage | null) {
-    if (!next) return;
-    // Keep a window size we already learned when a later report omits it
-    // (S34) — remembering a real number, not inventing one.
-    usage = mergeUsage(usage, next);
   }
 
   function mergeStreamMedia(images: string[], videos: string[] = []) {
@@ -152,26 +201,19 @@
     return "";
   }
 
-  /** Debounced path-scan while the agent streams so thumbs appear before finalize. */
-  function schedulePathDetect(extraText = "") {
-    if (!chat) return;
+  /** Debounced path-scan of one capture-tool result. Other text is not included. */
+  function schedulePathDetect(toolText: string) {
+    if (!chat || !toolText.trim()) return;
     const chatId = chat.id;
     if (pathDetectTimer) clearTimeout(pathDetectTimer);
     const gen = pathDetectGen;
     pathDetectTimer = setTimeout(() => {
       void (async () => {
         if (gen !== pathDetectGen || !chat || chat.id !== chatId) return;
-        const turnText = [
-          extraText,
-          ...streaming.map((item) => item.content),
-        ]
-          .filter(Boolean)
-          .join("\n");
-        if (!turnText.trim()) return;
         try {
           const scanned = await invoke<{ images: string[]; videos: string[] }>(
             "detect_chat_media",
-            { chatId, text: turnText },
+            { chatId, text: toolText },
           );
           if (gen !== pathDetectGen) return;
           mergeStreamMedia(scanned.images ?? [], scanned.videos ?? []);
@@ -195,22 +237,13 @@
       (typeof inner.title === "string" ? inner.title : "") ||
       "";
 
-    // ACP session-usage RFD: sessionUpdate "usage_update" with used + size.
-    if (sessionUpdate === "usage_update") {
-      applyUsage(parseUsageUpdate(inner));
-      return;
-    }
-
-    // Vendor updates that carry real token numbers (S34/S34b). Grok sends
-    // these on `_x.ai/session_notification` (NOT `session/update`, despite its
-    // own logs saying so); acp.rs forwards vendor session notifications.
+    // Token and compaction notices are not shown, and they carry no chat text.
     if (
+      sessionUpdate === "usage_update" ||
       sessionUpdate === "turn_completed" ||
       sessionUpdate === "response_completed" ||
       sessionUpdate === "auto_compact_started"
     ) {
-      applyUsage(parseVendorUsage(inner));
-      // turn_completed has no renderable text; auto_compact is informational.
       return;
     }
 
@@ -222,8 +255,6 @@
     ) {
       harvestAcpImages(content);
       harvestAcpImages(inner);
-      const flat = flattenForPathScan(inner);
-      if (flat) schedulePathDetect(flat);
     }
 
     if (!text && sessionUpdate !== "tool_call" && sessionUpdate !== "tool_call_update") return;
@@ -238,9 +269,6 @@
           ...streaming,
           { id: crypto.randomUUID(), role: "assistant", content: text, kind: "message" },
         ];
-      }
-      if (/\.(png|jpe?g|gif|webp|bmp|svg|mp4|webm|mov)\b/i.test(text)) {
-        schedulePathDetect(text);
       }
       return;
     }
@@ -266,13 +294,18 @@
           "string" &&
           String((inner.toolCall as Record<string, unknown>).toolCallId)) ||
         undefined;
-      // Prefer a rich label for chips; still path-scan the full flattened payload.
       const flat = flattenForPathScan(inner);
       const label =
         text ||
         (typeof inner.title === "string" ? inner.title : "") ||
         flat.slice(0, 200) ||
         sessionUpdate;
+
+      const pushMedia = (item: StreamMessage) => {
+        if (isChatMediaTool(item.toolName) && item.content.trim()) {
+          schedulePathDetect(item.content);
+        }
+      };
 
       if (toolCallId) {
         const idx = streaming.findIndex(
@@ -283,36 +316,39 @@
           // Keep the longer of label vs prior so rawOutput paths are retained.
           const nextContent =
             flat.length > (prev.content?.length ?? 0) ? flat : label || prev.content;
-          streaming[idx] = {
+          const next: StreamMessage = {
             ...prev,
             content: nextContent || prev.content,
             kind: sessionUpdate,
+            toolName: rememberToolName(inner, prev.toolName),
           };
+          streaming[idx] = next;
           streaming = [...streaming];
+          pushMedia(next);
           return;
         }
-        streaming = [
-          ...streaming,
-          {
-            id: toolCallId,
-            toolCallId,
-            role: "tool",
-            content: flat || label,
-            kind: sessionUpdate,
-          },
-        ];
-        return;
-      }
-
-      streaming = [
-        ...streaming,
-        {
-          id: crypto.randomUUID(),
+        const created: StreamMessage = {
+          id: toolCallId,
+          toolCallId,
           role: "tool",
           content: flat || label,
           kind: sessionUpdate,
-        },
-      ];
+          toolName: rememberToolName(inner),
+        };
+        streaming = [...streaming, created];
+        pushMedia(created);
+        return;
+      }
+
+      const created: StreamMessage = {
+        id: crypto.randomUUID(),
+        role: "tool",
+        content: flat || label,
+        kind: sessionUpdate,
+        toolName: rememberToolName(inner),
+      };
+      streaming = [...streaming, created];
+      pushMedia(created);
     }
   }
 
@@ -349,26 +385,28 @@
         text: item.content,
       }));
 
-    // Media: stream harvest first, then final path-scan over prose + tool text
-    // (S15b — agent-generated images often only appear in tool payloads).
+    // Real image blocks are harvested while streaming. Path scan is limited
+    // to capture-tool output, so a mentioned file is not shown as a picture.
     let media: { images: string[]; videos: string[] } = {
       images: [...streamImages],
       videos: [...streamVideos],
     };
-    const turnText = streaming.map((item) => item.content).join("\n");
-    try {
-      const scanned = await invoke<{ images: string[]; videos: string[] }>("detect_chat_media", {
-        chatId: chat.id,
-        text: turnText,
-      });
-      for (const img of scanned.images ?? []) {
-        if (!media.images.includes(img)) media.images.push(img);
+    const turnText = mediaScanText(streaming);
+    if (turnText.trim()) {
+      try {
+        const scanned = await invoke<{ images: string[]; videos: string[] }>("detect_chat_media", {
+          chatId: chat.id,
+          text: turnText,
+        });
+        for (const img of scanned.images ?? []) {
+          if (!media.images.includes(img)) media.images.push(img);
+        }
+        for (const vid of scanned.videos ?? []) {
+          if (!media.videos.includes(vid)) media.videos.push(vid);
+        }
+      } catch {
+        /* path-scan is best-effort */
       }
-      for (const vid of scanned.videos ?? []) {
-        if (!media.videos.includes(vid)) media.videos.push(vid);
-      }
-    } catch {
-      /* path-scan is best-effort */
     }
 
     // Allow media-only turns (no prose) so generated images still save + preview.
@@ -389,7 +427,13 @@
       images: media.images,
       videos: media.videos,
       parts,
+      outcome: note ? "error" : "finished",
     });
+    if (draftTimer) {
+      clearTimeout(draftTimer);
+      draftTimer = null;
+    }
+    clearChatDraft(chat.id);
 
     chat = {
       ...chat,
@@ -408,7 +452,6 @@
   async function bootstrap(id: string, gen: number) {
     error = null;
     sessionReady = false;
-    usage = emptyUsage();
     resetStream();
 
     // Paint transcript ASAP from cache; don't block on a full workspace refresh
@@ -440,12 +483,32 @@
     chat = loaded;
     project = workspaceStore.projectById(loaded.project_id) ?? null;
 
+    const draft = loadChatDraft(loaded.id);
+    if (draft && shouldRecoverDraft(draft, loaded.messages)) {
+      try {
+        const recovered = await invoke<ChatMessage>("append_chat_message", {
+          chatId: loaded.id,
+          role: "assistant",
+          content: draft.content,
+          images: draft.images ?? [],
+          videos: draft.videos ?? [],
+          parts: draft.parts ?? [],
+        });
+        if (gen !== bootstrapGen) return;
+        chat = {
+          ...chat,
+          messages: [...chat.messages, recovered],
+          updated_at: recovered.created_at,
+        };
+        clearChatDraft(loaded.id);
+      } catch {
+        /* Leave the draft. The next open can try again. */
+      }
+    }
+
     try {
-      await invoke<{ success: boolean; message: string }>("start_chat_session", {
-        chatId: id,
-      });
+      await ensureLiveSession(id, gen);
       if (gen !== bootstrapGen) return;
-      sessionReady = true;
       await refreshActiveSessions();
     } catch (err) {
       if (gen !== bootstrapGen) return;
@@ -480,8 +543,7 @@
       chat = { ...chat, model_id: id };
       await invoke("close_chat_session", { chatId: chat.id });
       sessionReady = false;
-      await invoke("start_chat_session", { chatId: chat.id });
-      sessionReady = true;
+      await ensureLiveSession(chat.id, bootstrapGen);
       await refreshActiveSessions();
     } catch (err) {
       sessionReady = false;
@@ -509,11 +571,9 @@
     resetStream();
 
     try {
-      if (!sessionReady) {
-        await invoke("start_chat_session", { chatId: chat.id });
-        sessionReady = true;
-        await refreshActiveSessions();
-      }
+      const wasReady = sessionReady;
+      await ensureLiveSession(chat.id, bootstrapGen);
+      if (!wasReady) await refreshActiveSessions();
       const userMessage = await invoke<ChatMessage>("append_chat_message", {
         chatId: chat.id,
         role: "user",
@@ -541,6 +601,12 @@
       const saved = await finalizeAssistantMessage("Partial reply saved after interruption");
       if (saved) {
         await workspaceStore.refresh();
+      } else if (chat) {
+        try {
+          await invoke("record_project_card", { chatId: chat.id, outcome: "error" });
+        } catch {
+          /* the card is best-effort */
+        }
       }
       error = String(err);
     } finally {
@@ -548,35 +614,34 @@
     }
   }
 
+  $effect(() => {
+    const count = streaming.length;
+    const tail = streaming[count - 1]?.content.length ?? 0;
+    if (!chat || count === 0) return;
+    void tail;
+    scheduleDraft();
+  });
+
   onMount(() => {
+    const flushDraft = () => persistDraftNow();
+    window.addEventListener("beforeunload", flushDraft);
     const offs = [
       subscribe<{ chatId: string; params: Record<string, unknown> }>("chat-update", (event) => {
         if (event.payload.chatId !== $page.params.id) return;
         appendStream(event.payload.params);
       }),
-      subscribe<{ chatId: string; contextWindow?: number | null }>(
-        "chat-session-ready",
-        (event) => {
-          if (event.payload.chatId === $page.params.id) {
-            sessionReady = true;
-            // A session came up — whatever auth problem we showed is resolved.
-            authRequiredProvider = null;
-            // S35: the agent tells us the window up front, so the bar can show
-            // a real percentage on the first turn instead of waiting for the
-            // ~80%-full compaction notice. Size only — `used` stays unknown
-            // until the agent reports it.
-            applyUsage(sizeOnlyUsage(event.payload.contextWindow));
-          }
-          refreshActiveSessions();
-        },
-      ),
-      subscribe<{ chatId: string; usage?: unknown }>("chat-turn-end", (event) => {
+      subscribe<{ chatId: string }>("chat-session-ready", (event) => {
+        if (event.payload.chatId === $page.params.id) {
+          sessionReady = true;
+          // A session came up — whatever auth problem we showed is resolved.
+          authRequiredProvider = null;
+        }
+        refreshActiveSessions();
+      }),
+      subscribe<{ chatId: string }>("chat-turn-end", (event) => {
         // Arrives after the turn's last chunk event, so the saved reply includes
         // the tail that finalizing on the send's return could clip.
         if (event.payload.chatId !== $page.params.id) return;
-        if (event.payload.usage !== undefined) {
-          applyUsage(parseEndTurnUsage(event.payload.usage));
-        }
         void finalizeAssistantMessage().then((saved) => {
           if (saved) workspaceStore.refresh();
         });
@@ -596,7 +661,13 @@
         sessionReady = false;
         void finalizeAssistantMessage("Partial reply saved (agent disconnected)").then(
           (saved) => {
-            if (saved) workspaceStore.refresh();
+            if (saved) {
+              workspaceStore.refresh();
+            } else if (chat) {
+              void invoke("record_project_card", { chatId: chat.id, outcome: "error" }).catch(
+                () => {},
+              );
+            }
           },
         );
         sending = false;
@@ -610,7 +681,11 @@
         browserPane.onActivity(event.payload?.url);
       }),
     ];
-    return () => offs.forEach((o) => o());
+    return () => {
+      window.removeEventListener("beforeunload", flushDraft);
+      if (draftTimer) clearTimeout(draftTimer);
+      offs.forEach((o) => o());
+    };
   });
 </script>
 
@@ -625,7 +700,11 @@
     />
   </div>
 
-  {#if chat}
+  {#if chat && chat.messages.length === 0 && streaming.length === 0}
+    <div class="reading-col status-wrap">
+      <ProjectStatus projectId={chat.project_id} hideChatId={chat.id} />
+    </div>
+  {:else if chat}
     <MessageList
       messages={chat.messages}
       {streaming}
@@ -657,7 +736,6 @@
       showModelPicker={chatProviderId === "grok"}
       modelId={chat?.model_id ?? null}
       {modelSwitching}
-      {usage}
       connected={sessionReady}
       onmodelchange={switchModel}
     />
@@ -684,6 +762,13 @@
     place-items: center;
     color: var(--text-muted);
     font-size: 0.875rem;
+  }
+
+  .status-wrap {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding-top: 0.75rem;
   }
 
   .composer-wrap {

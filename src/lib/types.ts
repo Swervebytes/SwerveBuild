@@ -75,6 +75,26 @@ export type Workspace = {
   chats: Chat[];
 };
 
+/** Fact card the app keeps for one project. No model-written summary. */
+export type ProjectChatFact = {
+  id: string;
+  title: string;
+  open: boolean;
+  last_request: string;
+  /** "finished" | "error" | "none" */
+  outcome: string;
+  updated_at: string;
+};
+
+export type ProjectCard = {
+  project_id: string;
+  updated_at: string;
+  branch: string | null;
+  dirty: string[];
+  dirty_more: number;
+  chats: ProjectChatFact[];
+};
+
 export type ProviderKind = "acp" | "http";
 
 export type Provider = {
