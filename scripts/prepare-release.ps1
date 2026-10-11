@@ -17,6 +17,15 @@ if (-not (Test-Path $overlay)) {
 $version = Assert-SwerveVersionsInSync -Root $root
 Write-Host "Release version (manifests in sync): $version" -ForegroundColor Green
 
+# P3.1: the bundler signs the installer. The private key stays outside the
+# repo. A path is enough; this script never prints the key or the password.
+$updaterDir = Join-Path $env:USERPROFILE ".swerve-updater"
+$updaterKey = Join-Path $updaterDir "swerve-updater.key"
+$updaterPasswordFile = Join-Path $updaterDir "password.txt"
+if (-not (Test-Path -LiteralPath $updaterKey) -or -not (Test-Path -LiteralPath $updaterPasswordFile)) {
+    throw "Updater signing key is missing from $updaterDir. Refusing to bundle without a signature. The private key stays out of the repo."
+}
+
 Push-Location $root
 try {
     Write-Host "Building frontend..." -ForegroundColor Cyan
@@ -56,9 +65,16 @@ try {
     if (-not (Test-Path $tauriCli)) {
         throw "Missing Tauri CLI: $tauriCli (run npm install)"
     }
-    & $tauriCli build --config $overlay
-    if ($LASTEXITCODE -ne 0) {
-        throw "tauri build failed with exit code $LASTEXITCODE"
+    $env:TAURI_SIGNING_PRIVATE_KEY = $updaterKey
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ([System.IO.File]::ReadAllText($updaterPasswordFile)).TrimEnd("`r", "`n")
+    try {
+        & $tauriCli build --config $overlay
+        if ($LASTEXITCODE -ne 0) {
+            throw "tauri build failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+        Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
     }
 
     $installer = Join-Path $tauri "target\release\bundle\nsis\Swerve Build_${version}_x64-setup.exe"
@@ -83,6 +99,32 @@ try {
         "$hash *Swerve Build_${version}_x64-setup.exe" | Set-Content -LiteralPath $shaFile -Encoding ascii
         Write-Host "SHA-256:   $hash" -ForegroundColor Green
         Write-Host "Checksum file: $shaFile (upload alongside the installer)" -ForegroundColor Green
+
+        $sigFile = "$installer.sig"
+        if (-not (Test-Path -LiteralPath $sigFile)) {
+            throw "Missing updater signature: $sigFile"
+        }
+        # Keep the signature bytes exact. Trimming would fail minisign verify.
+        $signature = [System.IO.File]::ReadAllText($sigFile)
+        $notes = "Swerve Build $version. See the GitHub release notes."
+        $pubDate = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $assetUrl = "https://github.com/Swervebytes/SwerveBuild/releases/download/v$version/Swerve%20Build_${version}_x64-setup.exe"
+        $latest = [ordered]@{
+            version = $version
+            notes = $notes
+            pub_date = $pubDate
+            platforms = [ordered]@{
+                "windows-x86_64" = [ordered]@{
+                    signature = $signature
+                    url = $assetUrl
+                }
+            }
+        }
+        $latestJson = $latest | ConvertTo-Json -Depth 6
+        $latestPath = Join-Path (Split-Path -Parent $installer) "latest.json"
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($latestPath, $latestJson, $utf8)
+        Write-Host "Update feed: $latestPath (upload as latest.json on the GitHub release)" -ForegroundColor Green
     }
     Write-Host "Local install:  npm run install:local" -ForegroundColor DarkGray
     Write-Host "Tag path (after main is clean + CI green): git tag -a v$version -m `"v$version`"; git push origin main --tags" -ForegroundColor DarkGray

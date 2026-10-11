@@ -8,6 +8,9 @@ record lives in the git log.
 ## [Unreleased]
 
 ### Added
+- **App updates in Settings.** "Check for updates" asks GitHub Releases for
+  `latest.json` and installs a newer NSIS package only after the minisign
+  signature verifies. The private key stays outside the repo.
 - **Provider sign-in from Settings** — Claude Code (`claude /login` in a
   terminal) and Gemini (Google OAuth) sign in through each agent's own flow;
   chats that hit a signed-out agent show a banner pointing at the fix.

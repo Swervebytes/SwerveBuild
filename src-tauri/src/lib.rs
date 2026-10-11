@@ -1,4 +1,5 @@
 mod acp;
+mod app_update;
 pub mod app_ui;
 mod app_ui_cdp;
 mod artifacts;
@@ -21,6 +22,7 @@ pub mod secrets;
 mod store;
 pub mod terminal;
 mod util;
+pub mod vm_guest;
 pub mod workflows_tauri;
 
 use acp::AcpManager;
@@ -1543,6 +1545,46 @@ fn set_term_grant(granted: bool) -> Result<terminal::TermGrant, String> {
     terminal::set_granted(granted)
 }
 
+#[tauri::command]
+fn get_vm_grant() -> vm_guest::VmGrant {
+    vm_guest::load_grant()
+}
+
+#[tauri::command]
+fn set_vm_grant(granted: bool) -> Result<vm_guest::VmGrant, String> {
+    vm_guest::set_granted(granted)
+}
+
+#[tauri::command]
+fn get_vm_guest() -> vm_guest::VmStatus {
+    vm_guest::status()
+}
+
+#[tauri::command]
+fn set_vm_guest(vm_name: String, snapshot: String, username: String) -> Result<vm_guest::VmConfig, String> {
+    vm_guest::set_config(&vm_name, &snapshot, &username)
+}
+
+#[tauri::command]
+fn set_vm_guest_secret(password: String) -> Result<(), String> {
+    vm_guest::store_password(&password)
+}
+
+#[tauri::command]
+fn vm_guest_probe() -> Result<serde_json::Value, String> {
+    vm_guest::probe()
+}
+
+#[tauri::command]
+fn vm_guest_console() -> Result<serde_json::Value, String> {
+    vm_guest::open_console()
+}
+
+#[tauri::command]
+fn vm_guest_join_hyperv() -> Result<String, String> {
+    vm_guest::grant_hypervisor_access()
+}
+
 // ---- provider CLI install (S37) ----------------------------------------------
 
 /// Is npm on PATH, and where? `npm` is a `.cmd` shim on Windows, so it must be
@@ -1990,6 +2032,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // P4.2: remember window size/position/maximized across launches.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // P3.1: Settings calls app_update::*. The plugin IPC stays off the
+        // capability allowlist (see app_update.rs).
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(acp)
         .manage(job_mgr)
         .manage(wf_mgr)
@@ -2053,6 +2098,8 @@ pub fn run() {
             open_grok_login,
             check_grok_updates,
             apply_grok_update,
+            app_update::check_app_update,
+            app_update::install_app_update,
             read_memory,
             write_memory,
             list_skills,
@@ -2124,6 +2171,14 @@ pub fn run() {
             set_app_ui_grant,
             get_term_grant,
             set_term_grant,
+            get_vm_grant,
+            set_vm_grant,
+            get_vm_guest,
+            set_vm_guest,
+            set_vm_guest_secret,
+            vm_guest_probe,
+            vm_guest_console,
+            vm_guest_join_hyperv,
             get_browser_debug_grant,
             secret_set,
             secret_status,

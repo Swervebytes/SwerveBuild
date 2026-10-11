@@ -55,6 +55,15 @@
   let termGranted = $state(false);
   let termSaving = $state(false);
   let termMessage = $state<string | null>(null);
+  let vmGranted = $state(false);
+  let vmSaving = $state(false);
+  let vmMessage = $state<string | null>(null);
+  let vmError = $state(false);
+  let vmName = $state("");
+  let vmSnapshot = $state("");
+  let vmUser = $state("");
+  let vmSecret = $state("");
+  let vmSecretSaved = $state(false);
   let browserGranted = $state(false);
   let browserAllowPublic = $state(false);
   let browserSaving = $state(false);
@@ -94,6 +103,19 @@
   let lastClipPath = $state<string | null>(null);
   let lastClipHasAudio = $state<boolean | null>(null);
 
+  type AppUpdateReport = {
+    ok: boolean;
+    current_version: string;
+    available: boolean;
+    version: string | null;
+    notes: string | null;
+    message: string;
+  };
+  let updateBusy = $state<"check" | "install" | null>(null);
+  let updateMessage = $state<string | null>(null);
+  let updateOk = $state(true);
+  let appUpdate = $state<AppUpdateReport | null>(null);
+
   const themeOptions: { value: ThemePref; label: string; icon: IconName }[] = [
     { value: "system", label: "System", icon: "settings" },
     { value: "light", label: "Light", icon: "sun" },
@@ -132,6 +154,22 @@
       termGranted = !!grant.granted;
     } catch {
       termGranted = false;
+    }
+    try {
+      const guest = await invoke<{
+        granted: boolean;
+        passwordSaved: boolean;
+        vmName: string;
+        snapshot: string;
+        username: string;
+      }>("get_vm_guest");
+      vmGranted = !!guest.granted;
+      vmSecretSaved = !!guest.passwordSaved;
+      vmName = guest.vmName ?? "";
+      vmSnapshot = guest.snapshot ?? "";
+      vmUser = guest.username ?? "";
+    } catch {
+      vmGranted = false;
     }
     try {
       const grant = await invoke<{ granted: boolean; allowPublic?: boolean }>(
@@ -247,6 +285,93 @@
     }
   }
 
+  async function setVmGrant(next: boolean) {
+    vmSaving = true;
+    vmMessage = null;
+    vmError = false;
+    try {
+      const grant = await invoke<{ granted: boolean }>("set_vm_grant", { granted: next });
+      vmGranted = !!grant.granted;
+      vmMessage = vmGranted
+        ? "Agents in this app may test the saved virtual machine."
+        : "Virtual machine test access revoked.";
+    } catch (e) {
+      vmError = true;
+      vmMessage = String(e);
+    } finally {
+      vmSaving = false;
+    }
+  }
+
+  async function saveVmGuest() {
+    vmSaving = true;
+    vmMessage = null;
+    vmError = false;
+    try {
+      await invoke("set_vm_guest", {
+        vmName: vmName.trim(),
+        snapshot: vmSnapshot.trim(),
+        username: vmUser.trim(),
+      });
+      if (vmSecret.trim()) {
+        await invoke("set_vm_guest_secret", { password: vmSecret });
+        vmSecret = "";
+        vmSecretSaved = true;
+      }
+      vmMessage = "Test virtual machine saved.";
+    } catch (e) {
+      vmError = true;
+      vmMessage = String(e);
+    } finally {
+      vmSaving = false;
+    }
+  }
+
+  async function checkVm() {
+    vmSaving = true;
+    vmMessage = null;
+    vmError = false;
+    try {
+      const live = await invoke<{ state?: string; snapshots?: string[] }>("vm_guest_probe");
+      const snaps = (live.snapshots ?? []).join(", ");
+      vmMessage = `Guest is ${live.state ?? "unknown"}.${snaps ? ` Snapshots: ${snaps}` : ""}`;
+    } catch (e) {
+      vmError = true;
+      vmMessage = String(e);
+    } finally {
+      vmSaving = false;
+    }
+  }
+
+  async function openVmConsole() {
+    vmSaving = true;
+    vmMessage = null;
+    vmError = false;
+    try {
+      await invoke("vm_guest_console");
+      vmMessage = "Hyper-V console opened. Use it for a sign-in or a consent prompt, then hand the desktop back.";
+    } catch (e) {
+      vmError = true;
+      vmMessage = String(e);
+    } finally {
+      vmSaving = false;
+    }
+  }
+
+  async function joinHyperV() {
+    vmSaving = true;
+    vmMessage = null;
+    vmError = false;
+    try {
+      vmMessage = await invoke<string>("vm_guest_join_hyperv");
+    } catch (e) {
+      vmError = true;
+      vmMessage = String(e);
+    } finally {
+      vmSaving = false;
+    }
+  }
+
   async function setBrowserGrant(next: boolean) {
     browserSaving = true;
     browserMessage = null;
@@ -345,6 +470,39 @@
       epError = true;
     } finally {
       epTesting = false;
+    }
+  }
+
+  async function checkAppUpdate() {
+    updateBusy = "check";
+    updateMessage = null;
+    try {
+      const report = await invoke<AppUpdateReport>("check_app_update");
+      appUpdate = report;
+      updateOk = report.ok;
+      updateMessage = report.message;
+    } catch (e) {
+      updateOk = false;
+      appUpdate = null;
+      updateMessage = String(e);
+    } finally {
+      updateBusy = null;
+    }
+  }
+
+  async function installAppUpdate() {
+    updateBusy = "install";
+    updateOk = true;
+    updateMessage =
+      "Downloading the signed installer. Swerve Build will close when the install starts.";
+    try {
+      const message = await invoke<string>("install_app_update");
+      updateMessage = message;
+    } catch (e) {
+      updateOk = false;
+      updateMessage = String(e);
+    } finally {
+      updateBusy = null;
     }
   }
 </script>
@@ -737,6 +895,73 @@
 
   <section class="card">
     <div class="group-head">
+      <h2 class="group-title">Test virtual machine</h2>
+      <StatusPill
+        tone={vmGranted ? "warning" : "muted"}
+        label={vmGranted ? "Granted" : "Off"}
+      />
+    </div>
+    <p class="group-note">
+      A model can revert a Hyper-V snapshot and use that Windows desktop like a person:
+      screenshot, click a button by its name, and type. Make the snapshot while a user is
+      already signed in. Secure-desktop consent prompts still need you, through
+      <strong>Open console</strong>. Off by default. Automations cannot use it.
+    </p>
+    <Field label="Allow agents to test this virtual machine" row>
+      <div class="segmented" role="radiogroup" aria-label="Virtual machine test grant">
+        <button
+          class="seg"
+          class:active={!vmGranted}
+          type="button"
+          role="radio"
+          aria-checked={!vmGranted}
+          disabled={vmSaving}
+          onclick={() => setVmGrant(false)}
+        >
+          Off
+        </button>
+        <button
+          class="seg"
+          class:active={vmGranted}
+          type="button"
+          role="radio"
+          aria-checked={vmGranted}
+          disabled={vmSaving}
+          data-testid="vm-grant-on"
+          onclick={() => setVmGrant(true)}
+        >
+          On
+        </button>
+      </div>
+    </Field>
+    <Field label="Virtual machine" hint="Hyper-V name, for example Win Test.">
+      <input class="input" type="text" spellcheck="false" bind:value={vmName} />
+    </Field>
+    <Field label="Snapshot" hint="Checkpoint of a logged-on desktop. Each test run reverts to it.">
+      <input class="input" type="text" spellcheck="false" bind:value={vmSnapshot} />
+    </Field>
+    <Field label="Guest user" hint="The Windows account that is signed in on that snapshot.">
+      <input class="input" type="text" spellcheck="false" autocapitalize="off" bind:value={vmUser} />
+    </Field>
+    <Field
+      label="Guest sign-in"
+      hint={vmSecretSaved ? "A sign-in secret is saved for this Windows user. Enter a new one to replace it." : "Saved on this PC for your Windows user only. The model never sees it."}
+    >
+      <input class="input" type="password" autocomplete="off" bind:value={vmSecret} />
+    </Field>
+    <div class="ids-row">
+      <button class="btn btn-sm" type="button" disabled={vmSaving} onclick={saveVmGuest}>Save</button>
+      <button class="btn btn-sm" type="button" disabled={vmSaving} onclick={checkVm}>Check</button>
+      <button class="btn btn-sm" type="button" disabled={vmSaving} onclick={openVmConsole}>Open console</button>
+      <button class="btn btn-sm" type="button" disabled={vmSaving} onclick={joinHyperV}>Allow Hyper-V</button>
+    </div>
+    {#if vmMessage}
+      <p class="ep-msg" class:error={vmError}>{vmMessage}</p>
+    {/if}
+  </section>
+
+  <section class="card">
+    <div class="group-head">
       <h2 class="group-title">Agent browser debug</h2>
       <StatusPill
         tone={browserGranted ? "warning" : "muted"}
@@ -836,6 +1061,42 @@
       Up to 3 chats stay connected in the background. Switching between them reconnects instantly;
       older sessions pause automatically when a fourth chat opens.
     </p>
+  </section>
+
+  <section class="card" data-testid="app-update-section">
+    <h2 class="group-title">Updates</h2>
+    <p class="group-note">
+      Swerve Build v{APP_VERSION}. Check GitHub Releases for a newer installer. The app verifies
+      the minisign signature before it installs anything.
+    </p>
+    <div class="grok-row">
+      <button
+        class="btn btn-sm"
+        type="button"
+        data-testid="app-update-check"
+        disabled={updateBusy !== null}
+        onclick={checkAppUpdate}
+      >
+        {updateBusy === "check" ? "Checking…" : "Check for updates"}
+      </button>
+      {#if appUpdate?.available}
+        <button
+          class="btn btn-sm btn-accent"
+          type="button"
+          data-testid="app-update-install"
+          disabled={updateBusy !== null}
+          onclick={installAppUpdate}
+        >
+          {updateBusy === "install" ? "Installing…" : "Install and restart"}
+        </button>
+      {/if}
+    </div>
+    {#if updateMessage}
+      <p class="ep-msg" class:error={!updateOk} data-testid="app-update-msg">{updateMessage}</p>
+    {/if}
+    {#if appUpdate?.notes}
+      <p class="ep-msg" data-testid="app-update-notes">{appUpdate.notes}</p>
+    {/if}
   </section>
 
   <section class="card about">

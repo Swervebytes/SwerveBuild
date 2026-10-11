@@ -293,6 +293,7 @@ impl AgentRunner for GrokAgentRunner {
         let mut child = crate::util::hidden_command(&grok)
             .args(&args)
             .env("GROK_DISABLE_AUTOUPDATER", "1")
+            .env("SWERVE_AUTOMATION", "1")
             .envs(crate::providers::grok_endpoint_env())
             .current_dir(&cwd)
             .stdin(Stdio::null())

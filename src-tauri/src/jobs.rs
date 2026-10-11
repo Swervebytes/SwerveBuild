@@ -822,6 +822,7 @@ impl JobManager {
         command
             .args(&args)
             .env("GROK_DISABLE_AUTOUPDATER", "1")
+            .env("SWERVE_AUTOMATION", "1")
             // A custom Grok endpoint routes globally via config.toml, so headless
             // automation runs need its API key just like interactive chats do.
             .envs(crate::providers::grok_endpoint_env())
