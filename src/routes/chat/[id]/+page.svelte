@@ -18,6 +18,7 @@
     sizeOnlyUsage,
   } from "$lib/chatUsage";
   import ChatHeader from "$lib/components/chat/ChatHeader.svelte";
+  import ComposerDock from "$lib/components/chat/ComposerDock.svelte";
   import MessageList from "$lib/components/chat/MessageList.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
   import { browserPane } from "$lib/stores/browserPane.svelte";
@@ -619,13 +620,7 @@
       title={chat?.title ?? "Chat"}
       projectName={project?.name}
       projectPath={project?.path}
-      connected={sessionReady}
       {activeSessionCount}
-      showModelPicker={chatProviderId === "grok"}
-      modelId={chat?.model_id ?? null}
-      {modelSwitching}
-      {usage}
-      onmodelchange={switchModel}
       onexport={() => invoke<string>("export_chat_markdown", { chatId: $page.params.id })}
     />
   </div>
@@ -658,6 +653,14 @@
   {/if}
 
   <div class="reading-col composer-wrap">
+    <ComposerDock
+      showModelPicker={chatProviderId === "grok"}
+      modelId={chat?.model_id ?? null}
+      {modelSwitching}
+      {usage}
+      connected={sessionReady}
+      onmodelchange={switchModel}
+    />
     <Composer disabled={!chat || sending} {sending} onsend={sendMessage} onstop={stopGenerating} />
   </div>
 </div>
