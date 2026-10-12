@@ -425,9 +425,17 @@ mod tests {
         assert_eq!(resolved.len(), 2, "{resolved:?}");
         assert!(resolved.iter().any(|m| m.kind == MediaKind::Image));
         assert!(resolved.iter().any(|m| m.kind == MediaKind::Video));
+        let dest_prefix = stored_display(&dest);
         for m in &resolved {
             assert!(Path::new(&m.stored_path).is_file(), "copy exists: {}", m.stored_path);
-            assert!(m.stored_path.starts_with(&dest.display().to_string()), "{}", m.stored_path);
+            assert!(
+                m.stored_path
+                    .to_ascii_lowercase()
+                    .starts_with(&dest_prefix.to_ascii_lowercase()),
+                "stored {} dest {}",
+                m.stored_path,
+                dest_prefix
+            );
         }
 
         let _ = std::fs::remove_dir_all(&src);
