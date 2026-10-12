@@ -35,6 +35,7 @@ record lives in the git log.
 - A hard restart keeps the reply that was still streaming.
 - A screen clip with desktop audio no longer waits forever when the render device delivers no loopback samples. A silence render starts the endpoint clock, and a source that still stays quiet fails that attempt so the clip can finish on the next source.
 - Chat no longer shows a picture just because a path was mentioned. A thumbnail is attached only when a capture tool returns the file (an app, browser, or virtual-machine screenshot, a media still or clip, or a local generated image). MCP calls, which arrive wrapped as `use_tool`, still count when the inner tool is one of those.
+- The same screenshot stays one thumbnail when Windows reports both its 8.3 short path and its long path.
 - ACP peers that use string JSON-RPC ids no longer have permission requests
   silently dropped.
 - Live output produced in the first instant of a "Run now" is no longer lost.

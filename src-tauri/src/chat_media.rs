@@ -209,11 +209,13 @@ fn same_file_len(path: &Path, len: u64) -> bool {
     std::fs::metadata(path).map(|m| m.is_file() && m.len() == len).unwrap_or(false)
 }
 
-/// `canonicalize` on Windows prefixes `\\?\`. The chat compares paths as
-/// strings, so that prefix would show one file as two thumbnails.
+/// One string for one file. `canonicalize` on Windows prefixes `\\?\` and
+/// expands an 8.3 short name (`RUNNER~1`) to the long name. The chat
+/// compares these strings, so either difference would show one file twice.
 fn stored_display(path: &Path) -> String {
-    let s = path.display().to_string();
-    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = canon.display().to_string();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
 }
 
 /// One resolved-and-copied attachment.
