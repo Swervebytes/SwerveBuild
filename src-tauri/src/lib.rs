@@ -1,4 +1,5 @@
 mod acp;
+mod app_update;
 pub mod app_ui;
 mod app_ui_cdp;
 mod artifacts;
@@ -15,12 +16,14 @@ pub mod media_worker;
 mod media_providers;
 mod model_catalog;
 pub mod paths;
+mod project_card;
 mod providers;
 pub mod provider_auth;
 pub mod secrets;
 mod store;
 pub mod terminal;
 mod util;
+pub mod vm_guest;
 pub mod workflows_tauri;
 
 use acp::AcpManager;
@@ -474,15 +477,89 @@ fn fetch_stable_version() -> Result<String, String> {
     Ok(v)
 }
 
+/// Run the installed Grok CLI's own updater (`grok update`). The resolved
+/// executable is spawned directly. A bare `grok` on PATH is not used, because
+/// that spawn has failed with "program not found" from this process.
+#[tauri::command]
+async fn apply_grok_update() -> CommandResult {
+    tauri::async_runtime::spawn_blocking(apply_grok_update_blocking)
+        .await
+        .unwrap_or_else(|e| CommandResult {
+            success: false,
+            message: format!("Update task failed: {e}"),
+        })
+}
+
+fn apply_grok_update_blocking() -> CommandResult {
+    let Some(exe) = resolve_grok_executable() else {
+        return CommandResult {
+            success: false,
+            message: "Grok Build is not installed.".into(),
+        };
+    };
+    let output = util::hidden_command(&exe)
+        .arg("update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match output {
+        Ok(out) => {
+            let detail = command_tail(&out.stdout, &out.stderr);
+            if out.status.success() {
+                let message = if detail.is_empty() {
+                    "Grok Build update finished.".to_string()
+                } else {
+                    format!("Grok Build update finished. {detail}")
+                };
+                CommandResult {
+                    success: true,
+                    message,
+                }
+            } else {
+                let code = out.status.code().unwrap_or(-1);
+                let message = if detail.is_empty() {
+                    format!("Grok update failed (exit {code}).")
+                } else {
+                    format!("Grok update failed (exit {code}). {detail}")
+                };
+                CommandResult {
+                    success: false,
+                    message,
+                }
+            }
+        }
+        Err(error) => CommandResult {
+            success: false,
+            message: format!("Failed to start Grok update: {error}"),
+        },
+    }
+}
+
+/// Last slice of a command's stdout, or stderr when stdout is empty.
+fn command_tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let raw = if stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        String::from_utf8_lossy(stdout)
+    } else {
+        String::from_utf8_lossy(stderr)
+    };
+    let trimmed = raw.trim();
+    const MAX: usize = 500;
+    if trimmed.chars().count() <= MAX {
+        trimmed.to_string()
+    } else {
+        let start = trimmed.chars().count() - MAX;
+        format!("…{}", trimmed.chars().skip(start).collect::<String>())
+    }
+}
+
 /// Pure message builder so the compare logic is unit-testable. `installed` is
 /// raw `grok --version` output ("grok 1.0.0 (3cd0d0cbce) [stable]").
 fn update_message(installed: &str, latest: &str) -> String {
     if version_matches_pin(installed, latest) {
         format!("Grok Build is up to date — v{latest}.")
     } else {
-        format!(
-            "Update available: {installed} → v{latest}. Grok updates itself in the background, or run `grok update` to apply it now."
-        )
+        format!("Update available: {installed} → v{latest}.")
     }
 }
 
@@ -715,39 +792,77 @@ fn get_chat(chat_id: String) -> Result<Chat, String> {
 
 #[tauri::command]
 fn append_chat_message(
+    acp: State<'_, Arc<AcpManager>>,
     chat_id: String,
     role: String,
     content: String,
     images: Vec<String>,
     videos: Option<Vec<String>>,
     parts: Option<Vec<MessagePart>>,
+    outcome: Option<String>,
 ) -> Result<ChatMessage, String> {
-    let _guard = Store::lock();
-    let mut store = Store::load();
-    let chat = store
-        .chats
-        .iter_mut()
-        .find(|c| c.id == chat_id)
-        .ok_or_else(|| "Chat not found".to_string())?;
+    let (message, record) = {
+        let _guard = Store::lock();
+        let mut store = Store::load();
+        let chat = store
+            .chats
+            .iter_mut()
+            .find(|c| c.id == chat_id)
+            .ok_or_else(|| "Chat not found".to_string())?;
 
-    let message = ChatMessage {
-        id: Store::new_id(),
-        role,
-        content,
-        images,
-        videos: videos.unwrap_or_default(),
-        parts: parts.unwrap_or_default(),
-        created_at: Store::now(),
+        let message = ChatMessage {
+            id: Store::new_id(),
+            role,
+            content,
+            images,
+            videos: videos.unwrap_or_default(),
+            parts: parts.unwrap_or_default(),
+            created_at: Store::now(),
+        };
+
+        if chat.title == "New chat" && message.role == "user" && !message.content.trim().is_empty()
+        {
+            chat.title = Store::chat_title_from_message(&message.content);
+        }
+
+        let record = (message.role == "assistant").then(|| {
+            let turn = if outcome.as_deref() == Some("error") {
+                "error"
+            } else {
+                "finished"
+            };
+            (chat_id.clone(), turn.to_string())
+        });
+
+        chat.messages.push(message.clone());
+        chat.updated_at = Store::now();
+        Store::save(&store)?;
+        (message, record)
     };
-
-    if chat.title == "New chat" && message.role == "user" && !message.content.trim().is_empty() {
-        chat.title = Store::chat_title_from_message(&message.content);
+    if let Some((id, turn)) = record {
+        // Git status runs outside the store lock.
+        if let Err(err) = project_card::record(&id, &turn, &acp.list_active()) {
+            eprintln!("[swervebuild] project card: {err}");
+        }
     }
-
-    chat.messages.push(message.clone());
-    chat.updated_at = Store::now();
-    Store::save(&store)?;
     Ok(message)
+}
+
+#[tauri::command]
+fn record_project_card(
+    acp: State<'_, Arc<AcpManager>>,
+    chat_id: String,
+    outcome: String,
+) -> Result<(), String> {
+    project_card::record(&chat_id, &outcome, &acp.list_active())
+}
+
+#[tauri::command]
+fn get_project_card(
+    acp: State<'_, Arc<AcpManager>>,
+    project_id: String,
+) -> Result<project_card::ProjectCard, String> {
+    project_card::load_or_build(&project_id, &acp.list_active())
 }
 
 #[tauri::command]
@@ -1469,6 +1584,46 @@ fn set_term_grant(granted: bool) -> Result<terminal::TermGrant, String> {
     terminal::set_granted(granted)
 }
 
+#[tauri::command]
+fn get_vm_grant() -> vm_guest::VmGrant {
+    vm_guest::load_grant()
+}
+
+#[tauri::command]
+fn set_vm_grant(granted: bool) -> Result<vm_guest::VmGrant, String> {
+    vm_guest::set_granted(granted)
+}
+
+#[tauri::command]
+fn get_vm_guest() -> vm_guest::VmStatus {
+    vm_guest::status()
+}
+
+#[tauri::command]
+fn set_vm_guest(vm_name: String, snapshot: String, username: String) -> Result<vm_guest::VmConfig, String> {
+    vm_guest::set_config(&vm_name, &snapshot, &username)
+}
+
+#[tauri::command]
+fn set_vm_guest_secret(password: String) -> Result<(), String> {
+    vm_guest::store_password(&password)
+}
+
+#[tauri::command]
+fn vm_guest_probe() -> Result<serde_json::Value, String> {
+    vm_guest::probe()
+}
+
+#[tauri::command]
+fn vm_guest_console() -> Result<serde_json::Value, String> {
+    vm_guest::open_console()
+}
+
+#[tauri::command]
+fn vm_guest_join_hyperv() -> Result<String, String> {
+    vm_guest::grant_hypervisor_access()
+}
+
 // ---- provider CLI install (S37) ----------------------------------------------
 
 /// Is npm on PATH, and where? `npm` is a `.cmd` shim on Windows, so it must be
@@ -1916,6 +2071,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // P4.2: remember window size/position/maximized across launches.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // P3.1: Settings calls app_update::*. The plugin IPC stays off the
+        // capability allowlist (see app_update.rs).
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(acp)
         .manage(job_mgr)
         .manage(wf_mgr)
@@ -1978,6 +2136,9 @@ pub fn run() {
             install_grok,
             open_grok_login,
             check_grok_updates,
+            apply_grok_update,
+            app_update::check_app_update,
+            app_update::install_app_update,
             read_memory,
             write_memory,
             list_skills,
@@ -1989,6 +2150,8 @@ pub fn run() {
             rename_chat,
             get_chat,
             append_chat_message,
+            record_project_card,
+            get_project_card,
             save_pasted_image,
             import_attachment_files,
             artifact_store_status,
@@ -2049,6 +2212,14 @@ pub fn run() {
             set_app_ui_grant,
             get_term_grant,
             set_term_grant,
+            get_vm_grant,
+            set_vm_grant,
+            get_vm_guest,
+            set_vm_guest,
+            set_vm_guest_secret,
+            vm_guest_probe,
+            vm_guest_console,
+            vm_guest_join_hyperv,
             get_browser_debug_grant,
             secret_set,
             secret_status,
@@ -2198,9 +2369,23 @@ mod grok_install_tests {
         let behind = update_message("grok 0.2.106 [stable]", "1.0.0");
         assert!(behind.contains("Update available"), "{behind}");
         assert!(behind.contains("v1.0.0"));
+        assert!(
+            !behind.contains("run `grok update`"),
+            "the app applies the update; the notice must not send the user to a terminal"
+        );
 
         // "0.2.1060" must not read as matching "0.2.106" (tokenizer rule).
         assert!(update_message("grok 0.2.1060", "0.2.106").contains("Update available"));
+    }
+
+    #[test]
+    fn command_tail_prefers_stdout_and_clips() {
+        assert_eq!(command_tail(b"  hello\n", b"err"), "hello");
+        assert_eq!(command_tail(b"   \n", b"from stderr"), "from stderr");
+        let long = "x".repeat(600);
+        let tail = command_tail(long.as_bytes(), b"");
+        assert!(tail.starts_with('…'));
+        assert_eq!(tail.chars().count(), 501);
     }
 
     #[test]

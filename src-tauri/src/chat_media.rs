@@ -8,9 +8,12 @@
 //! makes chats self-contained — the preview survives the project file moving.
 //!
 //! What is detected: path-looking tokens ending in a known image/video
-//! extension inside the turn's text (final prose + tool-chip text) — bare
-//! tokens without spaces, and quoted/backticked/markdown-linked paths which may
-//! contain spaces. Relative paths resolve against the chat's project folder.
+//! extension inside the text the caller passes. The chat page passes only the
+//! output of a capture tool (screenshot, still, clip, local image). Prose,
+//! thoughts, and other tool results are not passed, so a mentioned path such
+//! as `docs/hero.svg` is not a picture. Bare tokens without spaces, and
+//! quoted/backticked/markdown-linked paths which may contain spaces. Relative
+//! paths resolve against the chat's project folder.
 //! What is NOT detected: URLs, data URIs, paths without extensions, files
 //! larger than the caps.
 
@@ -22,9 +25,10 @@ pub const VIDEO_EXTS: [&str; 4] = ["mp4", "webm", "ogv", "mov"];
 /// Size caps — a copy is skipped (not an error) beyond these.
 const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 const VIDEO_MAX_BYTES: u64 = 250 * 1024 * 1024;
-/// Per-message attachment caps (first hits win, order of appearance).
-const MAX_IMAGES: usize = 6;
-const MAX_VIDEOS: usize = 2;
+/// Runaway guard only. A tool log can mention hundreds of media paths.
+/// Distinct files below this all show. The same file never counts twice.
+const MAX_IMAGES: usize = 24;
+const MAX_VIDEOS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MediaKind {
@@ -191,6 +195,27 @@ fn percent_decode_lite(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Stable across processes. `DefaultHasher` is not.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn same_file_len(path: &Path, len: u64) -> bool {
+    std::fs::metadata(path).map(|m| m.is_file() && m.len() == len).unwrap_or(false)
+}
+
+/// `canonicalize` on Windows prefixes `\\?\`. The chat compares paths as
+/// strings, so that prefix would show one file as two thumbnails.
+fn stored_display(path: &Path) -> String {
+    let s = path.display().to_string();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
 /// One resolved-and-copied attachment.
 #[derive(Debug, Clone)]
 pub struct ResolvedMedia {
@@ -239,14 +264,18 @@ pub fn resolve_and_copy(candidates: &[String], cwd: &Path, dest_dir: &Path) -> V
         // directly). Avoid a redundant copy so thumbs match the saved file.
         if let Some(ref dest_root) = dest_canon {
             if real.starts_with(dest_root) {
+                seen_sources.push(real.clone());
+                let stored_path = stored_display(&real);
+                if out.iter().any(|m| m.stored_path.eq_ignore_ascii_case(&stored_path)) {
+                    continue;
+                }
                 match kind {
                     MediaKind::Image => images += 1,
                     MediaKind::Video => videos += 1,
                 }
-                seen_sources.push(real.clone());
                 out.push(ResolvedMedia {
                     kind,
-                    stored_path: real.display().to_string(),
+                    stored_path,
                 });
                 continue;
             }
@@ -260,16 +289,23 @@ pub fn resolve_and_copy(candidates: &[String], cwd: &Path, dest_dir: &Path) -> V
         if std::fs::create_dir_all(dest_dir).is_err() {
             continue;
         }
-        let dest = dest_dir.join(format!("{}.{ext}", crate::store::Store::new_id()));
-        if std::fs::copy(&real, &dest).is_err() {
+        // Stable name so a later scan of the same source reuses this copy
+        // instead of minting another attachment. Screenshot paths are unique
+        // per capture, so one shot stays one image and seven shots stay seven.
+        let dest = dest_dir.join(format!("{:016x}.{ext}", fnv1a64(real.as_os_str().as_encoded_bytes())));
+        if !same_file_len(&dest, meta.len()) && std::fs::copy(&real, &dest).is_err() {
+            continue;
+        }
+        seen_sources.push(real);
+        let stored_path = stored_display(&dest);
+        if out.iter().any(|m| m.stored_path.eq_ignore_ascii_case(&stored_path)) {
             continue;
         }
         match kind {
             MediaKind::Image => images += 1,
             MediaKind::Video => videos += 1,
         }
-        seen_sources.push(real);
-        out.push(ResolvedMedia { kind, stored_path: dest.display().to_string() });
+        out.push(ResolvedMedia { kind, stored_path });
     }
     out
 }
@@ -406,9 +442,76 @@ mod tests {
         let mut cands: Vec<String> = (0..8).map(|i| format!("i{i}.png")).collect();
         cands.push("i0.png".into()); // duplicate source
         let resolved = resolve_and_copy(&cands, &src, &dest);
-        // Capped at MAX_IMAGES, duplicate not double-copied.
-        assert_eq!(resolved.len(), 6, "{resolved:?}");
+        // All eight distinct files, and the repeated i0.png is not a second copy.
+        assert_eq!(resolved.len(), 8, "{resolved:?}");
+        let again = resolve_and_copy(&cands, &src, &dest);
+        assert_eq!(
+            again.iter().map(|m| m.stored_path.clone()).collect::<Vec<_>>(),
+            resolved.iter().map(|m| m.stored_path.clone()).collect::<Vec<_>>()
+        );
+        let copies = std::fs::read_dir(&dest).unwrap().count();
+        assert_eq!(copies, 8, "a second scan must not mint new files");
 
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn one_screenshot_scanned_seven_times_stays_one_image() {
+        let src = temp_dir("one-shot");
+        let dest = temp_dir("one-shot-dest");
+        let shot = src.join("screen.png");
+        std::fs::write(&shot, b"one-screenshot").unwrap();
+        let cands = vec![shot.display().to_string()];
+        let mut paths = Vec::new();
+        for _ in 0..7 {
+            let resolved = resolve_and_copy(&cands, &src, &dest);
+            assert_eq!(resolved.len(), 1, "{resolved:?}");
+            paths.push(resolved[0].stored_path.clone());
+        }
+        assert!(paths.iter().all(|p| p == &paths[0]), "{paths:?}");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn seven_distinct_screenshots_stay_seven() {
+        let src = temp_dir("seven-shots");
+        let dest = temp_dir("seven-shots-dest");
+        let cands: Vec<String> = (0..7)
+            .map(|i| {
+                let path = src.join(format!("shot-{i}.png"));
+                std::fs::write(&path, format!("shot-{i}")).unwrap();
+                path.display().to_string()
+            })
+            .collect();
+        let resolved = resolve_and_copy(&cands, &src, &dest);
+        assert_eq!(resolved.len(), 7, "{resolved:?}");
+        let again = resolve_and_copy(&cands, &src, &dest);
+        assert_eq!(again.len(), 7);
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 7);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn verbatim_prefix_does_not_duplicate_one_file() {
+        let src = temp_dir("verbatim-src");
+        let dest = temp_dir("verbatim-dest");
+        let shot = src.join("screen.png");
+        std::fs::write(&shot, b"same-bytes").unwrap();
+        let first = resolve_and_copy(&[shot.display().to_string()], &src, &dest);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(
+            !first[0].stored_path.starts_with(r"\\?\"),
+            "{}",
+            first[0].stored_path
+        );
+        let verbatim = format!(r"\\?\{}", first[0].stored_path);
+        let both = resolve_and_copy(&[shot.display().to_string(), verbatim], &src, &dest);
+        assert_eq!(both.len(), 1, "{both:?}");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
     }

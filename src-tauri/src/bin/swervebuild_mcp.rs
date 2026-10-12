@@ -347,6 +347,62 @@ fn tools() -> Vec<ToolDef> {
                 }
             }),
         },
+        // --- Hyper-V guest desktop. Grant is off by default. Automations cannot call these. ---
+        ToolDef {
+            name: "vm_status".into(),
+            description: "Read the Test virtual machine setup: grant, saved guest, and live Hyper-V state when a machine is configured. Does not start or click anything.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "vm_prepare".into(),
+            description: "Turn the configured Hyper-V guest off, revert it to the saved snapshot, and start it. The snapshot must already be a Windows desktop with a user logged on. Requires Settings → Test virtual machine.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "vm_screenshot".into(),
+            description: "Capture the logged-on guest desktop to a PNG and return its path. Requires the Test virtual machine grant.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "vm_click".into(),
+            description: "Press a control on the guest desktop by its visible Windows name (Invoke, or a click on that control's bounds). Returns a new screenshot path. Requires the Test virtual machine grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Accessible name of the button or control" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDef {
+            name: "vm_type".into(),
+            description: "Type into a named control on the guest desktop. Uses the control's value pattern. Returns a new screenshot path. Requires the Test virtual machine grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Accessible name of the field" },
+                    "text": { "type": "string", "description": "Text to set" }
+                },
+                "required": ["name", "text"]
+            }),
+        },
+        ToolDef {
+            name: "vm_press".into(),
+            description: "Send one key on the guest desktop: Enter, Tab, Escape, Backspace, Space, Up, Down, Left, Right. Optional control name to focus first. Returns a new screenshot path. Requires the Test virtual machine grant.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" },
+                    "name": { "type": "string", "description": "Optional control to focus first" }
+                },
+                "required": ["key"]
+            }),
+        },
+        ToolDef {
+            name: "vm_console".into(),
+            description: "Open Hyper-V's console window so the person can take over for a sign-in or a secure-desktop consent prompt. Requires the Test virtual machine grant.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
     ]
 }
 
@@ -722,6 +778,57 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
             let project_id = args.get("project_id").and_then(|v| v.as_str());
             let body = swerve_build_lib::media_worker::capture_still_opts(project_id)?;
             Ok(serde_json::to_value(body).unwrap_or_else(|_| json!({ "ok": false })))
+        }
+        "vm_status" => {
+            let mut body = serde_json::to_value(swerve_build_lib::vm_guest::status())
+                .unwrap_or_else(|_| json!({ "granted": false }));
+            if body.get("configured").and_then(|v| v.as_bool()) == Some(true) {
+                match swerve_build_lib::vm_guest::probe() {
+                    Ok(live) => {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.insert("hypervisor".into(), live);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.insert("hypervisorError".into(), json!(error));
+                        }
+                    }
+                }
+            }
+            Ok(body)
+        }
+        "vm_prepare" => swerve_build_lib::vm_guest::prepare(),
+        "vm_screenshot" => swerve_build_lib::vm_guest::screenshot(),
+        "vm_click" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "name required".to_string())?;
+            swerve_build_lib::vm_guest::click(name)
+        }
+        "vm_type" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "name required".to_string())?;
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "text required".to_string())?;
+            swerve_build_lib::vm_guest::type_text(name, text)
+        }
+        "vm_press" => {
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "key required".to_string())?;
+            let name = args.get("name").and_then(|v| v.as_str());
+            swerve_build_lib::vm_guest::press_key(name, key)
+        }
+        "vm_console" => {
+            swerve_build_lib::vm_guest::ensure_agent_drive()?;
+            swerve_build_lib::vm_guest::open_console()
         }
         "media_encode_clip" | "swervebuild_media_encode_clip" => {
             let still_path = args

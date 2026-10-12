@@ -17,11 +17,14 @@
     showModelPicker = false,
     modelId = null,
     modelSwitching = false,
+    sheetUp = false,
     onmodelchange,
   }: {
     showModelPicker?: boolean;
     modelId?: string | null;
     modelSwitching?: boolean;
+    /** Open the sheet above the trigger. Used when the control sits over the composer. */
+    sheetUp?: boolean;
     onmodelchange?: (id: string | null) => void;
   } = $props();
 
@@ -123,7 +126,7 @@
   </button>
 
   {#if open}
-    <div class="sheet" role="dialog" aria-label="Models">
+    <div class="sheet" class:up={sheetUp} role="dialog" aria-label="Models">
       <div class="sheet-head">
         <span class="mono-label">Models</span>
         <p class="sheet-hint">
@@ -239,6 +242,10 @@
     border-radius: var(--radius-lg, 10px);
     background: var(--bg-surface);
     box-shadow: var(--shadow-lg);
+  }
+  .sheet.up {
+    top: auto;
+    bottom: calc(100% + 6px);
   }
   .sheet-head {
     padding: 0.35rem 0.5rem 0.55rem;

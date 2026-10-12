@@ -7,6 +7,13 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
+    # Public release stays on Vite 6.x. A major bump is its own ritual pass
+    # after that tag. This ignore applies on GitHub once the file is on the
+    # default branch. Leave the open Vite 8 pull request unmerged.
+    ignore:
+      - dependency-name: "vite"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: cargo
     directory: /src-tauri

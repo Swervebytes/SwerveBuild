@@ -1,6 +1,6 @@
 [package]
 name = "swerve-build"
-version = "0.3.36"
+version = "0.3.43"
 description = "Swerve Build — a clean Windows desktop shell for Grok Build and ACP agents"
 authors = ["Swerve Build Contributors"]
 license = "MIT"
@@ -48,6 +48,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 # P4.2 — restore window size/position/maximized across launches.
 tauri-plugin-window-state = "2"
+# P3.1 — minisign-verified installer updates. Private key stays off the repo.
+tauri-plugin-updater = "2"
 toml_edit = "0.22"
 swerve-workflows = { path = "crates/swerve-workflows" }
 # CDP client for app_ui drive (WebSocket to WebView2 remote-debugging-port).

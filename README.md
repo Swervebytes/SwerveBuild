@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshot-chat.png" alt="A Swerve Build project chat with tool-approval chips, a reasoning trace, streamed code, and an honest context bar" width="860" />
+  <img src="docs/screenshot-chat.png" alt="A Swerve Build project chat with tool-approval chips, a reasoning trace, and streamed code" width="860" />
 </p>
 
 ---
@@ -23,7 +23,7 @@ Prefer to keep your code on your machine? Point Grok at your own [local or self-
 
 ## Highlights
 
-- **Project chats.** Folder-scoped conversations with ACP streaming, a tool-approval UI, inline images and video, and an honest context bar (real token counts from the agent, or a dash when the agent reports nothing, never invented). Up to 3 run at once.
+- **Project chats.** Folder-scoped conversations with ACP streaming, a tool-approval UI, and inline images and video. The project shows the last request, whether that turn finished, and the git branch. Up to 3 run at once.
 - **Any agent, managed in-app.** Grok works out of the box. Claude Code and Gemini **install, sign in, and uninstall** from Settings.
 - **Automations.** Headless Grok runs on a schedule, a git commit, a file change, or on demand. Read-only by default.
 - **Workflows.** A visual node-graph engine: triggers, requests, transforms, sandboxed code, and agent turns.

@@ -6,7 +6,6 @@
   import { createChat } from "$lib/workspace";
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import { automationsStore } from "$lib/stores/automations.svelte";
-  import { providerStore } from "$lib/stores/providers.svelte";
   import Wordmark from "./Wordmark.svelte";
   import Icon from "./ui/Icon.svelte";
   import { APP_VERSION } from "$lib/version";
@@ -98,11 +97,8 @@
     {/if}
   </div>
 
-  <footer class="sidebar-footer">
-    <div class="provider" title="Active provider">
-      <span class="swatch" style="--c: {providerStore.active.accent}"></span>
-      <span class="provider-label">{providerStore.active.label}</span>
-    </div>
+  <footer class="sidebar-footer" title="Swerve Build version">
+    <span class="foot-kicker">App</span>
     <span class="version">v{appVersion}</span>
   </footer>
 </aside>
@@ -271,31 +267,16 @@
   .sidebar-footer {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 0.5rem;
+    gap: 0.45rem;
     padding: 0.7rem 1rem 0.85rem;
     border-top: 1px solid var(--border);
   }
-  .provider {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.45rem;
-    min-width: 0;
-  }
-  .swatch {
-    width: 9px;
-    height: 9px;
-    border-radius: 3px;
-    background: var(--c, var(--sc-accent));
-    box-shadow: var(--glow) var(--c, var(--sc-accent));
+  .foot-kicker {
     flex: none;
-  }
-  .provider-label {
-    font-size: 0.75rem;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 0.625rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-faint);
   }
   .version {
     font-size: 0.6875rem;

@@ -45,6 +45,8 @@ pub struct EnvSnapshot {
     pub browser_granted: bool,
     /// Browser pane may navigate public (non-loopback) URLs.
     pub browser_public: bool,
+    /// Settings → Test virtual machine. Off for unattended runs.
+    pub vm_granted: bool,
     /// S16: who actually runs image/video gen (not the chat model). No network.
     pub media_honesty: String,
 }
@@ -107,13 +109,20 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
         s.agent_surfaces.join(", ")
     };
     lines.push(format!(
-        "Agent surfaces: {} | grants: app_ui={} term={} browser={} browser_public={}",
+        "Agent surfaces: {} | grants: app_ui={} term={} browser={} browser_public={} vm={}",
         surfaces,
         yn(s.app_ui_granted),
         yn(s.term_granted),
         yn(s.browser_granted),
         yn(s.browser_public),
+        yn(s.vm_granted),
     ));
+    if s.agent_surfaces.iter().any(|x| x == "vm") {
+        lines.push(
+            "VM test MCP (Settings grant, off for automations): vm_status, vm_prepare, vm_screenshot, vm_click, vm_type, vm_press, vm_console. Reverts a Hyper-V snapshot and drives the logged-on desktop by control name."
+                .to_string(),
+        );
+    }
     // S30: make still+clip MCP tools discoverable in the always-on fact sheet.
     if s.agent_surfaces.iter().any(|x| x == "media") {
         lines.push(
@@ -130,6 +139,12 @@ pub fn format_pack(s: &EnvSnapshot) -> String {
     if s.self_dev {
         lines.push(
             "Frozen core: see docs-internal/FROZEN-CORE.md — flag any frozen-surface edit in your plan before changing it."
+                .to_string(),
+        );
+        // Content line only (fingerprint already includes self_dev). The running
+        // process is the installed copy; editing this repo does not change it.
+        lines.push(
+            "Running copy: the installed app, separate from this repo. Edits apply after npm run install:local and a restart. This chat resumes."
                 .to_string(),
         );
     }
@@ -155,7 +170,7 @@ fn yn(v: bool) -> &'static str {
 /// When this changes, the next user turn should re-inject the pack.
 pub fn env_fingerprint(s: &EnvSnapshot) -> String {
     format!(
-        "v={}|root={}|self={}|prov={}|model={}|media={}|surfaces={}|aui={}|term={}|br={}|brpub={}|local={}",
+        "v={}|root={}|self={}|prov={}|model={}|media={}|surfaces={}|aui={}|term={}|br={}|brpub={}|vm={}|local={}",
         s.app_version,
         s.project_root,
         s.self_dev,
@@ -167,6 +182,7 @@ pub fn env_fingerprint(s: &EnvSnapshot) -> String {
         s.term_granted,
         s.browser_granted,
         s.browser_public,
+        s.vm_granted,
         s.local_model_loaded.as_deref().unwrap_or(""),
     )
 }
@@ -259,6 +275,7 @@ fn agent_surfaces() -> Vec<String> {
         "browser".to_string(),
         "media".to_string(), // S29+: media_status / media_capture_still / media_encode_clip
         "local_image".to_string(),
+        "vm".to_string(),
     ];
     if crate::which_on_path("swervebytes-mcp").is_some() {
         surfaces.push("swervebytes".to_string());
@@ -306,6 +323,7 @@ pub fn gather_for_chat(
     };
 
     let (app_ui_granted, term_granted, browser_granted, browser_public) = grant_bits();
+    let vm_granted = crate::vm_guest::is_granted();
 
     EnvSnapshot {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -331,6 +349,7 @@ pub fn gather_for_chat(
         term_granted,
         browser_granted,
         browser_public,
+        vm_granted,
         media_honesty: crate::media_providers::honesty_summary(),
     }
 }
@@ -386,12 +405,13 @@ pub fn gather_for_automation(
         // Never auto-grant UI/terminal/browser for unattended runs.
         agent_surfaces: agent_surfaces()
             .into_iter()
-            .filter(|s| s != "app_ui" && s != "terminal" && s != "browser")
+            .filter(|s| s != "app_ui" && s != "terminal" && s != "browser" && s != "vm")
             .collect(),
         app_ui_granted: false,
         term_granted: false,
         browser_granted: false,
         browser_public: false,
+        vm_granted: false,
         media_honesty: crate::media_providers::honesty_summary(),
     }
 }
@@ -459,11 +479,13 @@ mod tests {
                 "browser".into(),
                 "media".into(),
                 "local_image".into(),
+                "vm".into(),
             ],
             app_ui_granted: false,
             term_granted: false,
             browser_granted: true,
             browser_public: false,
+            vm_granted: false,
             media_honesty: "images=xAI Imagine (remote); chat model does NOT render pixels".into(),
         }
     }
@@ -487,6 +509,8 @@ mod tests {
         assert!(pack.contains("media"));
         assert!(pack.contains("media_capture_still"));
         assert!(pack.contains("media_encode_clip"));
+        assert!(pack.contains("vm_prepare"));
+        assert!(pack.contains("vm=no"));
         assert!(pack.contains("Media gen:"));
         assert!(pack.contains("does NOT render pixels"));
         assert!(!pack.contains("Frozen core"));
@@ -500,6 +524,8 @@ mod tests {
         let pack = format_pack(&s);
         assert!(pack.contains("self-dev: yes"));
         assert!(pack.contains("FROZEN-CORE.md"));
+        assert!(pack.contains("Running copy: the installed app"));
+        assert!(pack.contains("install:local"));
     }
 
     #[test]
@@ -521,6 +547,7 @@ mod tests {
             "browser".into(),
             "media".into(),
             "local_image".into(),
+            "vm".into(),
             "swervebytes".into(),
         ];
         s.term_granted = true;

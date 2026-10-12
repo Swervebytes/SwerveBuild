@@ -6,6 +6,7 @@
   import { workspaceStore } from "$lib/stores/workspace.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import ProjectStatus from "$lib/components/project/ProjectStatus.svelte";
 
   let loading = $state(true);
   let busy = $state<string | null>(null);
@@ -142,6 +143,7 @@
 
           {#if expanded[project.id]}
             <div class="chat-list">
+              <ProjectStatus projectId={project.id} />
               {#if chats.length === 0}
                 <p class="muted small">No chats yet for this project.</p>
               {:else}

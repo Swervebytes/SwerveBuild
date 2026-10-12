@@ -62,6 +62,9 @@ pub struct AcpManager {
     /// The reader thread blocks on the receiver until the UI calls
     /// `respond_permission` (or the session dies / times out).
     write_approvals: Arc<Mutex<WriteApprovalMap>>,
+    /// One connect per chat. The session is inserted only after `session/new`
+    /// returns, so a second `ensure_session` cannot see the first process yet.
+    starting: Arc<StartGate>,
 }
 
 /// Shared ACP transport — must be usable without holding `AcpManager::sessions` lock
@@ -91,11 +94,105 @@ struct ActiveSession {
     env_fingerprint: Mutex<Option<String>>,
 }
 
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        // The map is the owner. A failed connect drops the session before
+        // insert, and a replace drops the previous one. `Child`'s destructor
+        // does not stop the process on Windows, so the grok (and the MCP
+        // processes it spawned) would keep running.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Callers blocked on a connect that is already running for this chat.
+struct Flight {
+    waiters: Mutex<Vec<mpsc::Sender<Result<String, String>>>>,
+}
+
+enum StartRole {
+    Leader,
+    Follower(mpsc::Receiver<Result<String, String>>),
+}
+
+struct StartGate {
+    inflight: Mutex<HashMap<String, Arc<Flight>>>,
+}
+
+impl Default for StartGate {
+    fn default() -> Self {
+        Self {
+            inflight: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl StartGate {
+    fn enter(&self, chat_id: &str) -> StartRole {
+        let mut map = self.inflight.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(flight) = map.get(chat_id) {
+            let (tx, rx) = mpsc::channel();
+            flight
+                .waiters
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(tx);
+            StartRole::Follower(rx)
+        } else {
+            map.insert(
+                chat_id.to_string(),
+                Arc::new(Flight {
+                    waiters: Mutex::new(Vec::new()),
+                }),
+            );
+            StartRole::Leader
+        }
+    }
+
+    fn publish(&self, chat_id: &str, result: &Result<String, String>) {
+        let flight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(chat_id);
+        let Some(flight) = flight else {
+            return;
+        };
+        let waiters = std::mem::take(
+            &mut *flight
+                .waiters
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+        );
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+/// Publishes the leader's result to followers, including when connect panics.
+struct FlightGuard {
+    gate: Arc<StartGate>,
+    chat_id: String,
+    result: Option<Result<String, String>>,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err("Chat session start ended before it finished".to_string()));
+        self.gate.publish(&self.chat_id, &result);
+    }
+}
+
 impl Default for AcpManager {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             write_approvals: Arc::new(Mutex::new(HashMap::new())),
+            starting: Arc::new(StartGate::default()),
         }
     }
 }
@@ -135,6 +232,22 @@ impl AcpManager {
         crate::local_llm::manager().release_prefix("chat:");
     }
 
+    fn live_session_id(&self, chat_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .ok()?
+            .get(chat_id)
+            .map(|session| session.session_id.clone())
+    }
+
+    fn announce_ready(&self, app: &AppHandle, chat_id: &str, session_id: &str) {
+        self.touch(chat_id);
+        let _ = app.emit(
+            "chat-session-ready",
+            json!({ "chatId": chat_id, "sessionId": session_id }),
+        );
+    }
+
     pub fn ensure_session(
         &self,
         app: AppHandle,
@@ -146,23 +259,38 @@ impl AcpManager {
         model_id: Option<&str>,
         running_automations: usize,
     ) -> Result<String, String> {
-        if let Ok(guard) = self.sessions.lock() {
-            if guard.contains_key(chat_id) {
-                let session_id = guard.get(chat_id).map(|s| s.session_id.clone());
-                drop(guard);
-                self.touch(chat_id);
-                if let Some(session_id) = session_id {
-                    let _ = app.emit(
-                        "chat-session-ready",
-                        json!({ "chatId": chat_id, "sessionId": session_id }),
-                    );
-                    return Ok(session_id);
-                }
+        if let Some(session_id) = self.live_session_id(chat_id) {
+            self.announce_ready(&app, chat_id, &session_id);
+            return Ok(session_id);
+        }
+
+        // Send can arrive while the chat page's own connect is still inside
+        // session/new. Joining that start is what keeps a second grok.exe
+        // from being spawned. Followers block on this thread; callers already
+        // run ensure_session on a blocking pool.
+        match self.starting.enter(chat_id) {
+            StartRole::Follower(rx) => {
+                return rx.recv().unwrap_or_else(|_| {
+                    Err("Chat session start ended before it finished".to_string())
+                });
             }
+            StartRole::Leader => {}
+        }
+
+        let mut guard = FlightGuard {
+            gate: Arc::clone(&self.starting),
+            chat_id: chat_id.to_string(),
+            result: None,
+        };
+
+        if let Some(session_id) = self.live_session_id(chat_id) {
+            self.announce_ready(&app, chat_id, &session_id);
+            guard.result = Some(Ok(session_id.clone()));
+            return Ok(session_id);
         }
 
         self.evict_if_needed();
-        self.spawn_session(
+        let outcome = self.spawn_session(
             app,
             launch,
             cwd,
@@ -171,7 +299,9 @@ impl AcpManager {
             provider_id,
             model_id,
             running_automations,
-        )
+        );
+        guard.result = Some(outcome.clone());
+        outcome
     }
 
     fn touch(&self, chat_id: &str) {
@@ -637,11 +767,12 @@ impl AcpManager {
 
     pub fn send_prompt(&self, chat_id: &str, text: &str, images: &[String]) -> Result<(), String> {
         let active_chats = self.list_active().len().max(1);
-        let (transport, session_id, env_pack) = {
+        let (transport, session_id, env_pack, open_ids) = {
             let mut guard = self
                 .sessions
                 .lock()
                 .map_err(|_| "ACP session lock poisoned".to_string())?;
+            let open_ids: Vec<String> = guard.keys().cloned().collect();
             let active = guard
                 .get_mut(chat_id)
                 .ok_or_else(|| "No active session for this chat. Open the chat to connect.".to_string())?;
@@ -660,6 +791,7 @@ impl AcpManager {
                 Arc::clone(&active.transport),
                 active.session_id.clone(),
                 pack,
+                open_ids,
             )
         };
 
@@ -670,13 +802,25 @@ impl AcpManager {
 
         // Delivery is a user-turn prefix because Grok ACP `session/new` does not
         // expose a client system-prompt field we can rely on.
-        let mut body = text.trim().to_string();
+        //
+        // Project status uses this same path once, for a chat with no assistant
+        // reply yet. acp.rs is frozen; the text itself lives in project_card.rs.
+        let project_status = crate::project_card::wire_prefix(chat_id, &open_ids);
+        let mut sections: Vec<String> = Vec::new();
         if let Some(pack) = env_pack {
-            if body.is_empty() {
-                body = pack;
+            sections.push(pack);
+        }
+        if let Some(status) = project_status {
+            sections.push(status);
+        }
+        let mut body = text.trim().to_string();
+        if !sections.is_empty() {
+            let prefix = sections.join("\n\n");
+            body = if body.is_empty() {
+                prefix
             } else {
-                body = format!("{pack}\n\n---\n\n{body}");
-            }
+                format!("{prefix}\n\n---\n\n{body}")
+            };
         }
         if !body.is_empty() {
             blocks.push(json!({ "type": "text", "text": body }));
@@ -1398,6 +1542,73 @@ mod tests {
         // Clean the copied attachment if under real attachments dir.
         if let Some(p) = imported.first().map(PathBuf::from) {
             let _ = fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn start_gate_second_caller_waits_for_the_leader() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::thread;
+
+        let gate = Arc::new(StartGate::default());
+        assert!(matches!(gate.enter("chat"), StartRole::Leader));
+
+        let follower_gate = Arc::clone(&gate);
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_flag = Arc::clone(&entered);
+        let follower = thread::spawn(move || {
+            let role = follower_gate.enter("chat");
+            entered_flag.store(true, AtomicOrdering::SeqCst);
+            let StartRole::Follower(rx) = role else {
+                panic!("second start for the same chat must wait");
+            };
+            rx.recv().expect("leader publishes")
+        });
+
+        while !entered.load(AtomicOrdering::SeqCst) {
+            thread::yield_now();
+        }
+        gate.publish("chat", &Ok("session-1".to_string()));
+        assert_eq!(follower.join().unwrap().unwrap(), "session-1");
+        assert!(
+            matches!(gate.enter("chat"), StartRole::Leader),
+            "after the connect finishes, the next start is a new leader"
+        );
+    }
+
+    #[test]
+    fn start_gate_distinct_chats_each_lead() {
+        let gate = StartGate::default();
+        assert!(matches!(gate.enter("one"), StartRole::Leader));
+        assert!(matches!(gate.enter("two"), StartRole::Leader));
+    }
+
+    #[test]
+    fn start_gate_followers_share_one_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::thread;
+
+        let gate = Arc::new(StartGate::default());
+        assert!(matches!(gate.enter("chat"), StartRole::Leader));
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::clone(&gate);
+            let arrived = Arc::clone(&arrived);
+            handles.push(thread::spawn(move || {
+                let StartRole::Follower(rx) = gate.enter("chat") else {
+                    panic!("expected follower");
+                };
+                arrived.fetch_add(1, AtomicOrdering::SeqCst);
+                rx.recv().unwrap()
+            }));
+        }
+        while arrived.load(AtomicOrdering::SeqCst) < 2 {
+            thread::yield_now();
+        }
+        gate.publish("chat", &Err("connect failed".to_string()));
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap_err(), "connect failed");
         }
     }
 

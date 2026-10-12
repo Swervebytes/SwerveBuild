@@ -8,6 +8,10 @@ record lives in the git log.
 ## [Unreleased]
 
 ### Added
+- **Project status.** Each project keeps a fact card: the last request in each chat, whether that turn finished or stopped on an error, the git branch and dirty files, and which chats are open. The Projects page shows it. A new chat is told once, on its first message, and does not treat other chats' leftover work as its task.
+- **App updates in Settings.** "Check for updates" asks GitHub Releases for
+  `latest.json` and installs a newer NSIS package only after the minisign
+  signature verifies. The private key stays outside the repo.
 - **Provider sign-in from Settings** — Claude Code (`claude /login` in a
   terminal) and Gemini (Google OAuth) sign in through each agent's own flow;
   chats that hit a signed-out agent show a banner pointing at the fix.
@@ -24,7 +28,13 @@ record lives in the git log.
 - Daily/weekly automation schedules follow the OS clock across DST transitions
   (previously drifted an hour until re-saved).
 
+### Removed
+- The chat context meter (Room left, Getting full, the token percentage, and the dash while the window size was unknown). The composer row keeps Connected and Models.
+
 ### Fixed
+- A hard restart keeps the reply that was still streaming.
+- A screen clip with desktop audio no longer waits forever when the render device delivers no loopback samples. A silence render starts the endpoint clock, and a source that still stays quiet fails that attempt so the clip can finish on the next source.
+- Chat no longer shows a picture just because a path was mentioned. A thumbnail is attached only when a capture tool returns the file (an app, browser, or virtual-machine screenshot, a media still or clip, or a local generated image). MCP calls, which arrive wrapped as `use_tool`, still count when the inner tool is one of those.
 - ACP peers that use string JSON-RPC ids no longer have permission requests
   silently dropped.
 - Live output produced in the first instant of a "Run now" is no longer lost.
