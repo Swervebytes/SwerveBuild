@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -1222,6 +1222,12 @@ pub fn build_clip_args(
                 rate.to_string(),
                 "-ac".into(),
                 channels.to_string(),
+                // A raw pipe has no header. Don't let FFmpeg block filling a
+                // large probe buffer before the duration clock can start.
+                "-probesize".into(),
+                "32".into(),
+                "-analyzeduration".into(),
+                "0".into(),
                 "-thread_queue_size".into(),
                 "1024".into(),
                 "-i".into(),
@@ -1435,6 +1441,31 @@ fn verify_clip_output(out: &Path, tag: &str) -> Result<(), String> {
     }
 }
 
+fn clip_budget(duration: &str) -> Duration {
+    let secs: f64 = duration.parse().unwrap_or(2.0);
+    Duration::from_secs_f64(secs.clamp(0.5, 30.0) + 12.0)
+}
+
+/// Wait for a child, and kill it when `budget` passes.
+///
+/// A stuck `ddagrab` or a capture device that never delivers keeps the
+/// Desktop Duplication output locked. The next clip then hangs too.
+fn wait_child(child: &mut Child, budget: Duration) -> Result<ExitStatus, String> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() >= budget => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("ffmpeg did not finish within {budget:?}"));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(40)),
+            Err(e) => return Err(format!("wait ffmpeg: {e}")),
+        }
+    }
+}
+
 fn run_ffmpeg_clip(
     ffmpeg: &Path,
     out: &Path,
@@ -1449,10 +1480,11 @@ fn run_ffmpeg_clip(
         video_encoder,
         CLIP_FRAMERATE,
     );
-    let status = crate::util::hidden_command(ffmpeg)
+    let mut child = crate::util::hidden_command(ffmpeg)
         .args(&args)
-        .status()
+        .spawn()
         .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    let status = wait_child(&mut child, clip_budget(duration))?;
     if !status.success() {
         return Err(format!("ffmpeg {video_encoder} failed with {status}"));
     }
@@ -1462,9 +1494,10 @@ fn run_ffmpeg_clip(
 /// Record with DESKTOP audio (S33): FFmpeg reads raw PCM from stdin while this
 /// process pumps WASAPI loopback samples into it.
 ///
-/// Loopback delivers a continuous stream (silence included) while the render
-/// device is active, so no silence-padding clock is needed — measured at
-/// exactly `rate * channels` samples/sec on an idle desktop.
+/// Some render devices deliver no loopback callbacks until a client is
+/// playing, which leaves FFmpeg blocked on an empty pipe. A silence render
+/// starts that clock. If samples still do not arrive, this attempt fails
+/// and the ladder tries the next source instead of waiting forever.
 fn run_ffmpeg_clip_loopback(
     ffmpeg: &Path,
     out: &Path,
@@ -1496,19 +1529,32 @@ fn run_ffmpeg_clip_loopback(
         .map_err(|e| format!("default_output_config: {e}"))?;
     let stream_cfg: cpal::StreamConfig = cfg.clone().into();
 
-    let mut child = crate::util::hidden_command(ffmpeg)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ffmpeg stdin unavailable".to_string())?;
+    // A silence render starts the endpoint clock. Zeros mix as silence.
+    let render = match cfg.sample_format() {
+        cpal::SampleFormat::F32 => dev
+            .build_output_stream(
+                &stream_cfg,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+                |e| eprintln!("loopback render error: {e}"),
+                None,
+            )
+            .map_err(|e| format!("build silence render: {e}"))?,
+        cpal::SampleFormat::I16 => dev
+            .build_output_stream(
+                &stream_cfg,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| data.fill(0),
+                |e| eprintln!("loopback render error: {e}"),
+                None,
+            )
+            .map_err(|e| format!("build silence render: {e}"))?,
+        other => return Err(format!("unsupported loopback sample format: {other:?}")),
+    };
+    render
+        .play()
+        .map_err(|e| format!("play silence render: {e}"))?;
 
     // Audio callback must never block: hand bytes to a writer thread.
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let err_fn = |e| eprintln!("loopback stream error: {e}");
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => dev.build_input_stream(
             &stream_cfg,
@@ -1519,7 +1565,7 @@ fn run_ffmpeg_clip_loopback(
                 }
                 let _ = tx.send(buf);
             },
-            err_fn,
+            |e| eprintln!("loopback stream error: {e}"),
             None,
         ),
         cpal::SampleFormat::I16 => dev.build_input_stream(
@@ -1531,7 +1577,7 @@ fn run_ffmpeg_clip_loopback(
                 }
                 let _ = tx.send(buf);
             },
-            err_fn,
+            |e| eprintln!("loopback stream error: {e}"),
             None,
         ),
         other => return Err(format!("unsupported loopback sample format: {other:?}")),
@@ -1541,9 +1587,29 @@ fn run_ffmpeg_clip_loopback(
         .play()
         .map_err(|e| format!("play loopback stream: {e}"))?;
 
+    let first = rx.recv_timeout(Duration::from_millis(1500));
+    let Ok(first_buf) = first else {
+        drop(stream);
+        drop(render);
+        return Err("loopback produced no samples".into());
+    };
+
+    let mut child = crate::util::hidden_command(ffmpeg)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ffmpeg stdin unavailable".to_string())?;
+
     let writer = thread::spawn(move || {
         // Ends when FFmpeg closes the pipe (it stops itself at -t) or the
         // stream is dropped below, which drops `tx` and closes the channel.
+        if stdin.write_all(&first_buf).is_err() {
+            return;
+        }
         while let Ok(buf) = rx.recv() {
             if stdin.write_all(&buf).is_err() {
                 break;
@@ -1551,9 +1617,11 @@ fn run_ffmpeg_clip_loopback(
         }
     });
 
-    let status = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
+    let waited = wait_child(&mut child, clip_budget(duration));
     drop(stream); // stop capture → drops tx → writer thread exits
+    drop(render);
     let _ = writer.join();
+    let status = waited?;
 
     if !status.success() {
         return Err(format!(
@@ -1844,6 +1912,8 @@ mod tests {
         assert!(joined.contains("-ar 48000"), "{joined}");
         assert!(joined.contains("-ac 2"), "{joined}");
         assert!(joined.contains("-i pipe:0"), "{joined}");
+        assert!(joined.contains("-probesize 32"), "{joined}");
+        assert!(joined.contains("-analyzeduration 0"), "{joined}");
         // Same mapping contract as dshow: filter video + input-0 audio.
         assert!(joined.contains("-map [v]"), "{joined}");
         assert!(joined.contains("-map 0:a"), "{joined}");
@@ -1874,6 +1944,21 @@ mod tests {
     }
 
     #[test]
+    fn wait_child_kills_a_process_that_overruns() {
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn sleeper");
+        let started = Instant::now();
+        let err = wait_child(&mut child, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill took too long: {err}"
+        );
+        assert!(err.contains("did not finish"));
+    }
+
+    #[test]
     fn agent_status_report_has_capabilities() {
         let v = agent_status_report();
         let caps = v.get("capabilities").and_then(|c| c.as_array()).unwrap();
@@ -1896,6 +1981,17 @@ mod tests {
         eprintln!("device: {:?}", dev.name());
         let cfg = dev.default_output_config().expect("default output config");
         eprintln!("default_output_config: {cfg:?}");
+
+        let stream_cfg: cpal::StreamConfig = cfg.clone().into();
+        let render = dev
+            .build_output_stream(
+                &stream_cfg,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+                |e| eprintln!("render error: {e}"),
+                None,
+            )
+            .expect("silence render starts the endpoint clock");
+        render.play().expect("play silence");
 
         let n = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
